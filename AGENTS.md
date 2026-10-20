@@ -7,7 +7,7 @@ Detail besar dipindah ke `docs/` (tidak di-inject tiap turn): lihat **Detail ref
 ## Objective
 - Bangun **"evrax"**: agent coding TUI di **Rust + ratatui** (`D:\another-evrax-agent`) — UI 1:1 ala opencode (RAM kecil, bukan Bun), otak backend ala `hermes-agent`, UI-first dengan MockBackend.
 - **Pekerjaan berikutnya: batch skills** (bundle 211 skill + compile-time embed `build.rs` + tools `skills_list`/`skill_view`/`skill_manage` + `/skills` picker + scrub kata "opencode"/"hermes" dari file evrax) — plan final disetujui, eksekusi setelah smoke batch ini. `/remote` C1-C5, M1 backend, M2 perf+approval+web, M3 anti-bloat+auto-judul, **iterasi hermes+retry opencode+fix 403 SELESAI**.
-- **Repo publik `evrax-ui`** (backup): `https://github.com/jackielnikkie/evrax-ui` — `main` @ `954d3da` (+ M3 & batch iterasi/retry belum di-commit), 4 crate (core/agent/remote/tui) + docs + AGENTS.md + LICENSE MIT + README. `target/` & `agent-reference/` di-ignore; AGENTS.md **ikut** (keputusan user).
+- **Repo publik `evrax-ui`** (backup): `https://github.com/jackielnikkie/evrax-ui` — `main` @ `8193cfc`, 4 crate (core/agent/remote/tui) + docs + AGENTS.md + LICENSE MIT + README. `target/` & `agent-reference/` di-ignore; AGENTS.md **ikut** (keputusan user).
 
 ## Aturan kerja (user)
 - Response ke user pakai **Bahasa Indonesia**.
