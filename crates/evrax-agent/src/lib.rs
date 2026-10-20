@@ -1,16 +1,20 @@
 //! Real evrax backend: OpenAI-compatible SSE chat (9router) + agent loop.
 
 pub mod diff;
+mod guardrails;
+mod retry;
 pub mod sse;
 pub mod tools;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use evrax_core::{AgentBackend, AgentEvent, DiffLine, TurnRequest};
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -21,6 +25,7 @@ use crate::sse::{Frame, SseDecoder, ToolCall, ToolCallAccumulator, parse_frame};
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:20128/v1";
 pub const DEFAULT_MODEL: &str = "bebas";
 const MAX_HISTORY_CHARS: usize = 100_000;
+const MAX_HISTORY_SESSIONS: usize = 24;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentConfig {
@@ -37,7 +42,7 @@ impl Default for AgentConfig {
             base_url: DEFAULT_BASE_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
             api_key: None,
-            max_iterations: 12,
+            max_iterations: 500,
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
@@ -156,10 +161,39 @@ struct Inner {
     cfg: AgentConfig,
     client: reqwest::Client,
     conversations: Mutex<HashMap<String, Vec<Vec<Value>>>>,
+    /// Recency clock per session, used to evict cold conversations.
+    session_use: Mutex<HashMap<String, u64>>,
+    clock: AtomicU64,
 }
 
 impl Inner {
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self {
+            cfg: AgentConfig {
+                base_url: DEFAULT_BASE_URL.into(),
+                model: DEFAULT_MODEL.into(),
+                api_key: None,
+                max_iterations: 500,
+                root: std::env::temp_dir(),
+            },
+            client: reqwest::Client::new(),
+            conversations: Mutex::new(HashMap::new()),
+            session_use: Mutex::new(HashMap::new()),
+            clock: AtomicU64::new(0),
+        }
+    }
+
+    fn bump(&self, session: &str) {
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
+        self.session_use
+            .lock()
+            .unwrap()
+            .insert(session.to_string(), tick);
+    }
+
     fn replay(&self, session: &str) -> Vec<Value> {
+        self.bump(session);
         let conversations = self.conversations.lock().unwrap();
         conversations
             .get(session)
@@ -171,6 +205,7 @@ impl Inner {
     }
 
     fn commit(&self, session: &str, turn: Vec<Value>) {
+        self.bump(session);
         let mut conversations = self.conversations.lock().unwrap();
         let turns = conversations.entry(session.to_string()).or_default();
         turns.push(turn);
@@ -181,6 +216,19 @@ impl Inner {
         while total > MAX_HISTORY_CHARS && turns.len() > 1 {
             total = total.saturating_sub(size(&turns[0]));
             turns.remove(0);
+        }
+        if conversations.len() > MAX_HISTORY_SESSIONS {
+            let mut use_map = self.session_use.lock().unwrap();
+            let current = session.to_string();
+            let victim = conversations
+                .keys()
+                .filter(|key| **key != current)
+                .min_by_key(|key| use_map.get(*key).copied().unwrap_or(0))
+                .cloned();
+            if let Some(victim) = victim {
+                conversations.remove(&victim);
+                use_map.remove(&victim);
+            }
         }
     }
 }
@@ -227,6 +275,8 @@ impl ChatBackend {
                 cfg,
                 client: builder.build()?,
                 conversations: Mutex::new(HashMap::new()),
+                session_use: Mutex::new(HashMap::new()),
+                clock: AtomicU64::new(0),
             }),
         })
     }
@@ -266,6 +316,74 @@ impl AgentBackend for ChatBackend {
         })
         .boxed()
     }
+    fn suggest_title(&self, prompt: String, reply: String) -> BoxFuture<'static, Option<String>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let url = format!("{}/chat/completions", inner.cfg.base_url.trim_end_matches('/'));
+            let body = json!({
+                "model": inner.cfg.model,
+                "messages": [
+                    {"role": "system", "content": TITLE_SYSTEM},
+                    {"role": "user", "content": format!(
+                        "PROMPT:\n{}\n\nREPLY:\n{}",
+                        trunc(&prompt, 1200),
+                        trunc(&reply, 1200)
+                    )}
+                ],
+                "stream": false,
+                "max_tokens": 16,
+                "temperature": 0.2
+            });
+            let call = async {
+                let mut request = inner.client.post(&url).json(&body);
+                if let Some(key) = &inner.cfg.api_key {
+                    request = request.bearer_auth(key);
+                }
+                let response = request.send().await.ok()?;
+                if !response.status().is_success() {
+                    return None;
+                }
+                let value: Value = response.json().await.ok()?;
+                let text = value.pointer("/choices/0/message/content")?.as_str()?;
+                sanitize_title(text)
+            };
+            tokio::time::timeout(Duration::from_secs(10), call).await.ok().flatten()
+        })
+    }
+}
+
+const TITLE_SYSTEM: &str = "Write a session title: 3 to 6 words naming the task, in the language of the prompt. Plain words only: no quotes, no emoji, no trailing punctuation or colon.";
+
+/// Normalizes a model-proposed title into a single short display line.
+pub fn sanitize_title(raw: &str) -> Option<String> {
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let trimmed = line.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '*' | '#' | '_' | '>' | '-')
+    });
+    let mut words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+    words.truncate(8);
+    let mut title = words.join(" ");
+    title = title
+        .trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(c, '"' | '\'' | '`' | ':' | ';' | '.' | ',' | '!' | '?' | '*' | '#')
+        })
+        .to_string();
+    if title.chars().count() > 60 {
+        let mut cut: String = title.chars().take(60).collect();
+        if let Some(pos) = cut.rfind(' ') {
+            cut.truncate(pos);
+        }
+        title = cut;
+    }
+    title = title.trim().to_string();
+    if title.chars().count() < 2 {
+        return None;
+    }
+    Some(title)
 }
 
 struct Exec {
@@ -292,6 +410,8 @@ async fn emit(tx: &mpsc::Sender<AgentEvent>, event: AgentEvent) -> Result<(), St
     tx.send(event).await.map_err(|_| "turn dibatalkan".to_string())
 }
 
+const SUMMARY_NUDGE: &str = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
+
 async fn run_turn(
     inner: Arc<Inner>,
     request: TurnRequest,
@@ -303,28 +423,45 @@ async fn run_turn(
     let specs = tool_specs(request.plan_mode);
     let ctx = tools::Context::new(inner.cfg.root.clone());
     let mut committed: Vec<Value> = vec![json!({ "role": "user", "content": request.prompt })];
-    let mut rounds = 0usize;
+    let max = inner.cfg.max_iterations.max(1);
+    let mut tool_rounds = 0usize;
+    let mut balanced = 1usize;
+    let mut guard = guardrails::Guard::default();
 
     loop {
-        rounds += 1;
-        if rounds > inner.cfg.max_iterations {
-            return Err(format!(
-                "berhenti: melebihi batas {} iterasi tool",
-                inner.cfg.max_iterations
-            ));
+        if tool_rounds >= max {
+            return finish_budget(
+                &inner,
+                &request.session,
+                &history,
+                &system,
+                committed,
+                max,
+                &tx,
+            )
+            .await;
         }
+        emit(&tx, AgentEvent::Iteration { n: tool_rounds + 1, max }).await?;
+
         let mut messages = Vec::with_capacity(history.len() + committed.len() + 1);
         messages.push(system.clone());
         messages.extend(history.iter().cloned());
         messages.extend(committed.iter().cloned());
 
-        let round = stream_round(&inner, &messages, &specs, &tx).await?;
+        let round = match stream_round(&inner, &messages, &specs, &tx).await {
+            Ok(round) => round,
+            Err(error) => {
+                commit_partial(&inner, &request.session, &committed, balanced);
+                return Err(error);
+            }
+        };
         if round.calls.is_empty() {
             committed.push(json!({ "role": "assistant", "content": round.text }));
             inner.commit(&request.session, committed);
             return emit(&tx, AgentEvent::TurnFinished).await;
         }
 
+        tool_rounds += 1;
         let calls = round.calls;
         committed.push(json!({
             "role": "assistant",
@@ -345,9 +482,39 @@ async fn run_turn(
             let summary = trunc(&summary, 120);
             emit(&tx, AgentEvent::ToolStarted { name: call.name.clone(), summary: summary.clone() })
                 .await?;
-            let outcome =
-                authorize_and_run(&call.name, &args, &summary, &ctx, request.plan_mode, &mut decisions, &tx)
-                    .await?;
+
+            if let Some(reason) = guard.blocked(&call.name, &call.arguments) {
+                emit(&tx, AgentEvent::ToolFinished {
+                    name: call.name.clone(),
+                    ok: false,
+                    detail: reason.clone(),
+                })
+                .await?;
+                committed.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": reason
+                }));
+                continue;
+            }
+
+            let outcome = match authorize_and_run(
+                &call.name,
+                &args,
+                &summary,
+                &ctx,
+                request.plan_mode,
+                &mut decisions,
+                &tx,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    commit_partial(&inner, &request.session, &committed, balanced);
+                    return Err(error);
+                }
+            };
             if let Some((path, lines)) = &outcome.diff {
                 emit(&tx, AgentEvent::Diff { path: path.clone(), lines: lines.clone() }).await?;
             }
@@ -357,13 +524,100 @@ async fn run_turn(
                 detail: trunc(&outcome.detail, 2000),
             })
             .await?;
+
+            let mut result = outcome.result_text();
+            if let Some(stub) = guard.observe(&call.name, &call.arguments, outcome.ok, &result) {
+                result = stub;
+            }
+            if let Some(notice) = guard.take_notice() {
+                emit(&tx, AgentEvent::Notice { message: notice }).await?;
+            }
             committed.push(json!({
                 "role": "tool",
                 "tool_call_id": call.id,
-                "content": outcome.result_text()
+                "content": result
             }));
         }
+        balanced = committed.len();
     }
+}
+
+/// Persists only the fully balanced prefix of a failed turn (user message plus
+/// complete assistant/tool rounds), so the next `continue` resumes with context.
+fn commit_partial(inner: &Inner, session: &str, committed: &[Value], balanced: usize) {
+    if balanced > 1 && committed.len() >= balanced {
+        inner.commit(session, committed[..balanced].to_vec());
+    }
+}
+
+/// Grace request when the tool-call budget runs out: ask for a summary without
+/// tools, retry once, then fall back to a `continue` hint and commit the turn.
+#[allow(clippy::too_many_arguments)]
+async fn finish_budget(
+    inner: &Inner,
+    session: &str,
+    history: &[Value],
+    system: &Value,
+    mut committed: Vec<Value>,
+    max: usize,
+    tx: &mpsc::Sender<AgentEvent>,
+) -> Result<(), String> {
+    emit(
+        tx,
+        AgentEvent::Notice {
+            message: format!("batas iterasi tool tercapai ({max}/{max}) — minta ringkasan"),
+        },
+    )
+    .await?;
+    committed.push(json!({ "role": "user", "content": SUMMARY_NUDGE }));
+
+    let mut text = String::new();
+    let mut last_error = None;
+    for attempt in 0..2 {
+        let mut messages = Vec::with_capacity(history.len() + committed.len() + 1);
+        messages.push(system.clone());
+        messages.extend(history.iter().cloned());
+        messages.extend(committed.iter().cloned());
+        match stream_round(inner, &messages, &[], tx).await {
+            Ok(round) if !round.text.trim().is_empty() => {
+                text = round.text;
+                break;
+            }
+            Ok(_) => last_error = Some("respons kosong".to_string()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt == 0 {
+            emit(
+                tx,
+                AgentEvent::Notice {
+                    message: "ringkasan gagal, coba sekali lagi".into(),
+                },
+            )
+            .await?;
+        }
+    }
+
+    if text.trim().is_empty() {
+        let detail = last_error.unwrap_or_else(|| "respons kosong".into());
+        text = format!(
+            "Batas langkah turn ini habis ({max} tool call). Kirim `continue` untuk melanjutkan, atau naikkan `max_iterations` di agent.json."
+        );
+        emit(
+            tx,
+            AgentEvent::Notice {
+                message: format!(
+                    "ringkasan tidak tersedia ({}) — pakai pesan fallback",
+                    trunc(&detail, 140)
+                ),
+            },
+        )
+        .await?;
+        emit(tx, AgentEvent::TextDelta { text: text.clone() }).await?;
+    }
+
+    committed.push(json!({ "role": "assistant", "content": text }));
+    inner.commit(session, committed);
+    emit(tx, AgentEvent::TurnFinished).await
 }
 
 fn parse_args(raw: &str) -> Result<Value, String> {
@@ -430,6 +684,26 @@ fn trunc(text: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
+fn provider_error(status: reqwest::StatusCode, body: &str, model: &str) -> String {
+    let detail = trunc(body.trim(), 400);
+    let hint = match status.as_u16() {
+        401 => "API key ditolak 9router — cek `api_key` di agent.json",
+        402 => "kuota/kredit provider habis",
+        403 => "9router menolak key ini untuk model tersebut — buka dashboard 9router → API Keys, izinkan model itu atau matikan restrict access",
+        _ => "",
+    };
+    if hint.is_empty() {
+        format!("HTTP {status}: {detail}")
+    } else {
+        let model = if status.as_u16() == 403 {
+            format!(" (model `{model}`)")
+        } else {
+            String::new()
+        };
+        format!("HTTP {status}: {hint}{model}. {detail}")
+    }
+}
+
 struct Round {
     text: String,
     calls: Vec<ToolCall>,
@@ -479,9 +753,8 @@ async fn stream_round(
     if !specs.is_empty() {
         body["tools"] = Value::Array(specs.to_vec());
     }
-    let mut attempt = 0u64;
+    let mut retry_state = retry::RetryState::default();
     let response = loop {
-        attempt += 1;
         let mut request = inner.client.post(&url).json(&body);
         if let Some(key) = &inner.cfg.api_key {
             request = request.bearer_auth(key);
@@ -489,19 +762,42 @@ async fn stream_round(
         match request.send().await {
             Ok(response) => {
                 let status = response.status();
-                if (status.as_u16() == 429 || status.is_server_error()) && attempt < 3 {
-                    tokio::time::sleep(Duration::from_millis(600 * attempt)).await;
+                if status.is_success() {
+                    break response;
+                }
+                let headers = response.headers().clone();
+                let text = response.text().await.unwrap_or_default();
+                let failure = retry::classify_status(status, &headers);
+                if let Some(delay) = retry_state.next(&failure) {
+                    emit(
+                        tx,
+                        AgentEvent::Retrying {
+                            attempt: retry_state.retries,
+                            max: retry::MAX_RETRIES,
+                            delay_ms: delay,
+                            reason: failure.reason().to_string(),
+                        },
+                    )
+                    .await?;
+                    tokio::time::sleep(retry::sleep(delay)).await;
                     continue;
                 }
-                if !status.is_success() {
-                    let text = response.text().await.unwrap_or_default();
-                    return Err(format!("HTTP {status}{}", trunc(&format!(": {text}"), 400)));
-                }
-                break response;
+                return Err(provider_error(status, &text, &inner.cfg.model));
             }
             Err(error) => {
-                if attempt < 3 {
-                    tokio::time::sleep(Duration::from_millis(600 * attempt)).await;
+                let failure = retry::classify_error(&error);
+                if let Some(delay) = retry_state.next(&failure) {
+                    emit(
+                        tx,
+                        AgentEvent::Retrying {
+                            attempt: retry_state.retries,
+                            max: retry::MAX_RETRIES,
+                            delay_ms: delay,
+                            reason: failure.reason().to_string(),
+                        },
+                    )
+                    .await?;
+                    tokio::time::sleep(retry::sleep(delay)).await;
                     continue;
                 }
                 return Err(format!("gagal menghubungi {}: {error}", inner.cfg.base_url));
@@ -614,8 +910,36 @@ mod tests {
         sse(&[&frame.to_string(), "[DONE]"])
     }
 
+    struct FakeReply {
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        body: String,
+    }
+
+    impl FakeReply {
+        fn ok(body: String) -> Self {
+            Self {
+                status: 200,
+                headers: Vec::new(),
+                body,
+            }
+        }
+
+        fn status(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: body.to_string(),
+            }
+        }
+    }
+
     /// Serves one scripted reply per request; records each request body.
     fn fake_server(replies: Vec<String>) -> (Arc<Mutex<Vec<String>>>, String) {
+        fake_server_raw(replies.into_iter().map(FakeReply::ok).collect())
+    }
+
+    fn fake_server_raw(replies: Vec<FakeReply>) -> (Arc<Mutex<Vec<String>>>, String) {
         let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
         let addr = server.server_addr().to_ip().unwrap();
         let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -631,22 +955,33 @@ mod tests {
                     let mut body = String::new();
                     request.as_reader().read_to_string(&mut body).unwrap();
                     thread_bodies.lock().unwrap().push(body);
-                    let _ = request.respond(Response::from_data(reply));
+                    let mut response =
+                        Response::from_data(reply.body).with_status_code(reply.status);
+                    for (name, value) in reply.headers {
+                        if let Ok(header) = tiny_http::Header::from_bytes(name, value) {
+                            response.add_header(header);
+                        }
+                    }
+                    let _ = request.respond(response);
                 }
             });
         }
         (bodies, format!("http://{addr}/v1"))
     }
 
-    fn backend(base_url: String, root: PathBuf) -> ChatBackend {
+    fn backend_with(base_url: String, root: PathBuf, max_iterations: usize) -> ChatBackend {
         ChatBackend::new(AgentConfig {
             base_url,
             model: "test-model".into(),
             api_key: None,
-            max_iterations: 4,
+            max_iterations,
             root,
         })
         .unwrap()
+    }
+
+    fn backend(base_url: String, root: PathBuf) -> ChatBackend {
+        backend_with(base_url, root, 4)
     }
 
     async fn collect(backend: &ChatBackend, prompt: &str) -> Vec<AgentEvent> {
@@ -945,12 +1280,10 @@ mod tests {
         let server = Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap();
         std::thread::spawn(move || {
-            for _ in 0..3 {
-                let mut request = server.recv().unwrap();
-                let mut body = String::new();
-                request.as_reader().read_to_string(&mut body).unwrap();
-                let _ = request.respond(Response::from_string("kaboom").with_status_code(400));
-            }
+            let mut request = server.recv().unwrap();
+            let mut body = String::new();
+            request.as_reader().read_to_string(&mut body).unwrap();
+            let _ = request.respond(Response::from_string("kaboom").with_status_code(400));
         });
         let backend = backend(format!("http://{addr}/v1"), std::env::temp_dir());
         let events = collect(&backend, "halo").await;
@@ -958,6 +1291,133 @@ mod tests {
             panic!("expected Failed, got {events:?}");
         };
         assert!(message.contains("400"));
+    }
+
+    #[tokio::test]
+    async fn retries_rate_limits_before_failing_over() {
+        let (bodies, url) = fake_server_raw(vec![
+            FakeReply::status(429, "slow down"),
+            FakeReply::ok(sse(&[
+                r#"{"choices":[{"delta":{"content":"halo"}}]}"#,
+                "[DONE]",
+            ])),
+        ]);
+        let backend = backend(url, std::env::temp_dir());
+        let events = collect(&backend, "sapa").await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Retrying { attempt: 1, max: 10, reason, .. } if reason.contains("429")
+            )),
+            "missing retry event: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta { text } if text == "halo"
+        )));
+        assert_eq!(events.last(), Some(&AgentEvent::TurnFinished));
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn forbidden_error_is_not_retried_and_names_the_key_scope() {
+        let (_bodies, url) = fake_server_raw(vec![FakeReply::status(
+            403,
+            r#"{"error":{"message":"This API key is not allowed to use model test-model"}}"#,
+        )]);
+        let backend = backend(url, std::env::temp_dir());
+        let events = collect(&backend, "halo").await;
+        assert!(!events.iter().any(|event| matches!(event, AgentEvent::Retrying { .. })));
+        let Some(AgentEvent::Failed { message }) = events.last() else {
+            panic!("expected Failed, got {events:?}");
+        };
+        assert!(message.contains("403"));
+        assert!(message.contains("test-model"), "{message}");
+        assert!(message.contains("API Keys"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_requests_a_toolless_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "isi\n").unwrap();
+        let (bodies, url) = fake_server(vec![
+            tool_call_reply("read", json!({ "path": "a.txt" })),
+            tool_call_reply("read", json!({ "path": "a.txt" })),
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"ringkasan"}}]}"#,
+                "[DONE]",
+            ]),
+        ]);
+        let backend = backend_with(url, dir.path().to_path_buf(), 2);
+        let events = collect(&backend, "loop").await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Iteration { n: 2, max: 2 }
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Notice { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta { text } if text == "ringkasan"
+        )));
+        assert_eq!(events.last(), Some(&AgentEvent::TurnFinished));
+
+        let bodies = bodies.lock().unwrap();
+        let summary = bodies.last().unwrap();
+        assert!(
+            !summary.contains("\"tools\":"),
+            "summary request must not expose tools: {summary}"
+        );
+        assert!(summary.contains("maximum number of tool-calling iterations"));
+    }
+
+    #[tokio::test]
+    async fn budget_summary_falls_back_and_still_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "isi\n").unwrap();
+        let (_bodies, url) = fake_server(vec![
+            tool_call_reply("read", json!({ "path": "a.txt" })),
+            tool_call_reply("read", json!({ "path": "a.txt" })),
+            String::new(),
+            String::new(),
+        ]);
+        let backend = backend_with(url, dir.path().to_path_buf(), 2);
+        let events = collect(&backend, "loop").await;
+
+        assert!(!events.iter().any(|event| matches!(event, AgentEvent::Failed { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta { text } if text.contains("Batas langkah")
+        )));
+        assert_eq!(events.last(), Some(&AgentEvent::TurnFinished));
+    }
+
+    #[tokio::test]
+    async fn provider_error_keeps_completed_rounds_for_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "isi rahasia\n").unwrap();
+        let (bodies, url) = fake_server(vec![
+            tool_call_reply("read", json!({ "path": "a.txt" })),
+            sse(&[r#"{"error":{"message":"boom"}}"#]),
+            sse(&[
+                r#"{"choices":[{"delta":{"content":"lanjut ok"}}]}"#,
+                "[DONE]",
+            ]),
+        ]);
+        let backend = backend(url, dir.path().to_path_buf());
+
+        let first = collect(&backend, "baca").await;
+        assert!(matches!(first.last(), Some(AgentEvent::Failed { message }) if message.contains("boom")));
+
+        let _second = collect(&backend, "lanjut").await;
+        let bodies = bodies.lock().unwrap();
+        let second_turn = bodies.get(2).expect("second turn request");
+        assert!(
+            second_turn.contains("isi rahasia"),
+            "completed tool round was not committed: {second_turn}"
+        );
     }
 
     #[tokio::test]
@@ -1093,17 +1553,7 @@ mod tests {
 
     #[test]
     fn history_commit_trims_oldest_turns() {
-        let inner = Inner {
-            cfg: AgentConfig {
-                base_url: DEFAULT_BASE_URL.into(),
-                model: DEFAULT_MODEL.into(),
-                api_key: None,
-                max_iterations: 12,
-                root: std::env::temp_dir(),
-            },
-            client: reqwest::Client::new(),
-            conversations: Mutex::new(HashMap::new()),
-        };
+        let inner = Inner::for_test();
         let big = "x".repeat(MAX_HISTORY_CHARS / 2 + 10);
         for i in 0..3 {
             inner.commit("s", vec![json!({"role":"user","content":format!("q{i} {big}")})]);
@@ -1111,5 +1561,48 @@ mod tests {
         let replay = inner.replay("s");
         assert_eq!(replay.len(), 1, "only the newest turn survives");
         assert!(replay[0]["content"].as_str().unwrap().contains("q2"));
+    }
+
+    #[test]
+    fn history_evicts_cold_sessions_beyond_cap() {
+        let inner = Inner::for_test();
+        for i in 0..=MAX_HISTORY_SESSIONS {
+            inner.commit(&format!("s{i}"), vec![json!({"role":"user","content":"hi"})]);
+        }
+        let conversations = inner.conversations.lock().unwrap();
+        assert_eq!(conversations.len(), MAX_HISTORY_SESSIONS);
+        assert!(
+            !conversations.contains_key("s0"),
+            "the least recently used session should be gone"
+        );
+        assert!(conversations.contains_key(&format!("s{MAX_HISTORY_SESSIONS}")));
+    }
+
+    #[test]
+    fn sanitize_title_strips_noise_and_caps() {
+        assert_eq!(
+            sanitize_title("\"Fix SSE heartbeat\"\n").as_deref(),
+            Some("Fix SSE heartbeat")
+        );
+        assert_eq!(sanitize_title("# Re: refactor??").as_deref(), Some("Re: refactor"));
+        assert_eq!(
+            sanitize_title("a".repeat(90).as_str()).as_deref(),
+            Some("a".repeat(60).as_str())
+        );
+        assert_eq!(sanitize_title("  ! "), None);
+        assert_eq!(sanitize_title(""), None);
+    }
+
+    #[tokio::test]
+    async fn suggest_title_parses_model_reply_and_survives_errors() {
+        let good = json!({"choices":[{"message":{"content":"\"Fix SSE heartbeat\""}}]}).to_string();
+        let (_bodies, url) = fake_server(vec![good]);
+        let b1 = backend(url, std::env::temp_dir());
+        let title = b1.suggest_title("perbaiki sse".into(), "sudah".into()).await;
+        assert_eq!(title.as_deref(), Some("Fix SSE heartbeat"));
+
+        let (_bodies, url) = fake_server(vec!["not json".into()]);
+        let backend2 = backend(url, std::env::temp_dir());
+        assert_eq!(backend2.suggest_title("a".into(), "b".into()).await, None);
     }
 }

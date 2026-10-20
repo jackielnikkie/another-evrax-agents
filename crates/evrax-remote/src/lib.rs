@@ -765,6 +765,16 @@ pub fn deregister(server: &RemoteServer, id: &str) {
     }
 }
 
+/// Update only the display name of a registered session. Mode, queues and
+/// subscribers stay untouched — unlike `register`, renaming never resets state.
+pub fn rename_session(server: &RemoteServer, id: &str, name: String) {
+    if let Ok(mut reg) = server.state.registry.lock()
+        && let Some(existing) = reg.get_mut(id)
+    {
+        existing.session.name = name;
+    }
+}
+
 /// Push a realtime event to every web subscriber of one session. No-op when the
 /// session is not registered (remote disabled or closed).
 pub fn emit(server: &RemoteServer, id: &str, event: RemoteEvent) {
@@ -966,6 +976,33 @@ mod tests {
         deregister(&server, "s1");
         assert_eq!(server.state.refcount.load(Ordering::SeqCst), 1);
         deregister(&server, "missing");
+        assert_eq!(server.state.refcount.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rename_session_updates_name_only() {
+        let server = start(RemoteConfig { port: 0, ..Default::default() });
+        register(&server, "s1".into(), "one".into(), Permit::Read);
+        set_session_mode(&server, "s1", "plan");
+        server
+            .state
+            .registry
+            .lock()
+            .unwrap()
+            .get("s1")
+            .unwrap()
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .push_back("queued".to_string());
+        rename_session(&server, "s1", "perbaiki streaming".into());
+        rename_session(&server, "ghost", "ignored".into());
+        let reg = server.state.registry.lock().unwrap();
+        let entry = reg.get("s1").unwrap();
+        assert_eq!(entry.session.name, "perbaiki streaming");
+        assert_eq!(entry.session.mode, "plan", "rename must not reset the mode");
+        assert_eq!(entry.session.permit, Permit::Read);
+        assert_eq!(entry.pending_prompts.lock().unwrap().len(), 1);
         assert_eq!(server.state.refcount.load(Ordering::SeqCst), 1);
     }
 

@@ -5,7 +5,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block as WidgetBlock, BorderType, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Wrap,
+    ScrollbarState,
 };
 
 use evrax_core::DiffKind;
@@ -177,18 +177,22 @@ fn chat(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
 }
 
 fn messages(frame: &mut Frame, area: Rect, app: &mut App) {
-    let lines = conversation_lines(&app.messages, app.tick, area.width);
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let content_height = paragraph.line_count(area.width) as u16;
-    let max_scroll = content_height.saturating_sub(area.height);
-    // The event loop needs this exact value for clamping/scrolling; rebuilding the
-    // whole transcript a second time per frame was doubling the render cost.
-    app.frame_max_scroll = max_scroll;
-    let offset = max_scroll.saturating_sub(app.scroll_from_bottom);
-    frame.render_widget(paragraph.scroll((offset, 0)), area);
+    // Per-entry line cache: only the tail entry (streaming text, running tool)
+    // is rebuilt per frame, so render cost stays flat as the transcript grows.
+    let (content_height, offset, visible) = {
+        let lines = app
+            .transcript
+            .sync(&app.messages, app.tick, app.content_rev, area.width, crate::theme::index());
+        let max_scroll = lines.len().saturating_sub(area.height as usize) as u16;
+        let offset = max_scroll.saturating_sub(app.scroll_from_bottom);
+        let end = (offset as usize + area.height as usize + 1).min(lines.len());
+        app.frame_max_scroll = max_scroll;
+        (lines.len(), offset, lines[offset as usize..end].to_vec())
+    };
+    frame.render_widget(Paragraph::new(visible), area);
 
-    if max_scroll > 0 && area.width > 2 {
-        let mut state = ScrollbarState::new(content_height as usize)
+    if content_height > area.height as usize && area.width > 2 {
+        let mut state = ScrollbarState::new(content_height)
             .viewport_content_length(area.height as usize)
             .position(offset as usize);
         let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -198,10 +202,118 @@ fn messages(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// Flattened transcript lines with incremental rebuilds. Mutations always
+/// touch the last entry, so entries below the tail are frozen once built.
+#[derive(Default)]
+pub struct TranscriptCache {
+    width: usize,
+    theme: usize,
+    /// Entry count at the last sync; `usize::MAX` marks "force full rebuild".
+    prev_n: usize,
+    /// Number of frozen (non-tail) entry blocks in `lines`.
+    frozen: usize,
+    /// Line index where the tail entry block starts.
+    tail_start: usize,
+    /// Last tick/revision the tail was rendered for; unchanged means the
+    /// cached tail (including spinner frame) is still current.
+    last_tick: u64,
+    last_rev: u64,
+    lines: Vec<Line<'static>>,
+    #[cfg(test)]
+    rebuilds: usize,
+    #[cfg(test)]
+    tail_rebuilds: usize,
+}
+
+impl TranscriptCache {
+    /// Drop all cached lines (session switch or any other content reset).
+    pub fn invalidate(&mut self) {
+        self.prev_n = usize::MAX;
+    }
+
+    pub fn sync(
+        &mut self,
+        entries: &[ChatEntry],
+        tick: u64,
+        rev: u64,
+        width: u16,
+        theme: usize,
+    ) -> &Vec<Line<'static>> {
+        let width = width.max(1) as usize;
+        let n = entries.len();
+        if n < self.prev_n || width != self.width || theme != self.theme {
+            self.theme = theme;
+            self.rebuild(entries, tick, rev, width);
+            return &self.lines;
+        }
+        let mut tail_dirty = tick != self.last_tick || rev != self.last_rev;
+        if n > self.prev_n {
+            self.lines.truncate(self.tail_start);
+            for entry in &entries[self.frozen..n.saturating_sub(1)] {
+                self.lines.extend(entry_lines(entry, tick, width));
+                self.lines.push(Line::from(""));
+            }
+            self.frozen = n.saturating_sub(1);
+            self.tail_start = self.lines.len();
+            self.prev_n = n;
+            tail_dirty = true;
+        }
+        if n > 0 && tail_dirty {
+            self.lines.truncate(self.tail_start);
+            self.lines.extend(entry_lines(&entries[n - 1], tick, width));
+            self.lines.push(Line::from(""));
+            self.last_tick = tick;
+            self.last_rev = rev;
+            #[cfg(test)]
+            {
+                self.tail_rebuilds += 1;
+            }
+        }
+        &self.lines
+    }
+
+    fn rebuild(&mut self, entries: &[ChatEntry], tick: u64, rev: u64, width: usize) {
+        #[cfg(test)]
+        {
+            self.rebuilds += 1;
+            self.tail_rebuilds += 1;
+        }
+        self.width = width;
+        self.prev_n = entries.len();
+        self.last_tick = tick;
+        self.last_rev = rev;
+        self.lines = vec![Line::from("")];
+        let Some((last, head)) = entries.split_last() else {
+            self.frozen = 0;
+            self.tail_start = self.lines.len();
+            return;
+        };
+        for entry in head {
+            self.lines.extend(entry_lines(entry, tick, width));
+            self.lines.push(Line::from(""));
+        }
+        self.frozen = head.len();
+        self.tail_start = self.lines.len();
+        self.lines.extend(entry_lines(last, tick, width));
+        self.lines.push(Line::from(""));
+    }
+}
+
+/// Reference implementation used to verify the incremental cache.
+#[cfg(test)]
 fn conversation_lines(entries: &[ChatEntry], tick: u64, width: u16) -> Vec<Line<'static>> {
     let width = width.max(1) as usize;
     let mut lines: Vec<Line<'static>> = vec![Line::from("")];
     for entry in entries {
+        lines.extend(entry_lines(entry, tick, width));
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    {
         match entry {
             ChatEntry::User(text) => {
                 for raw in wrap_text(text, width.saturating_sub(4)) {
@@ -262,18 +374,26 @@ fn conversation_lines(entries: &[ChatEntry], tick: u64, width: u16) -> Vec<Line<
                 }
             }
             ChatEntry::Diff { path, lines: diff } => {
+                let avail = width.saturating_sub(7);
+                let shown = if path.width() > avail {
+                    let mut cut: String = path.chars().take(avail.saturating_sub(1)).collect();
+                    cut.push('…');
+                    cut
+                } else {
+                    path.clone()
+                };
                 let mut header = vec![
                     Span::styled("   ", Style::default()),
                     Span::styled(
-                        "┊ ",
+                        "│ ",
                         Style::default().fg(current().border).bg(current().diff_ctx_gutter),
                     ),
                     Span::styled(
-                        path.clone(),
+                        shown.clone(),
                         Style::default().fg(current().muted).bg(current().diff_ctx_gutter),
                     ),
                 ];
-                let header_used = 5 + path.width();
+                let header_used = 5 + shown.width();
                 if header_used < width {
                     header.push(Span::styled(
                         " ".repeat(width - header_used),
@@ -286,48 +406,53 @@ fn conversation_lines(entries: &[ChatEntry], tick: u64, width: u16) -> Vec<Line<
                         DiffKind::Add => ("+", current().diff_add, current().diff_add_bg, current().diff_add_gutter),
                         DiffKind::Rem => ("-", current().diff_rem, current().diff_rem_bg, current().diff_rem_gutter),
                         DiffKind::Ctx => {
-                            lines.push(Line::from(vec![
-                                Span::styled("   ", Style::default()),
-                                Span::styled(
-                                    "┊ ",
-                                    Style::default().fg(current().border).bg(current().diff_ctx_gutter),
-                                ),
-                                Span::styled("  ", Style::default().fg(current().muted)),
-                                Span::styled(
-                                    line.text.clone(),
-                                    Style::default().fg(current().diff_ctx_text),
-                                ),
-                            ]));
+                            for raw in wrap_text(&line.text, width.saturating_sub(7).max(1)) {
+                                lines.push(Line::from(vec![
+                                    Span::styled("   ", Style::default()),
+                                    Span::styled(
+                                        "│ ",
+                                        Style::default()
+                                            .fg(current().border)
+                                            .bg(current().diff_ctx_gutter),
+                                    ),
+                                    Span::styled("  ", Style::default().fg(current().muted)),
+                                    Span::styled(
+                                        raw,
+                                        Style::default().fg(current().diff_ctx_text),
+                                    ),
+                                ]));
+                            }
                             continue;
                         }
                     };
-                    let mut spans = vec![
-                        Span::styled("   ", Style::default()),
-                        Span::styled(
-                            "┊ ",
-                            Style::default().fg(current().border).bg(gutter_bg),
-                        ),
-                        Span::styled(
-                            format!("{sign} "),
-                            Style::default().fg(sign_color).bg(content_bg),
-                        ),
-                        Span::styled(
-                            line.text.clone(),
-                            Style::default().fg(current().text).bg(content_bg),
-                        ),
-                    ];
-                    let used = 7 + line.text.width();
-                    if used < width {
-                        spans.push(Span::styled(
-                            " ".repeat(width - used),
-                            Style::default().bg(content_bg),
-                        ));
+                    for raw in wrap_text(&line.text, width.saturating_sub(7).max(1)) {
+                        let mut spans = vec![
+                            Span::styled("   ", Style::default()),
+                            Span::styled(
+                                "┊ ",
+                                Style::default().fg(current().border).bg(gutter_bg),
+                            ),
+                            Span::styled(
+                                format!("{sign} "),
+                                Style::default().fg(sign_color).bg(content_bg),
+                            ),
+                            Span::styled(
+                                raw.clone(),
+                                Style::default().fg(current().text).bg(content_bg),
+                            ),
+                        ];
+                        let used = 7 + raw.width();
+                        if used < width {
+                            spans.push(Span::styled(
+                                " ".repeat(width - used),
+                                Style::default().bg(content_bg),
+                            ));
+                        }
+                        lines.push(Line::from(spans));
                     }
-                    lines.push(Line::from(spans));
                 }
             }
         }
-        lines.push(Line::from(""));
     }
     lines
 }
@@ -797,7 +922,7 @@ fn sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::from(vec![
             Span::styled("▸ ", Style::default().fg(current().interactive)),
-            Span::styled(app.session_name.clone(), Style::default().fg(current().text)),
+            Span::styled(app.display_name(), Style::default().fg(current().text)),
         ]),
         Line::from(Span::styled(
             format!("  {} · {} saved", app.backend_label, app.sessions.len()),
@@ -851,12 +976,16 @@ fn sidebar(frame: &mut Frame, area: Rect, app: &App) {
 
 fn footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = if app.busy {
+        let status = match app.iteration {
+            Some((n, max)) => format!("working · iterasi {n}/{max}"),
+            None => "working".to_string(),
+        };
         vec![
             Span::styled(
                 format!(" {} ", spinner(app.tick)),
                 Style::default().fg(current().interactive),
             ),
-            Span::styled("working", Style::default().fg(current().muted)),
+            Span::styled(status, Style::default().fg(current().muted)),
             Span::styled("  ·  ", Style::default().fg(current().border)),
             Span::styled("esc ", Style::default().fg(current().interactive)),
             Span::styled("cancel", Style::default().fg(current().muted)),
@@ -1797,18 +1926,92 @@ mod tests {
     #[test]
     fn session_dialog_lists_sessions() {
         let mut app = App::new();
+        for c in "perbaiki streaming sse".chars() {
+            app.input.insert_char(c);
+        }
+        app.submit_prompt();
+        app.new_session();
         app.open_sessions();
         let text = render_text_with(&mut app, 100, 30);
         assert!(text.contains("sessions"), "modal title missing:\n{text}");
         assert!(
-            text.contains("untitled session"),
+            text.contains("new session (current)"),
             "current session missing:\n{text}"
         );
         assert!(
-            text.contains("refactor ui.rs"),
-            "saved session missing:\n{text}"
+            text.contains("perbaiki streaming sse"),
+            "titled session missing:\n{text}"
         );
         assert!(text.contains("new session"), "new session row missing:\n{text}");
+    }
+
+    #[test]
+    fn transcript_cache_grows_from_empty_transcript() {
+        let theme = crate::theme::index();
+        let mut cache = TranscriptCache::default();
+        let empty: [ChatEntry; 0] = [];
+        cache.sync(&empty, 0, 0, 80, theme);
+        let mut entries = vec![ChatEntry::User("hai bos".to_string())];
+        let out = cache.sync(&entries, 0, 1, 80, theme).clone();
+        assert_eq!(out, conversation_lines(&entries, 0, 80));
+        assert_eq!(cache.rebuilds, 1, "growth from empty must extend, not rebuild");
+        assert_eq!(out.first().unwrap().width(), 0);
+        entries.push(ChatEntry::Assistant("sip".to_string()));
+        let out = cache.sync(&entries, 0, 2, 80, theme).clone();
+        assert_eq!(out, conversation_lines(&entries, 0, 80));
+        assert_eq!(cache.rebuilds, 1);
+    }
+
+    #[test]
+    fn transcript_cache_matches_plain_render_and_reuses_prefix() {
+        let entries = sample_conversation();
+        let theme = crate::theme::index();
+        let mut cache = TranscriptCache::default();
+        let synced = cache.sync(&entries, 3, 0, 80, theme).clone();
+        assert_eq!(synced, conversation_lines(&entries, 3, 80));
+        assert_eq!(cache.rebuilds, 1);
+        for line in &synced {
+            assert!(line.width() <= 80, "line too wide: {line:?}");
+        }
+        cache.sync(&entries, 3, 0, 80, theme);
+        assert_eq!(cache.rebuilds, 1, "same content must not rebuild");
+        assert_eq!(cache.tail_rebuilds, 1, "same tick+rev must not rebuild the tail");
+        let mut grown = sample_conversation();
+        grown.push(ChatEntry::Assistant("tambahan baru".to_string()));
+        let out = cache.sync(&grown, 3, 1, 80, theme).clone();
+        assert_eq!(cache.rebuilds, 1, "new entries extend the cache");
+        assert_eq!(out, conversation_lines(&grown, 3, 80));
+        let shrunk = &grown[..grown.len() - 1];
+        cache.sync(shrunk, 3, 2, 80, theme);
+        assert_eq!(cache.rebuilds, 2, "shrink (retention) forces a rebuild");
+        cache.sync(shrunk, 3, 2, 40, theme);
+        assert_eq!(cache.rebuilds, 3, "width change forces a rebuild");
+        cache.sync(shrunk, 3, 2, 40, theme + 1);
+        assert_eq!(cache.rebuilds, 4, "theme change forces a rebuild");
+        cache.invalidate();
+        cache.sync(shrunk, 3, 2, 40, theme + 1);
+        assert_eq!(cache.rebuilds, 5, "invalidate forces a rebuild");
+    }
+
+    #[test]
+    fn transcript_cache_rebuilds_only_streaming_tail() {
+        let theme = crate::theme::index();
+        let mut cache = TranscriptCache::default();
+        let mut entries = vec![
+            ChatEntry::User("halo".to_string()),
+            ChatEntry::Assistant("sep".to_string()),
+        ];
+        cache.sync(&entries, 1, 0, 80, theme);
+        let after_prefix = cache.lines.len();
+        entries[1] = ChatEntry::Assistant("kata ".repeat(60));
+        let out = cache.sync(&entries, 1, 1, 80, theme).clone();
+        assert_eq!(cache.rebuilds, 1, "tail edit must not rebuild the prefix");
+        assert!(out.len() > after_prefix, "streaming must grow the tail");
+        assert_eq!(out, conversation_lines(&entries, 1, 80));
+        let same_len = out.len();
+        let same = cache.sync(&entries, 1, 1, 80, theme).clone();
+        assert_eq!(same.len(), same_len);
+        assert_eq!(cache.tail_rebuilds, 2, "idle repaint reuses the tail");
     }
 
     #[test]
@@ -1834,6 +2037,20 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("working"), "busy footer missing:\n{text}");
         assert!(text.contains("cancel"), "cancel hint missing:\n{text}");
+    }
+
+    #[test]
+    fn footer_shows_iteration_budget() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let mut app = App::new();
+        app.busy = true;
+        app.iteration = Some((3, 500));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("iterasi 3/500"),
+            "iteration status missing:\n{text}"
+        );
     }
 
     #[test]

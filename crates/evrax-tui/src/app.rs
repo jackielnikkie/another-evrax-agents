@@ -17,6 +17,8 @@ pub struct App {
     pub messages: Vec<ChatEntry>,
     pub input: LineEditor,
     pub busy: bool,
+    /// Current tool-calling iteration inside the running turn (`n/max`).
+    pub iteration: Option<(usize, usize)>,
     pub mode: AgentMode,
     pub scroll_from_bottom: u16,
     pub viewport_height: u16,
@@ -50,10 +52,25 @@ pub struct App {
     pub pending_kitty: Vec<String>,
     pub chip_rects: Vec<Rect>,
     pub chip_x_rects: Vec<Rect>,
-    pub session_name: String,
+    pub session_id: String,
     pub sessions: Vec<String>,
     /// Message history kept per named session (replayed when switching back).
     pub transcripts: std::collections::HashMap<String, Vec<ChatEntry>>,
+    /// Display titles per session id; `session_id` itself never changes so the
+    /// backend history and remote registry stay intact across renames.
+    pub titles: std::collections::HashMap<String, String>,
+    /// Sessions whose title was set manually; LLM suggestions must not
+    /// overwrite them.
+    pub manual_titles: std::collections::HashSet<String>,
+    /// Sessions for which an LLM title request has already been fired.
+    title_pending: std::collections::HashSet<String>,
+    /// Queued LLM title job picked up by the event loop (session, prompt, reply).
+    title_job: Option<(String, String, String)>,
+    /// Flattened transcript lines, rebuilt per entry only when it changes.
+    pub transcript: crate::ui::TranscriptCache,
+    /// Bumped whenever transcript content changes; lets the render cache skip
+    /// tail rebuilds on pure keystroke repaints.
+    pub content_rev: u64,
     pub last_esc: Option<u64>,
     asst_open: bool,
 }
@@ -149,6 +166,7 @@ pub enum Command {
     NewSession,
     Theme,
     Remote,
+    Rename,
     Quit,
 }
 
@@ -201,6 +219,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         command: Command::Remote,
     },
     SlashCommand {
+        name: "rename",
+        aliases: &[],
+        description: "set this session's title",
+        command: Command::Rename,
+    },
+    SlashCommand {
         name: "exit",
         aliases: &["quit", "q"],
         description: "quit evrax",
@@ -226,6 +250,12 @@ pub fn slash_options() -> Vec<SlashOption> {
 
 /// Rows shown per page in scrollable dialogs (palette, slash menu, lists).
 pub const DIALOG_PAGE: usize = 8;
+
+/// Transcript entries kept per session in memory (oldest are dropped first).
+pub const MAX_ENTRIES_PER_SESSION: usize = 400;
+
+/// Background sessions whose transcripts and titles are retained (LRU).
+pub const MAX_RETAINED_SESSIONS: usize = 16;
 
 /// Minimum remote password length enforced by the in-TUI editor.
 pub const REMOTE_MIN_PASSWORD: usize = 8;
@@ -350,10 +380,59 @@ fn local_ipv4() -> Option<String> {
 }
 
 /// Unique session name: millisecond epoch + a process-local counter.
-fn unique_session_name() -> String {
+fn unique_session_id() -> String {
     static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("session-{}-{n}", s_now())
+}
+
+/// Placeholder title from a prompt: first prose line, markdown stripped,
+/// cut to a short word boundary. Used until the model proposes a real title.
+pub fn title_from_prompt(prompt: &str) -> Option<String> {
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("```"))?;
+    if line.starts_with('/') {
+        return None;
+    }
+    let mut words: Vec<String> = Vec::new();
+    for w in line.split_whitespace() {
+        let clean = w.trim_matches(|c: char| {
+            matches!(c, '#' | '*' | '`' | '>' | '_' | '~' | '[' | ']' | '(' | ')')
+        });
+        if clean.is_empty() {
+            continue;
+        }
+        words.push(clean.to_string());
+        if words.len() == 6 {
+            break;
+        }
+    }
+    if words.is_empty() {
+        return None;
+    }
+    let mut title = words.join(" ");
+    title = title
+        .trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(c, '"' | '\'' | ':' | ';' | '.' | ',' | '!' | '?' | '-' | '#')
+        })
+        .to_string();
+    if title.chars().count() > 48 {
+        let mut cut: String = title.chars().take(48).collect();
+        if let Some(pos) = cut.rfind(' ') {
+            cut.truncate(pos);
+        }
+        title = cut.trim_end_matches(|c: char| {
+            matches!(c, '"' | '\'' | ':' | ';' | '.' | ',' | '!' | '?' | '-')
+        })
+        .to_string();
+    }
+    if title.chars().count() < 2 {
+        return None;
+    }
+    Some(title)
 }
 
 /// Copies a staged clipboard image to a friendlier `screenshot-HHMMSS.png`
@@ -639,6 +718,7 @@ impl App {
             messages: Vec::new(),
             input: LineEditor::new(),
             busy: false,
+            iteration: None,
             mode: AgentMode::Build,
             scroll_from_bottom: 0,
             viewport_height: 10,
@@ -667,9 +747,15 @@ impl App {
             pending_kitty: Vec::new(),
             chip_rects: Vec::new(),
             chip_x_rects: Vec::new(),
-            session_name: "untitled session".to_string(),
-            sessions: vec!["refactor ui.rs".to_string(), "fix failing test".to_string()],
+            session_id: unique_session_id(),
+            sessions: Vec::new(),
             transcripts: std::collections::HashMap::new(),
+            titles: std::collections::HashMap::new(),
+            manual_titles: std::collections::HashSet::new(),
+            title_pending: std::collections::HashSet::new(),
+            title_job: None,
+            transcript: crate::ui::TranscriptCache::default(),
+            content_rev: 0,
             last_esc: None,
             asst_open: false,
         }
@@ -703,6 +789,127 @@ impl App {
 
     pub fn set_flash(&mut self, text: String) {
         self.flash = Some((text, self.tick + 10));
+    }
+
+    /// Name shown in the sidebar, session dialog and web: the title if one
+    /// exists, else a generic label (raw ids are noise).
+    pub fn display_name(&self) -> String {
+        self.titles
+            .get(&self.session_id)
+            .cloned()
+            .unwrap_or_else(|| "new session".to_string())
+    }
+
+    /// Title for any known session id (falls back to the id itself).
+    pub fn title_of(&self, id: &str) -> String {
+        self.titles.get(id).cloned().unwrap_or_else(|| id.to_string())
+    }
+
+    /// Sets a session title and mirrors it to the remote registry, if on.
+    fn set_title(&mut self, id: &str, title: String, manual: bool) {
+        if title.is_empty() {
+            return;
+        }
+        self.titles.insert(id.to_string(), title.clone());
+        if manual {
+            self.manual_titles.insert(id.to_string());
+        }
+        if id == self.session_id
+            && self.remote.as_ref().is_some_and(|r| r.enabled)
+            && let Some(server) = &self.remote_server
+        {
+            let turn_id = self
+                .remote
+                .as_ref()
+                .map(|r| r.session_id.clone())
+                .unwrap_or_default();
+            evrax_remote::rename_session(server, &turn_id, title);
+        }
+    }
+
+    /// `/rename <title>` — a manual title survives later model suggestions.
+    pub fn rename_session_title(&mut self, arg: &str) {
+        let title: String = arg.split_whitespace().collect::<Vec<_>>().join(" ");
+        let title: String = title.chars().take(60).collect();
+        if title.is_empty() {
+            self.set_flash("usage: /rename <title>".to_string());
+            return;
+        }
+        let id = self.session_id.clone();
+        self.set_title(&id, title, true);
+        self.set_flash("session renamed".to_string());
+    }
+
+    /// LLM title job queued for the event loop (it owns tokio spawning).
+    pub fn take_title_job(&mut self) -> Option<(String, String, String)> {
+        self.title_job.take()
+    }
+
+    fn plan_title_job(&mut self) {
+        let id = self.session_id.clone();
+        if self.manual_titles.contains(&id) || self.title_pending.contains(&id) {
+            return;
+        }
+        let Some(prompt) = self.messages.iter().find_map(|entry| match entry {
+            ChatEntry::User(text) if !text.trim().is_empty() => Some(text.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(reply) = self.last_assistant_text() else {
+            return;
+        };
+        self.title_pending.insert(id.clone());
+        self.title_job = Some((id, prompt, reply));
+    }
+
+    fn ensure_placeholder_title(&mut self, prompt: &str) {
+        if self.titles.contains_key(&self.session_id) {
+            return;
+        }
+        let Some(title) = title_from_prompt(prompt) else {
+            return;
+        };
+        let id = self.session_id.clone();
+        self.set_title(&id, title, false);
+    }
+
+    /// Push one transcript entry, capping how much a single session keeps in
+    /// memory. Dropped entries only leave the display; the backend history is
+    /// trimmed independently by character budget.
+    fn push_entry(&mut self, entry: ChatEntry) {
+        self.messages.push(entry);
+        if self.messages.len() > MAX_ENTRIES_PER_SESSION + 80 {
+            let drop = self.messages.len() - MAX_ENTRIES_PER_SESSION;
+            self.messages.drain(..drop);
+        }
+        self.content_rev = self.content_rev.wrapping_add(1);
+    }
+
+    /// Store a session's transcript, evicting the least recently used ones
+    /// beyond the retention cap.
+    fn remember_transcript(&mut self, id: String, messages: Vec<ChatEntry>) {
+        self.transcripts.insert(id, messages);
+        while self.transcripts.len() > MAX_RETAINED_SESSIONS {
+            let victim = self
+                .sessions
+                .iter()
+                .rev()
+                .find(|name| **name != self.session_id && self.transcripts.contains_key(*name))
+                .cloned();
+            match victim {
+                Some(victim) => self.forget_session(&victim),
+                None => break,
+            }
+        }
+    }
+
+    fn forget_session(&mut self, id: &str) {
+        self.transcripts.remove(id);
+        self.titles.remove(id);
+        self.manual_titles.remove(id);
+        self.title_pending.remove(id);
+        self.sessions.retain(|name| name != id);
     }
 
     pub fn quit(&mut self) {
@@ -834,6 +1041,7 @@ impl App {
             Command::NewSession => self.new_session(),
             Command::Theme => self.open_theme_dialog(),
             Command::Remote => self.open_remote_dialog(),
+            Command::Rename => self.rename_session_title(""),
             Command::Quit => self.quit(),
         }
     }
@@ -944,9 +1152,9 @@ impl App {
         self.slash_dismissed = None;
         self.session_dialog = None;
         self.theme_dialog = None;
-        let old = std::mem::replace(&mut self.session_name, unique_session_name());
-        self.transcripts
-            .insert(old.clone(), std::mem::take(&mut self.messages));
+        let old = std::mem::replace(&mut self.session_id, unique_session_id());
+        let archived = std::mem::take(&mut self.messages);
+        self.remember_transcript(old.clone(), archived);
         if !self.sessions.contains(&old) {
             self.sessions.insert(0, old);
         }
@@ -955,6 +1163,7 @@ impl App {
         self.busy = false;
         self.scroll_from_bottom = 0;
         self.selection.clear();
+        self.transcript.invalidate();
         self.set_flash("new session".to_string());
     }
 
@@ -972,8 +1181,13 @@ impl App {
 
     pub fn session_rows(&self) -> Vec<String> {
         let mut rows = vec!["＋ new session".to_string()];
-        rows.push(format!("{} (current)", self.session_name));
-        rows.extend(self.sessions.iter().cloned());
+        rows.push(format!("{} (current)", self.display_name()));
+        rows.extend(
+            self.sessions
+                .iter()
+                .map(|id| self.title_of(id))
+                .collect::<Vec<String>>(),
+        );
         rows
     }
 
@@ -1010,18 +1224,18 @@ impl App {
             idx => {
                 let target = idx - 2;
                 if target < self.sessions.len() {
-                    let old = std::mem::replace(&mut self.session_name, self.sessions[target].clone());
-                    let target_name = self.session_name.clone();
-                    self.sessions[target] = old.clone();
-                    let current = std::mem::take(&mut self.messages);
-                    let restored = self.transcripts.remove(&target_name).unwrap_or_default();
-                    self.transcripts.insert(old, current);
+                    let target_id = self.sessions.remove(target);
+                    let old = std::mem::replace(&mut self.session_id, target_id.clone());
+                    self.sessions.insert(0, old.clone());
+                    let archived = std::mem::take(&mut self.messages);
+                    self.remember_transcript(old, archived);
+                    self.messages = self.transcripts.remove(&target_id).unwrap_or_default();
                     self.input.take();
                     self.asst_open = false;
                     self.scroll_from_bottom = 0;
                     self.selection.clear();
-                    self.messages = restored;
-                    self.set_flash(format!("session · {}", self.session_name));
+                    self.transcript.invalidate();
+                    self.set_flash(format!("session · {}", self.display_name()));
                 }
             }
         }
@@ -1585,7 +1799,7 @@ impl App {
         let session_id = remote.session_id.clone();
         let permit = remote.permit;
         let enabled = remote.enabled;
-        let name = self.session_name.clone();
+        let name = self.display_name();
 
         if !enabled {
             if let Some(server) = &self.remote_server {
@@ -1733,10 +1947,19 @@ impl App {
         if prompt.is_empty() && self.attachments.is_empty() {
             return None;
         }
+        if prompt.starts_with('/') && self.attachments.is_empty() {
+            self.input.take();
+            self.slash = None;
+            self.slash_dismissed = None;
+            self.run_slash_line(&prompt);
+            return None;
+        }
         self.input.take();
         self.attachments.clear();
-        self.messages.push(ChatEntry::User(prompt.clone()));
+        self.push_entry(ChatEntry::User(prompt.clone()));
+        self.ensure_placeholder_title(&prompt);
         self.busy = true;
+        self.iteration = None;
         self.asst_open = false;
         self.scroll_from_bottom = 0;
         if let Some(turn) = self.remote.as_ref().map(|s| s.session_id.clone()) {
@@ -1747,6 +1970,31 @@ impl App {
             self.emit_remote(evrax_remote::RemoteEvent::TurnStart { turn });
         }
         Some(prompt)
+    }
+
+    /// Runs a `/name [arg]` line typed into the composer (the slash menu only
+    /// matches argument-less names, so this is the entry point for `/rename`).
+    fn run_slash_line(&mut self, line: &str) {
+        let rest = &line[1..];
+        let (name, arg) = match rest.split_once(char::is_whitespace) {
+            Some((n, a)) => (n, a.trim()),
+            None => (rest, ""),
+        };
+        let Some((_, _, command)) =
+            slash_options().into_iter().find(|(entry, _, _)| *entry == name)
+        else {
+            self.set_flash(format!("unknown command: /{name}"));
+            return;
+        };
+        if command == Command::Rename {
+            self.rename_session_title(arg);
+            return;
+        }
+        if !arg.is_empty() {
+            self.set_flash(format!("/{name} takes no arguments"));
+            return;
+        }
+        self.execute_command(command);
     }
 
     /// Submit a prompt that originated from the web UI (queued by the remote
@@ -1761,8 +2009,10 @@ impl App {
         if prompt.is_empty() {
             return None;
         }
-        self.messages.push(ChatEntry::User(prompt.clone()));
+        self.push_entry(ChatEntry::User(prompt.clone()));
+        self.ensure_placeholder_title(&prompt);
         self.busy = true;
+        self.iteration = None;
         self.asst_open = false;
         self.scroll_from_bottom = 0;
         if let Some(turn) = self.remote.as_ref().map(|s| s.session_id.clone()) {
@@ -1846,6 +2096,7 @@ impl App {
                 tool.detail = "cancelled".to_string();
             }
         }
+        self.content_rev = self.content_rev.wrapping_add(1);
     }
 
     pub fn apply_event(&mut self, event: AgentEvent) {
@@ -1854,8 +2105,11 @@ impl App {
             AgentEvent::ThinkingDelta { text } => {
                 self.asst_open = false;
                 match self.messages.last_mut() {
-                    Some(ChatEntry::Thinking { summary, .. }) => summary.push_str(&text),
-                    _ => self.messages.push(ChatEntry::Thinking {
+                    Some(ChatEntry::Thinking { summary, .. }) => {
+                        summary.push_str(&text);
+                        self.content_rev = self.content_rev.wrapping_add(1);
+                    }
+                    _ => self.push_entry(ChatEntry::Thinking {
                         summary: text.clone(),
                         seconds: 0.0,
                     }),
@@ -1870,15 +2124,17 @@ impl App {
             AgentEvent::ThinkingFinished { seconds } => {
                 if let Some(ChatEntry::Thinking { seconds: s, .. }) = self.messages.last_mut() {
                     *s = seconds;
+                    self.content_rev = self.content_rev.wrapping_add(1);
                 }
             }
             AgentEvent::TextDelta { text } => {
                 if self.asst_open {
                     if let Some(ChatEntry::Assistant(body)) = self.messages.last_mut() {
                         body.push_str(&text);
+                        self.content_rev = self.content_rev.wrapping_add(1);
                     }
                 } else {
-                    self.messages.push(ChatEntry::Assistant(text.clone()));
+                    self.push_entry(ChatEntry::Assistant(text.clone()));
                     self.asst_open = true;
                 }
                 if let Some(turn) = &remote_turn {
@@ -1890,7 +2146,7 @@ impl App {
             }
             AgentEvent::ToolStarted { name, summary } => {
                 self.asst_open = false;
-                self.messages.push(ChatEntry::Tool(ToolCall {
+                self.push_entry(ChatEntry::Tool(ToolCall {
                     name: name.clone(),
                     summary,
                     status: ToolStatus::Running,
@@ -1918,6 +2174,7 @@ impl App {
                             ToolStatus::Error
                         };
                         tool.detail = detail.clone();
+                        self.content_rev = self.content_rev.wrapping_add(1);
                         break;
                     }
                 }
@@ -1948,20 +2205,44 @@ impl App {
             }
             AgentEvent::Diff { path, lines } => {
                 self.asst_open = false;
-                self.messages.push(ChatEntry::Diff { path, lines });
+                self.push_entry(ChatEntry::Diff { path, lines });
             }
             AgentEvent::TurnFinished => {
                 self.busy = false;
+                self.iteration = None;
                 self.asst_open = false;
+                self.plan_title_job();
                 if let Some(turn) = &remote_turn {
                     self.emit_remote(evrax_remote::RemoteEvent::TurnDone { turn: turn.clone() });
                 }
             }
+            AgentEvent::TitleSuggested { session, title } => {
+                if !self.manual_titles.contains(&session)
+                    && (session == self.session_id || self.sessions.contains(&session))
+                {
+                    self.set_title(&session, title, false);
+                }
+            }
+            AgentEvent::Notice { message } => {
+                self.set_flash(message);
+            }
+            AgentEvent::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                reason,
+            } => {
+                let seconds = delay_ms.div_ceil(1000);
+                self.set_flash(format!("retry {attempt}/{max} · {seconds}s · {reason}"));
+            }
+            AgentEvent::Iteration { n, max } => {
+                self.iteration = Some((n, max));
+            }
             AgentEvent::Failed { message } => {
                 self.busy = false;
+                self.iteration = None;
                 self.asst_open = false;
-                self.messages
-                    .push(ChatEntry::Assistant(format!("error: {message}")));
+                self.push_entry(ChatEntry::Assistant(format!("error: {message}")));
                 if let Some(turn) = &remote_turn {
                     self.emit_remote(evrax_remote::RemoteEvent::Error {
                         turn: Some(turn.clone()),
@@ -2267,6 +2548,30 @@ mod tests {
         assert_ne!(a.id, b.id);
         std::fs::remove_file(&p1).unwrap();
         std::fs::remove_file(&p2).unwrap();
+    }
+
+    #[test]
+    fn status_events_update_flash_and_iteration() {
+        let mut app = app();
+        app.apply_event(AgentEvent::Iteration { n: 4, max: 500 });
+        assert_eq!(app.iteration, Some((4, 500)));
+        app.apply_event(AgentEvent::Retrying {
+            attempt: 2,
+            max: 10,
+            delay_ms: 4_000,
+            reason: "HTTP 429".into(),
+        });
+        assert!(
+            app.flash.as_ref().unwrap().0.contains("retry 2/10"),
+            "flash: {:?}",
+            app.flash
+        );
+        app.apply_event(AgentEvent::Notice {
+            message: "guardrail".into(),
+        });
+        assert_eq!(app.flash.as_ref().unwrap().0, "guardrail");
+        app.apply_event(AgentEvent::TurnFinished);
+        assert_eq!(app.iteration, None);
     }
 
     #[test]
@@ -2690,14 +2995,15 @@ mod tests {
     #[test]
     fn session_dialog_switches_sessions() {
         let mut app = app();
+        app.new_session();
         app.open_sessions();
         let rows = app.session_rows();
         assert!(rows.len() >= 3, "rows: {rows:?}");
+        let target_id = app.sessions[0].clone();
         app.session_dialog.as_mut().unwrap().selected = 2;
-        let target = rows[2].replace(" (current)", "");
         app.sessions_confirm();
         assert!(app.session_dialog.is_none());
-        assert_eq!(app.session_name, target);
+        assert_eq!(app.session_id, target_id);
         assert!(app.flash.is_some(), "switch should flash");
     }
 
@@ -2706,35 +3012,144 @@ mod tests {
         let mut app = app();
         type_and_submit(&mut app, "halo").unwrap();
         assert!(!app.messages.is_empty());
-        let old_name = app.session_name.clone();
+        let old_id = app.session_id.clone();
+        app.new_session();
+        assert_ne!(app.session_id, old_id);
+        assert!(app.messages.is_empty(), "new session starts empty");
         app.open_sessions();
-        app.session_dialog.as_mut().unwrap().selected = 2;
-        app.sessions_confirm();
-        assert_ne!(app.session_name, old_name);
-        assert!(app.messages.is_empty(), "target session starts empty");
-        app.open_sessions();
-        let idx = app
-            .session_rows()
-            .iter()
-            .position(|row| row.starts_with(&old_name))
-            .unwrap();
+        let idx = 2 + app.sessions.iter().position(|s| *s == old_id).unwrap();
         app.session_dialog.as_mut().unwrap().selected = idx;
         app.sessions_confirm();
-        assert_eq!(app.session_name, old_name);
+        assert_eq!(app.session_id, old_id);
         assert!(!app.messages.is_empty(), "transcript replayed");
     }
 
     #[test]
     fn new_session_names_are_unique_and_keep_the_old_session() {
         let mut app = app();
-        let first = app.session_name.clone();
+        let first = app.session_id.clone();
         app.new_session();
-        let second = app.session_name.clone();
+        let second = app.session_id.clone();
         app.new_session();
         assert_ne!(first, second);
-        assert_ne!(app.session_name, second);
+        assert_ne!(app.session_id, second);
         assert!(app.sessions.contains(&first));
         assert!(app.sessions.contains(&second));
+    }
+
+    #[test]
+    fn placeholder_title_survives_session_switch() {
+        let mut app = app();
+        type_and_submit(&mut app, "perbaiki parser SSE");
+        let first_id = app.session_id.clone();
+        app.new_session();
+        assert_eq!(app.title_of(&first_id), "perbaiki parser SSE");
+        assert_eq!(app.display_name(), "new session");
+        app.open_sessions();
+        let idx = 2 + app.sessions.iter().position(|s| *s == first_id).unwrap();
+        app.session_dialog.as_mut().unwrap().selected = idx;
+        app.sessions_confirm();
+        assert_eq!(app.session_id, first_id);
+        assert_eq!(app.display_name(), "perbaiki parser SSE");
+        assert!(!app.messages.is_empty());
+    }
+
+    #[test]
+    fn slash_prompt_gets_no_placeholder() {
+        let mut app = app();
+        app.input.insert_str("/mode");
+        app.submit_prompt();
+        assert!(app.titles.is_empty());
+    }
+
+    #[test]
+    fn title_from_prompt_strips_markdown_and_caps() {
+        assert_eq!(
+            title_from_prompt("# Refactor **ui.rs** sekarang juga sebelum kepecah").as_deref(),
+            Some("Refactor ui.rs sekarang juga sebelum kepecah")
+        );
+        assert_eq!(title_from_prompt("/new halo").as_deref(), None);
+        assert_eq!(title_from_prompt("   \n\nfix test").as_deref(), Some("fix test"));
+        assert_eq!(title_from_prompt("a").as_deref(), None);
+    }
+
+    #[test]
+    fn rename_is_manual_and_survives_late_llm_title() {
+        let mut app = app();
+        type_and_submit(&mut app, "perbaiki bug");
+        app.rename_session_title("Pekerjaan Rilis v2");
+        let id = app.session_id.clone();
+        assert_eq!(app.titles.get(&id).map(String::as_str), Some("Pekerjaan Rilis v2"));
+        assert!(app.manual_titles.contains(&id));
+        app.apply_event(AgentEvent::TitleSuggested {
+            session: id.clone(),
+            title: "Perbaiki Bug Kecil".to_string(),
+        });
+        assert_eq!(app.titles.get(&id).map(String::as_str), Some("Pekerjaan Rilis v2"));
+        assert_eq!(app.session_rows()[1], "Pekerjaan Rilis v2 (current)");
+    }
+
+    #[test]
+    fn llm_title_replaces_placeholder_for_known_session() {
+        let mut app = app();
+        type_and_submit(&mut app, "perbaiki bug");
+        let id = app.session_id.clone();
+        app.apply_event(AgentEvent::TitleSuggested {
+            session: id.clone(),
+            title: "Perbaiki Bug Streaming".to_string(),
+        });
+        assert_eq!(app.titles.get(&id).map(String::as_str), Some("Perbaiki Bug Streaming"));
+        app.apply_event(AgentEvent::TitleSuggested {
+            session: "session-hantu".to_string(),
+            title: "Tidak Relevan".to_string(),
+        });
+        assert!(!app.titles.contains_key("session-hantu"));
+    }
+
+    #[test]
+    fn turn_finished_queues_one_title_job() {
+        let mut app = app();
+        type_and_submit(&mut app, "perbaiki bug");
+        app.apply_event(AgentEvent::TextDelta { text: "selesai".to_string() });
+        assert!(app.take_title_job().is_none(), "belum TurnFinished, belum ada job");
+        app.apply_event(AgentEvent::TurnFinished);
+        let job = app.take_title_job().expect("job should be queued");
+        assert_eq!(job.0, app.session_id.clone());
+        assert_eq!(job.1, "perbaiki bug");
+        assert_eq!(job.2, "selesai");
+        app.apply_event(AgentEvent::TurnFinished);
+        assert!(app.take_title_job().is_none(), "job hanya sekali per sesi");
+    }
+
+    #[test]
+    fn transcript_entries_are_capped() {
+        let mut app = app();
+        for i in 0..600 {
+            app.apply_event(AgentEvent::TextDelta { text: format!("m{i}") });
+            app.asst_open = false;
+        }
+        assert!(
+            app.messages.len() >= MAX_ENTRIES_PER_SESSION
+                && app.messages.len() <= MAX_ENTRIES_PER_SESSION + 80,
+            "len {}",
+            app.messages.len()
+        );
+        match app.messages.first() {
+            Some(ChatEntry::Assistant(text)) => {
+                assert_ne!(text, "m0", "oldest entries must be evicted")
+            }
+            _ => panic!("expected assistant entry first"),
+        }
+    }
+
+    #[test]
+    fn transcripts_are_evicted_lru_beyond_cap() {
+        let mut app = app();
+        for _ in 0..(MAX_RETAINED_SESSIONS + 5) {
+            app.new_session();
+        }
+        assert!(app.transcripts.len() <= MAX_RETAINED_SESSIONS);
+        assert!(app.sessions.len() <= MAX_RETAINED_SESSIONS);
     }
 
     #[test]

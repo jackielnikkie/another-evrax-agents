@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use futures_util::stream::{self, BoxStream};
 use tokio::sync::mpsc;
 
@@ -15,6 +16,19 @@ pub enum AgentEvent {
     ApprovalRequested { name: String, summary: String, key: String },
     Diff { path: String, lines: Vec<DiffLine> },
     TurnFinished,
+    /// Model-generated session title, delivered after the first turn.
+    TitleSuggested { session: String, title: String },
+    /// Informational status (iteration budget, guardrails, degraded summary).
+    Notice { message: String },
+    /// A provider retry was scheduled before the next attempt.
+    Retrying {
+        attempt: u32,
+        max: u32,
+        delay_ms: u64,
+        reason: String,
+    },
+    /// Current tool-calling iteration inside the running turn.
+    Iteration { n: usize, max: usize },
     Failed { message: String },
 }
 
@@ -46,6 +60,16 @@ pub trait AgentBackend: Send + Sync {
         request: TurnRequest,
         decisions: mpsc::Receiver<bool>,
     ) -> BoxStream<'static, AgentEvent>;
+
+    /// Asks the model for a short session title. Backends without a real
+    /// model return `None`; the caller keeps its heuristic title.
+    fn suggest_title(
+        &self,
+        _prompt: String,
+        _reply: String,
+    ) -> BoxFuture<'static, Option<String>> {
+        Box::pin(async { None })
+    }
 }
 
 pub struct MockBackend {

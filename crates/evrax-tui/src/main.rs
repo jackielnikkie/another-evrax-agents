@@ -95,19 +95,19 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         if loaded.mock {
             (
                 Box::new(MockBackend::new()),
-                "backend · mock".to_string(),
+                "backend Â· mock".to_string(),
                 "mock".to_string(),
             )
         } else {
             match evrax_agent::ChatBackend::new(loaded.config.clone()) {
                 Ok(real) => {
                     let label = real.model().to_string();
-                    let note = format!("backend · {} · {}", label, real.base_url());
+                    let note = format!("backend Â· {} Â· {}", label, real.base_url());
                     (Box::new(real), note, label)
                 }
                 Err(e) => (
                     Box::new(MockBackend::new()),
-                    format!("backend gagal ({e}) · pakai mock"),
+                    format!("backend gagal ({e}) Â· pakai mock"),
                     "mock".to_string(),
                 ),
             }
@@ -165,7 +165,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                             // Terminal paste without bracketed-paste support arrives
                             // as a key burst. Screenshot pastes show up as a temp
                             // file path (or as raw pixels only in the clipboard), so
-                            // try the clipboard image first — opencode-style — then
+                            // try the clipboard image first â€” opencode-style â€” then
                             // fall back to path detection, then literal text.
                             if is_paste_like(&chars) {
                                 if !app.ingest_paste(&chars) {
@@ -227,6 +227,17 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                     && let Some(tx) = &decision_tx
                 {
                     let _ = tx.try_send(true);
+                }
+                if let Some((session, prompt, reply)) = app.take_title_job() {
+                    let tx = event_tx.clone();
+                    let future = backend.suggest_title(prompt, reply);
+                    tokio::spawn(async move {
+                        if let Some(title) = future.await {
+                            let _ = tx
+                                .send(AgentEvent::TitleSuggested { session, title })
+                                .await;
+                        }
+                    });
                 }
                 needs_draw = true;
             }
@@ -404,7 +415,7 @@ fn commit_tunnel_url(app: &mut App) {
         }
         Ok(TunnelEditResult::HostReady) => {
             persist_remote(app);
-            app.set_flash("custom domain: menyiapkan tunnel…".to_string());
+            app.set_flash("custom domain: menyiapkan tunnelâ€¦".to_string());
             tunnel_start(app);
         }
         Err(msg) => app.set_flash(msg),
@@ -463,7 +474,7 @@ fn drain_remote_prompts(
     };
     let Some(text) = text else { return };
     if let Some(prompt) = app.submit_external_prompt(text) {
-        let (session, plan_mode) = (app.session_name.clone(), app.mode == AgentMode::Plan);
+        let (session, plan_mode) = (app.session_id.clone(), app.mode == AgentMode::Plan);
         start_turn(backend, event_tx, decision_tx, turn_task, prompt, session, plan_mode);
     }
 }
@@ -806,7 +817,7 @@ fn handle_key(
             {
                 app.input.insert_newline();
             } else if let Some(prompt) = app.submit_prompt() {
-                let (session, plan_mode) = (app.session_name.clone(), app.mode == AgentMode::Plan);
+                let (session, plan_mode) = (app.session_id.clone(), app.mode == AgentMode::Plan);
                 start_turn(backend, event_tx, decision_tx, turn_task, prompt, session, plan_mode);
             }
         }
