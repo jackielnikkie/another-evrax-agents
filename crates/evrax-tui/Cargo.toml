@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 crossterm.workspace = true
+evrax-agent = { path = "../evrax-agent" }
 evrax-core = { path = "../evrax-core" }
 evrax-remote = { path = "../evrax-remote" }
 futures-util.workspace = true

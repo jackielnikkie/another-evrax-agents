@@ -31,10 +31,21 @@ pub enum DiffKind {
     Ctx,
 }
 
+pub struct TurnRequest {
+    pub prompt: String,
+    /// Session key; when it changes, the backend starts a fresh conversation.
+    pub session: String,
+    pub plan_mode: bool,
+}
+
 pub trait AgentBackend: Send + Sync {
     /// Runs one turn. `decisions` carries tool-approval answers (true = allow)
     /// in the order `ApprovalRequested` events are emitted.
-    fn run_turn(&self, prompt: String, decisions: mpsc::Receiver<bool>) -> BoxStream<'static, AgentEvent>;
+    fn run_turn(
+        &self,
+        request: TurnRequest,
+        decisions: mpsc::Receiver<bool>,
+    ) -> BoxStream<'static, AgentEvent>;
 }
 
 pub struct MockBackend {
@@ -72,11 +83,11 @@ enum Step {
 impl AgentBackend for MockBackend {
     fn run_turn(
         &self,
-        prompt: String,
+        request: TurnRequest,
         decisions: mpsc::Receiver<bool>,
     ) -> BoxStream<'static, AgentEvent> {
         let pace = self.pace;
-        let steps = mock_script(prompt);
+        let steps = mock_script(request.prompt);
         let state = (steps, decisions, None::<(Vec<Step>, Vec<Step>)>);
         stream::unfold(state, move |(mut steps, mut decisions, mut branches)| async move {
             loop {
@@ -238,7 +249,12 @@ mod tests {
     async fn run_with_decision(prompt: &str, decision: Option<bool>) -> Vec<AgentEvent> {
         let backend = MockBackend::with_pace(Duration::ZERO);
         let (tx, rx) = mpsc::channel(1);
-        let mut stream = backend.run_turn(prompt.to_string(), rx);
+        let request = TurnRequest {
+            prompt: prompt.to_string(),
+            session: "test".to_string(),
+            plan_mode: false,
+        };
+        let mut stream = backend.run_turn(request, rx);
         let mut events = Vec::new();
         while let Some(event) = stream.next().await {
             let is_approval = matches!(event, AgentEvent::ApprovalRequested { .. });
@@ -322,7 +338,12 @@ mod tests {
     fn backend_is_object_safe() {
         let backend: Box<dyn AgentBackend> = Box::new(MockBackend::with_pace(Duration::ZERO));
         let (_tx, rx) = mpsc::channel(1);
-        let mut stream = backend.run_turn("hello".into(), rx);
+        let request = TurnRequest {
+            prompt: "hello".to_string(),
+            session: "test".to_string(),
+            plan_mode: false,
+        };
+        let mut stream = backend.run_turn(request, rx);
         assert!(stream.next().now_or_never().is_some());
     }
 }

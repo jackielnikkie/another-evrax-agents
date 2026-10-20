@@ -1,0 +1,21 @@
+[package]
+name = "evrax-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+evrax-core = { path = "../evrax-core" }
+futures-util.workspace = true
+glob.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tiny_http.workspace = true

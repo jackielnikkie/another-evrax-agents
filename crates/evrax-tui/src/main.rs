@@ -17,7 +17,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use evrax_core::{AgentBackend, AgentEvent, MockBackend};
+use evrax_core::{AgentBackend, AgentEvent, MockBackend, TurnRequest};
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -25,7 +25,7 @@ use ratatui::layout::Position;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::app::{App, ApprovalDecision, TunnelEditResult, TunnelEffect};
+use crate::app::{AgentMode, App, ApprovalDecision, TunnelEditResult, TunnelEffect};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -90,10 +90,27 @@ fn setup_panic_hook() {
 }
 
 async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    let backend = MockBackend::new();
+    let loaded = evrax_agent::config_from_args();
+    let (backend, backend_note): (Box<dyn AgentBackend>, String) = if loaded.mock {
+        (Box::new(MockBackend::new()), "backend · mock".to_string())
+    } else {
+        match evrax_agent::ChatBackend::new(loaded.config.clone()) {
+            Ok(real) => {
+                let note = format!("backend · {} · {}", real.model(), real.base_url());
+                (Box::new(real), note)
+            }
+            Err(e) => (
+                Box::new(MockBackend::new()),
+                format!("backend gagal ({e}) · pakai mock"),
+            ),
+        }
+    };
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let mut turn_task: Option<JoinHandle<()>> = None;
     let mut app = App::new();
+    if !backend_note.is_empty() {
+        app.set_flash(backend_note);
+    }
     let mut decision_tx: Option<mpsc::Sender<bool>> = None;
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
@@ -148,7 +165,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                             handle_event(
                                 &mut app,
                                 ev,
-                                &backend,
+                                &*backend,
                                 &event_tx,
                                 &mut decision_tx,
                                 &mut turn_task,
@@ -159,7 +176,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                         handle_event(
                             &mut app,
                             Event::Key(key),
-                            &backend,
+                            &*backend,
                             &event_tx,
                             &mut decision_tx,
                             &mut turn_task,
@@ -170,7 +187,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                     handle_event(
                         &mut app,
                         event,
-                        &backend,
+                        &*backend,
                         &event_tx,
                         &mut decision_tx,
                         &mut turn_task,
@@ -188,7 +205,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             }
             _ = ticker.tick() => {
                 app.tick();
-                drain_remote_prompts(&mut app, &backend, &event_tx, &mut decision_tx, &mut turn_task);
+                drain_remote_prompts(&mut app, &*backend, &event_tx, &mut decision_tx, &mut turn_task);
                 drain_remote_approvals(&mut app, &mut decision_tx);
             }
         }
@@ -345,10 +362,17 @@ fn start_turn(
     decision_tx: &mut Option<mpsc::Sender<bool>>,
     turn_task: &mut Option<JoinHandle<()>>,
     prompt: String,
+    session: String,
+    plan_mode: bool,
 ) {
     let (tx, rx) = mpsc::channel::<bool>(4);
     *decision_tx = Some(tx);
-    let stream = backend.run_turn(prompt, rx);
+    let request = TurnRequest {
+        prompt,
+        session,
+        plan_mode,
+    };
+    let stream = backend.run_turn(request, rx);
     let tx = event_tx.clone();
     *turn_task = Some(tokio::spawn(async move {
         let mut stream = stream;
@@ -383,7 +407,8 @@ fn drain_remote_prompts(
     };
     let Some(text) = text else { return };
     if let Some(prompt) = app.submit_external_prompt(text) {
-        start_turn(backend, event_tx, decision_tx, turn_task, prompt);
+        let (session, plan_mode) = (app.session_name.clone(), app.mode == AgentMode::Plan);
+        start_turn(backend, event_tx, decision_tx, turn_task, prompt, session, plan_mode);
     }
 }
 
@@ -725,7 +750,8 @@ fn handle_key(
             {
                 app.input.insert_newline();
             } else if let Some(prompt) = app.submit_prompt() {
-                start_turn(backend, event_tx, decision_tx, turn_task, prompt);
+                let (session, plan_mode) = (app.session_name.clone(), app.mode == AgentMode::Plan);
+                start_turn(backend, event_tx, decision_tx, turn_task, prompt, session, plan_mode);
             }
         }
         KeyCode::Esc => {

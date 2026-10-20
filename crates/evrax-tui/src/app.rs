@@ -46,6 +46,8 @@ pub struct App {
     pub chip_x_rects: Vec<Rect>,
     pub session_name: String,
     pub sessions: Vec<String>,
+    /// Message history kept per named session (replayed when switching back).
+    pub transcripts: std::collections::HashMap<String, Vec<ChatEntry>>,
     pub last_esc: Option<u64>,
     asst_open: bool,
 }
@@ -336,6 +338,13 @@ fn local_ipv4() -> Option<String> {
         std::net::IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
         _ => None,
     }
+}
+
+/// Unique session name: millisecond epoch + a process-local counter.
+fn unique_session_name() -> String {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("session-{}-{n}", s_now())
 }
 
 /// Copies a staged clipboard image to a friendlier `screenshot-HHMMSS.png`
@@ -650,6 +659,7 @@ impl App {
             chip_x_rects: Vec::new(),
             session_name: "untitled session".to_string(),
             sessions: vec!["refactor ui.rs".to_string(), "fix failing test".to_string()],
+            transcripts: std::collections::HashMap::new(),
             last_esc: None,
             asst_open: false,
         }
@@ -924,7 +934,12 @@ impl App {
         self.slash_dismissed = None;
         self.session_dialog = None;
         self.theme_dialog = None;
-        self.messages.clear();
+        let old = std::mem::replace(&mut self.session_name, unique_session_name());
+        self.transcripts
+            .insert(old.clone(), std::mem::take(&mut self.messages));
+        if !self.sessions.contains(&old) {
+            self.sessions.insert(0, old);
+        }
         self.input.take();
         self.asst_open = false;
         self.busy = false;
@@ -985,16 +1000,17 @@ impl App {
             idx => {
                 let target = idx - 2;
                 if target < self.sessions.len() {
-                    let old = std::mem::replace(
-                        &mut self.session_name,
-                        self.sessions[target].clone(),
-                    );
-                    self.sessions[target] = old;
-                    self.messages.clear();
+                    let old = std::mem::replace(&mut self.session_name, self.sessions[target].clone());
+                    let target_name = self.session_name.clone();
+                    self.sessions[target] = old.clone();
+                    let current = std::mem::take(&mut self.messages);
+                    let restored = self.transcripts.remove(&target_name).unwrap_or_default();
+                    self.transcripts.insert(old, current);
                     self.input.take();
                     self.asst_open = false;
                     self.scroll_from_bottom = 0;
                     self.selection.clear();
+                    self.messages = restored;
                     self.set_flash(format!("session · {}", self.session_name));
                 }
             }
@@ -2675,8 +2691,43 @@ mod tests {
     }
 
     #[test]
-    fn double_escape_cancels_within_window() {
+    fn switching_sessions_saves_and_restores_transcripts() {
         let mut app = app();
+        type_and_submit(&mut app, "halo").unwrap();
+        assert!(!app.messages.is_empty());
+        let old_name = app.session_name.clone();
+        app.open_sessions();
+        app.session_dialog.as_mut().unwrap().selected = 2;
+        app.sessions_confirm();
+        assert_ne!(app.session_name, old_name);
+        assert!(app.messages.is_empty(), "target session starts empty");
+        app.open_sessions();
+        let idx = app
+            .session_rows()
+            .iter()
+            .position(|row| row.starts_with(&old_name))
+            .unwrap();
+        app.session_dialog.as_mut().unwrap().selected = idx;
+        app.sessions_confirm();
+        assert_eq!(app.session_name, old_name);
+        assert!(!app.messages.is_empty(), "transcript replayed");
+    }
+
+    #[test]
+    fn new_session_names_are_unique_and_keep_the_old_session() {
+        let mut app = app();
+        let first = app.session_name.clone();
+        app.new_session();
+        let second = app.session_name.clone();
+        app.new_session();
+        assert_ne!(first, second);
+        assert_ne!(app.session_name, second);
+        assert!(app.sessions.contains(&first));
+        assert!(app.sessions.contains(&second));
+    }
+
+    #[test]
+    fn double_escape_cancels_within_window() {        let mut app = app();
         assert!(!app.request_cancel(), "first esc only warns");
         assert!(app.flash.is_some());
         app.tick();
