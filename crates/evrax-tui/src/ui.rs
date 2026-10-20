@@ -254,7 +254,6 @@ fn conversation_lines(entries: &[ChatEntry], tick: u64, width: u16) -> Vec<Line<
             }
             ChatEntry::Tool(tool) => {
                 let (glyph, color) = match tool.status {
-                    ToolStatus::Pending => ("○", current().muted),
                     ToolStatus::Running => (spinner(tick), current().interactive),
                     ToolStatus::Done => ("✓", current().success),
                     ToolStatus::Error => ("✗", current().error),
@@ -1437,7 +1436,7 @@ fn shorten_path(path: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, ToolCall};
     use evrax_core::{AgentEvent, DiffLine};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1456,6 +1455,49 @@ mod tests {
 
     fn render_text(width: u16, height: u16) -> String {
         let mut app = App::new();
+        render_text_with(&mut app, width, height)
+    }
+
+    /// Chat transcript covering every entry kind the renderer supports.
+    fn sample_conversation() -> Vec<ChatEntry> {
+        vec![
+            ChatEntry::User("render markdown in the chat".to_string()),
+            ChatEntry::Thinking {
+                summary: "parsing markdown blocks".to_string(),
+                seconds: 1.6,
+            },
+            ChatEntry::Tool(ToolCall {
+                name: "read".to_string(),
+                summary: "crates/evrax-tui/src/markdown.rs".to_string(),
+                status: ToolStatus::Done,
+                detail: "96 lines".to_string(),
+            }),
+            ChatEntry::Diff {
+                path: "crates/evrax-tui/src/markdown.rs".to_string(),
+                lines: vec![
+                    DiffLine {
+                        kind: DiffKind::Rem,
+                        text: "let raw = text.to_string();".to_string(),
+                    },
+                    DiffLine {
+                        kind: DiffKind::Add,
+                        text: "for block in markdown::parse(text) {".to_string(),
+                    },
+                ],
+            },
+            ChatEntry::Tool(ToolCall {
+                name: "shell".to_string(),
+                summary: "cargo test".to_string(),
+                status: ToolStatus::Error,
+                detail: "1 failed".to_string(),
+            }),
+            ChatEntry::Assistant("One case still fails on wrapped code rows.".to_string()),
+        ]
+    }
+
+    fn render_sample(width: u16, height: u16) -> String {
+        let mut app = App::new();
+        app.messages = sample_conversation();
         render_text_with(&mut app, width, height)
     }
 
@@ -1557,8 +1599,8 @@ mod tests {
     }
 
     #[test]
-    fn renders_mock_conversation() {
-        let text = render_text(100, 60);
+    fn renders_full_conversation() {
+        let text = render_sample(100, 60);
         assert!(text.contains('▌'), "user bar missing:\n{text}");
         assert!(text.contains("Thought:"), "thinking missing:\n{text}");
         assert!(text.contains('✓'), "done tool glyph missing:\n{text}");
@@ -1775,7 +1817,7 @@ mod tests {
 
     #[test]
     fn scrollbar_shows_only_when_content_overflows() {
-        let overflowing = render_text(100, 14);
+        let overflowing = render_sample(100, 14);
         assert!(
             overflowing.contains('█'),
             "scrollbar thumb missing:\n{overflowing}"
@@ -1802,6 +1844,7 @@ mod tests {
     fn scrolling_moves_viewport() {
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         let mut app = App::new();
+        app.messages = sample_conversation();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let at_bottom = buffer_text(&terminal);
 

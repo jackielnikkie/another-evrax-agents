@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use evrax_core::{AgentEvent, DiffKind, DiffLine};
+use evrax_core::{AgentEvent, DiffLine};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::layout::Rect;
@@ -408,7 +408,6 @@ pub struct ToolCall {
 }
 
 pub enum ToolStatus {
-    Pending,
     Running,
     Done,
     Error,
@@ -628,7 +627,7 @@ impl App {
             cwd: std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "~".to_string()),
-            messages: demo_conversation(),
+            messages: Vec::new(),
             input: LineEditor::new(),
             busy: false,
             mode: AgentMode::Build,
@@ -2034,67 +2033,6 @@ impl App {
     pub fn page(&self) -> u16 {
         self.viewport_height.saturating_sub(2).max(1)
     }
-}
-
-fn demo_conversation() -> Vec<ChatEntry> {
-    vec![
-        ChatEntry::User(
-            "render markdown in the chat\nand let the composer grow to multi-line".to_string(),
-        ),
-        ChatEntry::Thinking {
-            summary: "parsing markdown blocks, wiring the multi-line composer".to_string(),
-            seconds: 1.6,
-        },
-        ChatEntry::Tool(ToolCall {
-            name: "read".to_string(),
-            summary: "crates/evrax-tui/src/markdown.rs".to_string(),
-            status: ToolStatus::Done,
-            detail: "96 lines · parser + span wrapper".to_string(),
-        }),
-        ChatEntry::Assistant(
-            "## Markdown is live\n\nReplies now render **bold**, *italic* and `inline code` instead of raw markers.\n\n> blockquotes get a quiet rail, like this one\n\n- bullets wrap with a hanging indent\n- long words are chunked instead of overflowing\n\n1. fenced code keeps its own band\n2. streaming re-renders as markers close\n\n```rust\nlet offset = max_scroll.saturating_sub(app.scroll_from_bottom);\nframe.render_widget(paragraph.scroll((offset, 0)), area);\n```\n\nThe composer grew up too: **shift+enter** (or ctrl+j) inserts a newline, enter still sends.".to_string(),
-        ),
-        ChatEntry::Diff {
-            path: "crates/evrax-tui/src/markdown.rs".to_string(),
-            lines: vec![
-                DiffLine {
-                    kind: DiffKind::Rem,
-                    text: "let raw = text.to_string();".to_string(),
-                },
-                DiffLine {
-                    kind: DiffKind::Add,
-                    text: "for block in markdown::parse(text) {".to_string(),
-                },
-                DiffLine {
-                    kind: DiffKind::Add,
-                    text: "    lines.extend(render_block(block));".to_string(),
-                },
-                DiffLine {
-                    kind: DiffKind::Add,
-                    text: "}".to_string(),
-                },
-                DiffLine {
-                    kind: DiffKind::Ctx,
-                    text: "frame.render_widget(paragraph, area);".to_string(),
-                },
-            ],
-        },
-        ChatEntry::Tool(ToolCall {
-            name: "edit".to_string(),
-            summary: "crates/evrax-tui/src/markdown.rs".to_string(),
-            status: ToolStatus::Pending,
-            detail: "waiting for approval".to_string(),
-        }),
-        ChatEntry::Tool(ToolCall {
-            name: "shell".to_string(),
-            summary: "cargo test".to_string(),
-            status: ToolStatus::Error,
-            detail: "1 failed: wrapped_gutter_pads_code_rows".to_string(),
-        }),
-        ChatEntry::Assistant(
-            "One case still fails on wrapped code rows — padding the band and rerunning.".to_string(),
-        ),
-    ]
 }
 
 #[cfg(test)]
