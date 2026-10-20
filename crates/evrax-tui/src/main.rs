@@ -91,23 +91,31 @@ fn setup_panic_hook() {
 
 async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let loaded = evrax_agent::config_from_args();
-    let (backend, backend_note): (Box<dyn AgentBackend>, String) = if loaded.mock {
-        (Box::new(MockBackend::new()), "backend · mock".to_string())
-    } else {
-        match evrax_agent::ChatBackend::new(loaded.config.clone()) {
-            Ok(real) => {
-                let note = format!("backend · {} · {}", real.model(), real.base_url());
-                (Box::new(real), note)
-            }
-            Err(e) => (
+    let (backend, backend_note, backend_label): (Box<dyn AgentBackend>, String, String) =
+        if loaded.mock {
+            (
                 Box::new(MockBackend::new()),
-                format!("backend gagal ({e}) · pakai mock"),
-            ),
-        }
-    };
+                "backend · mock".to_string(),
+                "mock".to_string(),
+            )
+        } else {
+            match evrax_agent::ChatBackend::new(loaded.config.clone()) {
+                Ok(real) => {
+                    let label = real.model().to_string();
+                    let note = format!("backend · {} · {}", label, real.base_url());
+                    (Box::new(real), note, label)
+                }
+                Err(e) => (
+                    Box::new(MockBackend::new()),
+                    format!("backend gagal ({e}) · pakai mock"),
+                    "mock".to_string(),
+                ),
+            }
+        };
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let mut turn_task: Option<JoinHandle<()>> = None;
     let mut app = App::new();
+    app.set_backend_label(backend_label);
     if !backend_note.is_empty() {
         app.set_flash(backend_note);
     }
@@ -115,31 +123,38 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     let debug_window = std::env::var_os("EVRAX_DEBUG_MAXIMIZED").is_some();
-    let mut last_maximized: Option<Option<bool>> = None;
+    let mut debug_logged = false;
+
+    // Repaint only when something actually changed. The old unconditional 4 Hz
+    // redraw rebuilt the whole transcript twice per frame and burned ~50% of a core.
+    let mut needs_draw = true;
+    let mut max_scroll = 0u16;
+    let mut last_size = terminal.size()?;
+    let mut input_open = true;
 
     while !app.should_quit {
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
-        flush_kitty(terminal, &mut app);
-        let size = terminal.size()?;
-        app.set_viewport(size.height.saturating_sub(6));
-        if let Some(state) = window::window_state() {
-            app.maximized = Some(state);
-        }
-        if debug_window && last_maximized != Some(app.maximized) {
-            last_maximized = Some(app.maximized);
-            log_window_debug(app.maximized);
-        }
-        let max_scroll = ui::max_scroll_for(&app, size.width, size.height);
-        app.clamp_scroll(max_scroll);
-        if let Some(up) = app.selection_edge() {
-            app.scroll_view(1, up, max_scroll);
-        }
-        if let Some(text) = app.copied_text.take() {
-            copy_to_clipboard(text);
+        if needs_draw {
+            terminal.draw(|frame| ui::render(frame, &mut app))?;
+            flush_kitty(terminal, &mut app);
+            let size = terminal.size()?;
+            last_size = size;
+            app.set_viewport(size.height.saturating_sub(6));
+            max_scroll = app.frame_max_scroll;
+            app.clamp_scroll(max_scroll);
+            if let Some(up) = app.selection_edge() {
+                app.scroll_view(1, up, max_scroll);
+            }
+            if let Some(text) = app.copied_text.take() {
+                copy_to_clipboard(text);
+            }
+            needs_draw = false;
         }
 
         tokio::select! {
-            event = events.next() => {
+            event = events.next(), if input_open => {
+                if event.is_none() {
+                    input_open = false;
+                }
                 if let Some(Ok(Event::Key(key))) = event {
                     if is_batchable(&app, &key)
                         && let KeyCode::Char(c) = key.code
@@ -183,10 +198,16 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                             max_scroll,
                         );
                     }
-                } else if let Some(Ok(event)) = event {
+                    needs_draw = true;
+                } else if let Some(Ok(other)) = event {
+                    // Mouse motion alone never repaints: the terminal floods these
+                    // events and each repaint re-wraps the whole transcript.
+                    let idle_motion =
+                        matches!(other, Event::Mouse(ref m) if matches!(m.kind, MouseEventKind::Moved));
+                    needs_draw |= !idle_motion;
                     handle_event(
                         &mut app,
-                        event,
+                        other,
                         &*backend,
                         &event_tx,
                         &mut decision_tx,
@@ -197,16 +218,51 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             }
             Some(event) = event_rx.recv() => {
                 app.apply_event(event);
+                // Drain everything already queued so a burst of stream deltas costs
+                // one repaint instead of one per token.
+                while let Ok(more) = event_rx.try_recv() {
+                    app.apply_event(more);
+                }
                 if app.take_auto_approval()
                     && let Some(tx) = &decision_tx
                 {
                     let _ = tx.try_send(true);
                 }
+                needs_draw = true;
             }
             _ = ticker.tick() => {
+                let had_flash = app.flash.is_some();
+                let was_busy = app.busy;
+                let had_approval = app.approval.is_some();
+                let mode_before = app.mode;
                 app.tick();
+                app.sync_remote_mode();
                 drain_remote_prompts(&mut app, &*backend, &event_tx, &mut decision_tx, &mut turn_task);
                 drain_remote_approvals(&mut app, &mut decision_tx);
+                if let Some(state) = window::window_state()
+                    && app.maximized != Some(state)
+                {
+                    app.maximized = Some(state);
+                    if debug_window && !debug_logged {
+                        debug_logged = true;
+                        log_window_debug(app.maximized);
+                    }
+                }
+                if let Ok(size) = terminal.size()
+                    && size != last_size
+                {
+                    needs_draw = true;
+                }
+                // Keep repainting only while something animates (spinner, expiring
+                // flash, kitty frames) or when a drain changed dialog state.
+                needs_draw |= had_flash
+                    || was_busy
+                    || had_approval
+                    || app.busy
+                    || app.flash.is_some()
+                    || app.approval.is_some()
+                    || app.mode != mode_before
+                    || !app.pending_kitty.is_empty();
             }
         }
     }

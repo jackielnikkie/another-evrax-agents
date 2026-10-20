@@ -48,23 +48,6 @@ fn sidebar_visible(app: &App, width: u16) -> bool {
     width >= SIDEBAR_MIN_TOTAL_WIDTH && app.maximized.unwrap_or(true)
 }
 
-pub fn max_scroll_for(app: &App, width: u16, height: u16) -> u16 {
-    let chat_height = height
-        .saturating_sub(1)
-        .saturating_sub(3)
-        .saturating_sub(1)
-        .saturating_sub(1);
-    let chat_width = if sidebar_visible(app, width) {
-        width.saturating_sub(SIDEBAR_WIDTH)
-    } else {
-        width
-    };
-    let lines = conversation_lines(&app.messages, app.tick, chat_width);
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let content_height = paragraph.line_count(chat_width) as u16;
-    content_height.saturating_sub(chat_height)
-}
-
 fn apply_selection(frame: &mut Frame, app: &mut App) {
     let area = app.selectable_area;
     if area.width == 0 || area.height == 0 {
@@ -142,7 +125,7 @@ fn header(frame: &mut Frame, area: Rect) {
             Style::default().fg(current().accent).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  v{}  U3 mock stream", env!("CARGO_PKG_VERSION")),
+            format!("  v{}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(current().muted),
         ),
     ]);
@@ -193,11 +176,14 @@ fn chat(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
     rows[0]
 }
 
-fn messages(frame: &mut Frame, area: Rect, app: &App) {
+fn messages(frame: &mut Frame, area: Rect, app: &mut App) {
     let lines = conversation_lines(&app.messages, app.tick, area.width);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let content_height = paragraph.line_count(area.width) as u16;
     let max_scroll = content_height.saturating_sub(area.height);
+    // The event loop needs this exact value for clamping/scrolling; rebuilding the
+    // whole transcript a second time per frame was doubling the render cost.
+    app.frame_max_scroll = max_scroll;
     let offset = max_scroll.saturating_sub(app.scroll_from_bottom);
     frame.render_widget(paragraph.scroll((offset, 0)), area);
 
@@ -780,12 +766,20 @@ fn metadata(frame: &mut Frame, area: Rect, app: &App) {
         AgentMode::Build => ("Build", current().interactive),
         AgentMode::Plan => ("Plan", current().accent),
     };
+    let win = match app.maximized {
+        Some(true) => "max",
+        Some(false) => "win",
+        None => "-",
+    };
     let line = Line::from(vec![
         Span::styled(
             format!("  {label}"),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" · mock · max", Style::default().fg(current().muted)),
+        Span::styled(
+            format!(" · {} · {win}", app.backend_label),
+            Style::default().fg(current().muted),
+        ),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -806,7 +800,7 @@ fn sidebar(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(app.session_name.clone(), Style::default().fg(current().text)),
         ]),
         Line::from(Span::styled(
-            format!("  mock · {} saved", app.sessions.len()),
+            format!("  {} · {} saved", app.backend_label, app.sessions.len()),
             Style::default().fg(current().muted),
         )),
         Line::from(""),
@@ -1699,7 +1693,7 @@ mod tests {
             .expect("menu row");
         let composer_row = rows
             .iter()
-            .position(|row| row.contains(" · mock · max"))
+            .position(|row| row.contains("Build ·"))
             .expect("metadata row");
         assert!(menu_row < composer_row, "menu must sit above the composer");
     }
@@ -1740,6 +1734,7 @@ mod tests {
         app.apply_event(AgentEvent::ApprovalRequested {
             name: "edit".into(),
             summary: "src/ui.rs".into(),
+            key: "edit".into(),
         });
         let original = crate::theme::index();
         crate::theme::set_index(crate::theme::by_key("opencode").unwrap());
@@ -1770,6 +1765,7 @@ mod tests {
         app.apply_event(AgentEvent::ApprovalRequested {
             name: "edit".into(),
             summary: "crates/evrax-tui/src/ui.rs".into(),
+            key: "edit".into(),
         });
         let text = render_text_with(&mut app, 100, 30);
         assert!(text.contains("Permission required"), "header missing:\n{text}");
@@ -2103,13 +2099,24 @@ mod tests {
     #[test]
     fn metadata_line_reflects_mode() {
         let mut app = App::new();
+        app.set_backend_label("bebas");
+        app.maximized = Some(true);
         let build = render_text_with(&mut app, 100, 24);
         assert!(build.contains("Build"), "metadata missing build:\n{build}");
-        assert!(build.contains(" · mock · max"), "metadata details missing:\n{build}");
+        assert!(
+            build.contains("Build · bebas · max"),
+            "metadata should show the real backend: {build}"
+        );
         app.cycle_mode();
         let plan = render_text_with(&mut app, 100, 24);
         assert!(plan.contains("Plan"), "metadata missing plan:\n{plan}");
         assert!(!plan.contains("Build"), "build label should be gone:\n{plan}");
+        app.maximized = Some(false);
+        let windowed = render_text_with(&mut app, 100, 24);
+        assert!(
+            windowed.contains("Plan · bebas · win"),
+            "window state should show: {windowed}"
+        );
     }
 
     #[test]

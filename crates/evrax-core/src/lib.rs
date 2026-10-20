@@ -12,7 +12,7 @@ pub enum AgentEvent {
     TextDelta { text: String },
     ToolStarted { name: String, summary: String },
     ToolFinished { name: String, ok: bool, detail: String },
-    ApprovalRequested { name: String, summary: String },
+    ApprovalRequested { name: String, summary: String, key: String },
     Diff { path: String, lines: Vec<DiffLine> },
     TurnFinished,
     Failed { message: String },
@@ -111,7 +111,8 @@ impl AgentBackend for MockBackend {
                         allow,
                         reject,
                     } => {
-                        let event = AgentEvent::ApprovalRequested { name, summary };
+                        let key = name.clone();
+                        let event = AgentEvent::ApprovalRequested { name, summary, key };
                         return Some((event, (steps, decisions, Some((allow, reject)))));
                     }
                 }

@@ -385,13 +385,27 @@ async fn authorize_and_run(
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<Exec, String> {
     let mutating = tools::risk(name) == tools::Risk::Mutate;
-    if mutating && plan_mode {
-        return Ok(Exec::error("blocked: plan mode is read-only".into()));
+    let outside = match args {
+        Ok(value) => tools::outside_target(name, value, ctx),
+        Err(_) => None,
+    };
+    if plan_mode {
+        if mutating {
+            return Ok(Exec::error("blocked: plan mode is read-only".into()));
+        }
+        if outside.is_some() {
+            return Ok(Exec::error("blocked: plan mode is workspace read-only".into()));
+        }
     }
-    if mutating {
+    // shell always needs approval (system-wide scope); write/edit inside the
+    // workspace run automatically; any external path needs approval.
+    let needs_approval = name == "shell" || outside.is_some();
+    if needs_approval {
+        let key = tools::approval_key(name, outside.as_deref());
         emit(tx, AgentEvent::ApprovalRequested {
             name: name.to_string(),
             summary: summary.to_string(),
+            key,
         })
         .await?;
         if !decisions.recv().await.unwrap_or(false) {
@@ -562,12 +576,13 @@ fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
          Workspace: {} · Platform: {} — the shell tool runs PowerShell.\n\
          Inspect code with read/list/grep before changing anything. Make minimal, precise edits.\n\
          After code changes, verify with `cargo test` (and `cargo clippy` when asked).\n\
+         File tools run automatically inside the workspace (read AND write/edit). Any path outside the workspace needs explicit user approval, so ask before touching files elsewhere. Never write outside the workspace unless the user asked for it.\n\
          Keep replies concise. When the task is done, answer with plain text and no tool calls.",
         cfg.root.display(),
         std::env::consts::OS
     );
     if plan_mode {
-        prompt.push_str("\nPLAN MODE: read-only. Never attempt write/edit/shell; investigate and present a plan.");
+        prompt.push_str("\nPLAN MODE: read-only and workspace-only. Never attempt write/edit/shell, and never read outside the workspace; investigate and present a plan.");
     }
     prompt
 }
@@ -585,6 +600,18 @@ mod tests {
             out.push_str("\n\n");
         }
         out
+    }
+
+    /// One SSE reply that invokes `name` with `args` (properly JSON-escaped).
+    fn tool_call_reply(name: &str, args: Value) -> String {
+        let frame = json!({
+            "choices": [{ "delta": { "tool_calls": [{
+                "index": 0,
+                "id": "c1",
+                "function": { "name": name, "arguments": args.to_string() }
+            }] } }]
+        });
+        sse(&[&frame.to_string(), "[DONE]"])
     }
 
     /// Serves one scripted reply per request; records each request body.
@@ -692,17 +719,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutating_tool_requires_approval_and_reject_is_reported() {
+    async fn write_inside_workspace_runs_without_approval() {
         let dir = tempfile::tempdir().unwrap();
         let call = sse(&[
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"write","arguments":"{\"path\":\"x.txt\",\"content\":\"boom\"}"}}]}}]}"#,
             "[DONE]",
         ]);
-        let final_text = sse(&[r#"{"choices":[{"delta":{"content":"ya sudah, tidak jadi"}}]}"#, "[DONE]"]);
+        let final_text = sse(&[r#"{"choices":[{"delta":{"content":"sudah ditulis"}}]}"#, "[DONE]"]);
+        let (bodies, url) = fake_server(vec![call, final_text]);
+        let backend = backend(url, dir.path().to_path_buf());
+        let events = collect(&backend, "tulis").await;
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::ApprovalRequested { .. })),
+            "inside write must not ask for approval: {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolFinished { name, ok: true, .. } if name == "write"
+        )));
+        assert!(dir.path().join("x.txt").exists());
+        assert_eq!(bodies.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn outside_read_requires_approval_with_directory_key() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "rahasia luar\n").unwrap();
+        let target = outside.path().join("secret.txt");
+        let call = tool_call_reply("read", json!({ "path": target.to_string_lossy() }));
+        let final_text = sse(&[r#"{"choices":[{"delta":{"content":"oke"}}]}"#, "[DONE]"]);
         let server = Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap();
         std::thread::spawn(move || {
-            for reply in [call.clone(), final_text] {
+            for reply in [call, final_text] {
+                let mut request = server.recv().unwrap();
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let _ = request.respond(Response::from_data(reply));
+            }
+        });
+        let backend = backend(format!("http://{addr}/v1"), workspace.path().to_path_buf());
+        let (decide_tx, decide_rx) = mpsc::channel(4);
+        let mut stream = backend.run_turn(
+            TurnRequest { prompt: "baca luar".into(), session: "o".into(), plan_mode: false },
+            decide_rx,
+        );
+        let expected = tools::approval_key("read", Some(&target));
+        let mut key_seen = None;
+        let mut read_ok = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentEvent::ApprovalRequested { name, key, .. } => {
+                    assert_eq!(name, "read");
+                    key_seen = Some(key);
+                    decide_tx.send(true).await.unwrap();
+                }
+                AgentEvent::ToolFinished { name, ok: true, detail }
+                    if name == "read" && detail.contains("rahasia luar") =>
+                {
+                    read_ok = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(key_seen.as_deref(), Some(expected.as_str()));
+        assert!(expected.starts_with("read:"));
+        assert!(read_ok);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_blocks_outside_path_without_approval() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "rahasia\n").unwrap();
+        let target = outside.path().join("secret.txt");
+        let call = tool_call_reply("read", json!({ "path": target.to_string_lossy() }));
+        let final_text = sse(&[r#"{"choices":[{"delta":{"content":"encana"}}]}"#, "[DONE]"]);
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        std::thread::spawn(move || {
+            for reply in [call, final_text] {
+                let mut request = server.recv().unwrap();
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let _ = request.respond(Response::from_data(reply));
+            }
+        });
+        let backend = backend(format!("http://{addr}/v1"), workspace.path().to_path_buf());
+        let (decide_tx, decide_rx) = mpsc::channel(2);
+        let mut stream = backend.run_turn(
+            TurnRequest { prompt: "baca luar".into(), session: "po".into(), plan_mode: true },
+            decide_rx,
+        );
+        let mut saw_approval = false;
+        let mut saw_block = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentEvent::ApprovalRequested { .. } => saw_approval = true,
+                AgentEvent::ToolFinished { detail, ok: false, .. }
+                    if detail.contains("plan mode is workspace read-only") =>
+                {
+                    saw_block = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_block);
+        assert!(!saw_approval);
+        drop(decide_tx);
+    }
+
+    #[tokio::test]
+    async fn shell_always_requires_approval_with_shell_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let call = sse(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"shell","arguments":"{\"command\":\"echo hi\"}"}}]}}]}"#,
+            "[DONE]",
+        ]);
+        let final_text = sse(&[r#"{"choices":[{"delta":{"content":"selesai"}}]}"#, "[DONE]"]);
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        std::thread::spawn(move || {
+            for reply in [call, final_text] {
                 let mut request = server.recv().unwrap();
                 let mut body = String::new();
                 request.as_reader().read_to_string(&mut body).unwrap();
@@ -712,7 +851,41 @@ mod tests {
         let backend = backend(format!("http://{addr}/v1"), dir.path().to_path_buf());
         let (decide_tx, decide_rx) = mpsc::channel(4);
         let mut stream = backend.run_turn(
-            TurnRequest { prompt: "tulis".into(), session: "s".into(), plan_mode: false },
+            TurnRequest { prompt: "jalankan".into(), session: "sh".into(), plan_mode: false },
+            decide_rx,
+        );
+        let mut key = None;
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::ApprovalRequested { name, key: k, .. } = event {
+                assert_eq!(name, "shell");
+                key = Some(k);
+                decide_tx.send(true).await.unwrap();
+            }
+        }
+        assert_eq!(key.as_deref(), Some("shell"));
+    }
+
+    #[tokio::test]
+    async fn outside_write_reject_is_reported() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("x.txt");
+        let call = tool_call_reply("write", json!({ "path": target.to_string_lossy(), "content": "boom" }));
+        let final_text = sse(&[r#"{"choices":[{"delta":{"content":"tidak jadi"}}]}"#, "[DONE]"]);
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        std::thread::spawn(move || {
+            for reply in [call, final_text] {
+                let mut request = server.recv().unwrap();
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let _ = request.respond(Response::from_data(reply));
+            }
+        });
+        let backend = backend(format!("http://{addr}/v1"), workspace.path().to_path_buf());
+        let (decide_tx, decide_rx) = mpsc::channel(4);
+        let mut stream = backend.run_turn(
+            TurnRequest { prompt: "tulis luar".into(), session: "ow".into(), plan_mode: false },
             decide_rx,
         );
         let mut rejected_seen = false;
@@ -725,7 +898,7 @@ mod tests {
             }
         }
         assert!(rejected_seen);
-        assert!(!dir.path().join("x.txt").exists());
+        assert!(!target.exists());
     }
 
     #[tokio::test]

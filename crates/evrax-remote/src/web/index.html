@@ -98,6 +98,8 @@
     .badge.read { background: #1f5f2f; }
     .badge.write { background: #6b3d0f; }
     .badge.readonly { background: #5a3a1f; }
+    .badge.plan { background: #2f4f6b; }
+    .badge.build { background: #4d2f6b; }
     .err { color: var(--err); }
     .muted { color: var(--muted); }
     .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
@@ -157,6 +159,19 @@
     .composer { border-top: 1px solid var(--border); padding-top: .75rem; margin-top: .75rem; }
     .composer textarea { margin-bottom: .5rem; min-height: 64px; }
     .composer .actions { display: flex; align-items: center; justify-content: flex-end; gap: .5rem; }
+    .mode-toggle { display: flex; gap: .25rem; margin-right: auto; }
+    button.pill {
+      min-height: 34px;
+      padding: .25rem .8rem;
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: .8rem;
+    }
+    button.pill:hover:not(:disabled) { background: var(--panel); color: var(--text); }
+    button.pill.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.pill.on:hover:not(:disabled) { background: var(--accent-hover); }
     .status { color: var(--muted); font-size: .8rem; }
     .status.live { color: var(--ok); }
     .status.closed { color: var(--err); }
@@ -225,6 +240,7 @@
           <button class="ghost" @click="close">&larr; Back</button>
           <span class="name">{{ active.name || active.id }}</span>
           <span class="badge" :class="active.permit">{{ active.permit }}</span>
+          <span class="badge" :class="activeMode">{{ activeMode }}</span>
           <span v-if="active.permit === 'read'" class="badge readonly">read-only</span>
         </div>
         <span class="status" :class="connState">{{ connLabel }}</span>
@@ -270,6 +286,22 @@
           @keydown.enter.exact.prevent="send"
         ></textarea>
         <div class="actions">
+          <div class="mode-toggle">
+            <button
+              class="pill"
+              :class="{ on: activeMode === 'plan' }"
+              :disabled="active.permit === 'read'"
+              title="Plan mode: read-only tools"
+              @click="setMode('plan')"
+            >Plan</button>
+            <button
+              class="pill"
+              :class="{ on: activeMode === 'build' }"
+              :disabled="active.permit === 'read'"
+              title="Build mode: normal tool access"
+              @click="setMode('build')"
+            >Build</button>
+          </div>
           <span v-if="active.permit === 'read'" class="muted">read-only session</span>
           <button :disabled="active.permit === 'read' || sending || !draft.trim()" @click="send">
             {{ sending ? 'Sending...' : 'Send' }}
@@ -292,15 +324,19 @@
      *      We send it as "Authorization: Bearer <token>" anyway so C3 can add
      *      enforcement without changing this client.
      *
-     *  Endpoints used by this UI:
-     *    POST /login                          body {"password"} -> {"token"}
-     *    GET  /api/sessions                   -> [{ "id", "name", "permit" }]
-     *    GET  /api/session/{id}/stream        -> Server-Sent Events (see contract below)
-     *    POST /api/session/{id}/prompt        body {"prompt": "..."}  (C3)
-     *    POST /api/session/{id}/approval      body {"decision": "once"|"always"|"reject"}
-     *
-     *  Session shape (serde Serialize on 'Session', permit is lowercase):
-     *    { "id": "abc", "name": "Shell", "permit": "read" | "write" }
+      *  Endpoints used by this UI:
+      *    POST /login                          body {"password"} -> {"token"}
+      *    GET  /api/sessions                   -> [{ "id", "name", "permit", "mode" }]
+      *    GET  /api/session/{id}/stream        -> Server-Sent Events (see contract below)
+      *    POST /api/session/{id}/prompt        body {"prompt": "..."}  (C3)
+      *    POST /api/session/{id}/approval      body {"decision": "once"|"always"|"reject"}
+      *    POST /api/session/{id}/mode          body {"mode": "plan"|"build"} -> 202 {"ok":true}
+      *      Queues the request for the owning TUI; the UI only flips when the
+      *      'mode' SSE event (or a /api/sessions refresh) confirms it.
+      *
+      *  Session shape (serde Serialize on 'Session', permit is lowercase):
+      *    { "id": "abc", "name": "Shell", "permit": "read" | "write",
+      *      "mode": "plan" | "build" }
      *
      *  ============================================================================
      *  SSE EVENT CONTRACT  (backend C3 must emit these; current C2 stub only sends
@@ -357,6 +393,13 @@
      *      data: { "type": "turn_done", "turn": "<turn-id>" }
      *      The current turn finished. UI inserts a "turn complete" marker.
      *
+     *    event: mode
+     *      data: { "type": "mode", "mode": "plan" | "build" }
+     *      The session's authoritative Plan/Build mode changed. Broadcast by
+     *      the TUI after it applies a switch (its own or one requested from
+     *      any web tab via POST /api/session/{id}/mode). The UI updates the
+     *      header badge and the composer pills from this — never optimistically.
+     *
      *    event: error
      *      data: { "type": "error", "turn": "<turn-id|null>", "message": "..." }
      *      A stream-level or turn-level error. UI renders it in red.
@@ -398,6 +441,10 @@
           if (this.connState === "live") return "live";
           if (this.connState === "connecting") return "connecting...";
           return "disconnected";
+        },
+        activeMode() {
+          const m = this.active && this.active.mode;
+          return m === "plan" || m === "build" ? m : "build";
         },
       },
 
@@ -487,6 +534,9 @@
             // If the open session disappeared, drop back to the list.
             if (this.active && !this.sessions.some((s) => s.id === this.active.id)) {
               this.close();
+            } else if (this.active) {
+              // Re-point at the freshly fetched object so mode/permit refresh.
+              this.active = this.sessions.find((s) => s.id === this.active.id);
             }
           } catch (e) {
             this.pollError = String(e);
@@ -526,6 +576,7 @@
           es.addEventListener("tool", (e) => this.onTool(e));
           es.addEventListener("approval", (e) => this.onApproval(e));
           es.addEventListener("approval_resolved", (e) => this.onApprovalResolved(e));
+          es.addEventListener("mode", (e) => this.onMode(e));
           es.addEventListener("turn_done", (e) => this.onTurnDone(e));
           es.addEventListener("error", (e) => this.onError(e));
           es.addEventListener("done", (e) => this.onDone(e));
@@ -666,6 +717,45 @@
           } catch (err) {
             a.state = String(err);
             a.sending = false;
+          }
+        },
+
+        onMode(e) {
+          const d = this.parseData(e);
+          if (!d || (d.mode !== "plan" && d.mode !== "build")) return;
+          if (this.active) this.active.mode = d.mode;
+          for (const s of this.sessions) if (this.active && s.id === this.active.id) s.mode = d.mode;
+        },
+
+        // Request a Plan/Build switch. No optimistic flip: the pills only move
+        // when the TUI confirms via the `mode` SSE event (or a poll refresh),
+        // so every tab converges on the same authoritative state.
+        async setMode(mode) {
+          if (!this.active || this.active.permit === "read" || this.activeMode === mode) return;
+          try {
+            const r = await fetch(
+              "/api/session/" + encodeURIComponent(this.active.id) + "/mode",
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: "Bearer " + this.token,
+                },
+                body: JSON.stringify({ mode }),
+              }
+            );
+            if (!r.ok) {
+              let msg = "mode change failed (" + r.status + ")";
+              try {
+                const j = await r.json();
+                if (j && j.error) msg = j.error;
+              } catch (ignore) {}
+              this.messages.push({ kind: "error", text: msg });
+              this.scrollDown();
+            }
+          } catch (err) {
+            this.messages.push({ kind: "error", text: String(err) });
+            this.scrollDown();
           }
         },
 

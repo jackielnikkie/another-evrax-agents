@@ -72,6 +72,9 @@ pub struct Session {
     pub id: String,
     pub name: String,
     pub permit: Permit,
+    /// Authoritative agent mode, "plan" | "build". Owned by the TUI (it
+    /// confirms via `set_session_mode`); the web only requests changes.
+    pub mode: String,
 }
 
 /// A realtime event pushed to a session's web subscribers, then serialized to
@@ -87,6 +90,9 @@ pub enum RemoteEvent {
     Tool { turn: String, name: String, status: String, detail: Option<String> },
     Approval { turn: String, name: String, summary: String },
     ApprovalResolved { turn: String, decision: String },
+    /// Authoritative session mode changed ("plan" | "build"). Broadcast by the
+    /// owning TUI via `set_session_mode`; carries no turn id.
+    Mode { mode: String },
     TurnDone { turn: String },
     Error { turn: Option<String>, message: String },
     Done,
@@ -104,6 +110,7 @@ impl RemoteEvent {
             RemoteEvent::Tool { turn, name, status, detail } => ("tool", serde_json::json!({"type":"tool","turn":turn,"name":name,"status":status,"detail":detail})),
             RemoteEvent::Approval { turn, name, summary } => ("approval", serde_json::json!({"type":"approval","turn":turn,"name":name,"summary":summary})),
             RemoteEvent::ApprovalResolved { turn, decision } => ("approval_resolved", serde_json::json!({"type":"approval_resolved","turn":turn,"decision":decision})),
+            RemoteEvent::Mode { mode } => ("mode", serde_json::json!({"type":"mode","mode":mode})),
             RemoteEvent::TurnDone { turn } => ("turn_done", serde_json::json!({"type":"turn_done","turn":turn})),
             RemoteEvent::Error { turn, message } => ("error", serde_json::json!({"type":"error","turn":turn,"message":message})),
             RemoteEvent::Done => ("done", serde_json::json!({"type":"done"})),
@@ -120,6 +127,8 @@ struct Registered {
     pending_prompts: Arc<Mutex<VecDeque<String>>>,
     /// Accept/reject decisions sent from the web while an approval is open.
     pending_approvals: Arc<Mutex<VecDeque<String>>>,
+    /// Mode switches requested from the web, awaiting the owning TUI.
+    pending_modes: Arc<Mutex<VecDeque<String>>>,
 }
 
 /// Password policy: with the default password, only loopback clients may use
@@ -145,6 +154,8 @@ struct RegisterBody {
     #[serde(default)]
     name: String,
     permit: Permit,
+    #[serde(default)]
+    mode: String,
 }
 
 #[derive(Deserialize)]
@@ -162,6 +173,18 @@ struct PromptBody {
 struct ApprovalBody {
     #[serde(default)]
     decision: String,
+}
+
+#[derive(Deserialize)]
+struct ModeBody {
+    #[serde(default)]
+    mode: String,
+}
+
+/// Normalize an incoming mode to the closed set the rest of the system assumes.
+/// Anything other than `"plan"` (including a missing field) becomes `"build"`.
+fn normalize_mode(mode: &str) -> String {
+    if mode == "plan" { "plan".to_string() } else { "build".to_string() }
 }
 
 /// Shared server state.
@@ -423,7 +446,8 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
             match serde_json::from_str::<RegisterBody>(&body) {
                 Ok(b) if !b.id.trim().is_empty() => {
                     let name = if b.name.trim().is_empty() { b.id.clone() } else { b.name };
-                    let session = Session { id: b.id.clone(), name, permit: b.permit };
+                    let mode = normalize_mode(&b.mode);
+                    let session = Session { id: b.id.clone(), name, permit: b.permit, mode };
                     if let Ok(mut reg) = state.registry.lock() {
                         let existed = reg.contains_key(&session.id);
                         if existed {
@@ -436,6 +460,7 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                                 subs: Arc::new(Mutex::new(Vec::new())),
                                 pending_prompts: Arc::new(Mutex::new(VecDeque::new())),
                                 pending_approvals: Arc::new(Mutex::new(VecDeque::new())),
+                                pending_modes: Arc::new(Mutex::new(VecDeque::new())),
                             };
                             reg.insert(b.id.clone(), registered);
                             state.refcount.fetch_add(1, Ordering::SeqCst);
@@ -553,6 +578,36 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                 (Some(_), _) => {
                     respond_json(req, 400, &serde_json::json!({"error": "invalid decision"}))
                 }
+            }
+        }
+
+        (Method::Post, _) if path.starts_with("/api/session/") && path.ends_with("/mode") => {
+            let id = path
+                .trim_start_matches("/api/session/")
+                .trim_end_matches("/mode")
+                .to_string();
+            let body = read_body(&mut req);
+            let parsed = serde_json::from_str::<ModeBody>(&body).ok();
+            let entry = state
+                .registry
+                .lock()
+                .ok()
+                .and_then(|r| r.get(&id).map(|reg| (reg.session.permit, reg.pending_modes.clone())));
+            match (entry, parsed) {
+                (None, _) => respond_json(req, 404, &serde_json::json!({"error": "unknown session"})),
+                (Some((Permit::Read, _)), _) => {
+                    respond_json(req, 403, &serde_json::json!({"error": "session is read-only"}))
+                }
+                (Some((_, q)), Some(m)) if m.mode == "plan" || m.mode == "build" => {
+                    // Only queue the request; the owning TUI applies it and
+                    // confirms via `set_session_mode`, which broadcasts the
+                    // final state to every tab.
+                    if let Ok(mut q) = q.lock() {
+                        q.push_back(m.mode);
+                    }
+                    respond_json(req, 202, &serde_json::json!({"ok": true}))
+                }
+                (Some(_), _) => respond_json(req, 400, &serde_json::json!({"error": "invalid mode"})),
             }
         }
 
@@ -677,7 +732,7 @@ fn note_login_success(state: &State, ip: Option<IpAddr>) {
 
 /// Register a session in the shared registry.
 pub fn register(server: &RemoteServer, id: String, name: String, permit: Permit) {
-    let session = Session { id: id.clone(), name, permit };
+    let session = Session { id: id.clone(), name, permit, mode: "build".into() };
     if let Ok(mut reg) = server.state.registry.lock() {
         if let Some(existing) = reg.get_mut(&id) {
             existing.session = session;
@@ -690,6 +745,7 @@ pub fn register(server: &RemoteServer, id: String, name: String, permit: Permit)
                 subs: Arc::new(Mutex::new(Vec::new())),
                 pending_prompts: Arc::new(Mutex::new(VecDeque::new())),
                 pending_approvals: Arc::new(Mutex::new(VecDeque::new())),
+                pending_modes: Arc::new(Mutex::new(VecDeque::new())),
             },
         );
         server.state.refcount.fetch_add(1, Ordering::SeqCst);
@@ -743,6 +799,47 @@ pub fn take_pending_approval(server: &RemoteServer, id: &str) -> Option<String> 
         .lock()
         .ok()
         .and_then(|r| r.get(id).map(|reg| reg.pending_approvals.clone()))
+        .and_then(|q| q.lock().ok().map(|mut q| q.pop_front()))
+        .flatten()
+}
+
+/// Record + broadcast the session's authoritative mode ("plan"|"build").
+/// No-op when unchanged or unknown. Broadcasts `RemoteEvent::Mode` to all subscribers.
+pub fn set_session_mode(server: &RemoteServer, id: &str, mode: &str) {
+    if mode != "plan" && mode != "build" {
+        return;
+    }
+    // Clone the subscriber list and drop the registry lock before broadcasting.
+    let subs = {
+        let Ok(mut reg) = server.state.registry.lock() else { return };
+        let Some(entry) = reg.get_mut(id) else { return };
+        if entry.session.mode == mode {
+            return;
+        }
+        entry.session.mode = mode.to_string();
+        entry.subs.clone()
+    };
+    broadcast(&subs, RemoteEvent::Mode { mode: mode.to_string() });
+}
+
+/// The session's authoritative mode, if it is registered.
+pub fn session_mode(server: &RemoteServer, id: &str) -> Option<String> {
+    server
+        .state
+        .registry
+        .lock()
+        .ok()
+        .and_then(|r| r.get(id).map(|reg| reg.session.mode.clone()))
+}
+
+/// Pop the next mode requested from the web that the owning TUI has not applied yet.
+pub fn take_pending_mode(server: &RemoteServer, id: &str) -> Option<String> {
+    server
+        .state
+        .registry
+        .lock()
+        .ok()
+        .and_then(|r| r.get(id).map(|reg| reg.pending_modes.clone()))
         .and_then(|q| q.lock().ok().map(|mut q| q.pop_front()))
         .flatten()
 }
@@ -874,7 +971,7 @@ mod tests {
 
     #[test]
     fn session_serializes_lowercase_permit() {
-        let s = Session { id: "x".into(), name: "n".into(), permit: Permit::Write };
+        let s = Session { id: "x".into(), name: "n".into(), permit: Permit::Write, mode: "build".into() };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"permit\":\"write\""));
     }
@@ -1163,5 +1260,128 @@ mod tests {
         }
         let authed = request(b"GET /api/sessions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\n\r\n");
         assert!(authed.contains("200"), "expected 200 with token: {authed:?}");
+    }
+
+    #[test]
+    fn mode_event_serializes_to_sse() {
+        let frame = RemoteEvent::Mode { mode: "plan".into() }.to_sse();
+        assert!(frame.contains("event: mode\n"), "frame: {frame:?}");
+        assert!(frame.contains("\"type\":\"mode\""), "frame: {frame:?}");
+        assert!(frame.contains("\"mode\":\"plan\""), "frame: {frame:?}");
+    }
+
+    #[test]
+    fn register_body_mode_defaults_to_empty() {
+        let without: RegisterBody = serde_json::from_str(r#"{"id":"a","permit":"write"}"#).unwrap();
+        assert_eq!(without.mode, "");
+        assert_eq!(normalize_mode(&without.mode), "build");
+
+        let with: RegisterBody =
+            serde_json::from_str(r#"{"id":"a","permit":"read","mode":"plan"}"#).unwrap();
+        assert_eq!(with.mode, "plan");
+        assert_eq!(normalize_mode(&with.mode), "plan");
+        // Junk collapses to the safe default rather than being stored verbatim.
+        assert_eq!(normalize_mode("turbo"), "build");
+    }
+
+    #[test]
+    fn api_sessions_include_default_mode() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let free = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let server = start(RemoteConfig { bind: "127.0.0.1".into(), port: free, ..Default::default() });
+        assert!(server.is_running());
+        register(&server, "s1".into(), "one".into(), Permit::Write);
+        if let Ok(mut t) = server.state.token.lock() {
+            *t = Some(("tok".into(), Instant::now()));
+        }
+
+        let mut c = TcpStream::connect(("127.0.0.1", free)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        c.write_all(b"GET /api/sessions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\n\r\n")
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let n = c.read(&mut buf).unwrap();
+        let body = String::from_utf8_lossy(&buf[..n]);
+        assert!(body.contains("200 OK"), "response: {body:?}");
+        assert!(body.contains("\"mode\":\"build\""), "default mode missing: {body:?}");
+    }
+
+    #[test]
+    fn mode_endpoint_queues_and_validates() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let free = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let server = start(RemoteConfig { bind: "127.0.0.1".into(), port: free, ..Default::default() });
+        assert!(server.is_running());
+        register(&server, "s1".into(), "one".into(), Permit::Write);
+        register(&server, "ro".into(), "ro".into(), Permit::Read);
+        if let Ok(mut t) = server.state.token.lock() {
+            *t = Some(("tok".into(), Instant::now()));
+        }
+
+        let post = |path: &str, body: &str| -> String {
+            let mut c = TcpStream::connect(("127.0.0.1", free)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            c.write_all(req.as_bytes()).unwrap();
+            let mut buf = [0u8; 512];
+            let n = c.read(&mut buf).unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        };
+
+        let ok = post("/api/session/s1/mode", r#"{"mode":"plan"}"#);
+        assert!(ok.contains("202"), "response: {ok:?}");
+        assert_eq!(take_pending_mode(&server, "s1").as_deref(), Some("plan"));
+
+        let bad = post("/api/session/s1/mode", r#"{"mode":"turbo"}"#);
+        assert!(bad.contains("400"), "response: {bad:?}");
+        assert_eq!(take_pending_mode(&server, "s1"), None, "invalid mode must not enqueue");
+
+        let missing = post("/api/session/nope/mode", r#"{"mode":"plan"}"#);
+        assert!(missing.contains("404"), "response: {missing:?}");
+
+        let readonly = post("/api/session/ro/mode", r#"{"mode":"plan"}"#);
+        assert!(readonly.contains("403"), "response: {readonly:?}");
+        assert_eq!(take_pending_mode(&server, "ro"), None);
+    }
+
+    #[test]
+    fn set_session_mode_broadcasts_and_ignores_noops() {
+        let server = start(RemoteConfig { port: 0, ..Default::default() });
+        register(&server, "s1".into(), "one".into(), Permit::Write);
+        let subs = server.state.registry.lock().unwrap().get("s1").unwrap().subs.clone();
+        let (tx, rx) = channel::<RemoteEvent>();
+        subs.lock().unwrap().push(tx);
+
+        assert_eq!(session_mode(&server, "s1").as_deref(), Some("build"));
+        set_session_mode(&server, "s1", "plan");
+        assert_eq!(session_mode(&server, "s1").as_deref(), Some("plan"));
+        match rx.try_recv() {
+            Ok(RemoteEvent::Mode { mode }) => assert_eq!(mode, "plan"),
+            other => panic!("expected mode broadcast, got {other:?}"),
+        }
+
+        // Same value again: no state change, no broadcast.
+        set_session_mode(&server, "s1", "plan");
+        assert!(rx.try_recv().is_err(), "no-op must not broadcast");
+
+        // Unknown session and junk mode are silently ignored.
+        set_session_mode(&server, "missing", "build");
+        set_session_mode(&server, "s1", "turbo");
+        assert_eq!(session_mode(&server, "s1").as_deref(), Some("plan"));
+        assert_eq!(session_mode(&server, "missing"), None);
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -29,13 +29,20 @@ pub struct Context {
     pub root: PathBuf,
 }
 
+/// A resolved model-supplied path plus whether it leaves the workspace.
+pub struct Resolved {
+    pub path: PathBuf,
+    pub outside: bool,
+}
+
 impl Context {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
     }
 
-    /// Resolve a model-supplied path inside the workspace; reject escapes.
-    fn resolve(&self, raw: &str) -> Result<PathBuf, String> {
+    /// Resolve a model-supplied path and classify whether it leaves the
+    /// workspace. Escapes are allowed (approval is handled by the caller).
+    fn classify(&self, raw: &str) -> Result<Resolved, String> {
         let cleaned = raw.trim().trim_matches('"');
         if cleaned.is_empty() {
             return Err("empty path".into());
@@ -50,19 +57,15 @@ impl Context {
         for component in joined.components() {
             match component {
                 Component::ParentDir => {
-                    if !out.pop() {
-                        return Err(format!("path escapes the workspace: {raw}"));
-                    }
+                    out.pop();
                 }
                 Component::CurDir => {}
                 other => out.push(other.as_os_str()),
             }
         }
         let root = canonical(&self.root);
-        if !(out.starts_with(&self.root) || out.starts_with(&root)) {
-            return Err(format!("path escapes the workspace: {raw}"));
-        }
-        Ok(out)
+        let inside = out.starts_with(&self.root) || out.starts_with(&root);
+        Ok(Resolved { path: out, outside: !inside })
     }
 
     fn display(&self, path: &Path) -> String {
@@ -73,7 +76,42 @@ impl Context {
 }
 
 fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    strip_verbatim(&resolved)
+}
+
+/// Drop the Windows extended-length (`\\?\`) prefix so approval keys stay readable.
+fn strip_verbatim(path: &Path) -> PathBuf {
+    match path.to_string_lossy().strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => path.to_path_buf(),
+    }
+}
+
+/// First workspace-external target for a file tool, used to decide approval.
+/// Returns `None` for tools with no path argument (e.g. `grep`, `shell`) or
+/// when every candidate path stays inside the workspace.
+pub fn outside_target(name: &str, args: &Value, ctx: &Context) -> Option<PathBuf> {
+    let key = match name {
+        "read" | "write" | "edit" => "path",
+        "list" => "pattern",
+        _ => return None,
+    };
+    let raw = args.get(key)?.as_str()?;
+    let resolved = ctx.classify(raw).ok()?;
+    if resolved.outside { Some(resolved.path) } else { None }
+}
+
+/// Approval identity: `<tool>:<canonical parent dir>` for an external target,
+/// so "always allow" opens only that directory. `<tool>` otherwise.
+pub fn approval_key(name: &str, target: Option<&Path>) -> String {
+    match target {
+        Some(path) => {
+            let dir = path.parent().map(canonical).unwrap_or_else(|| path.to_path_buf());
+            format!("{name}:{}", dir.to_string_lossy().replace('\\', "/"))
+        }
+        None => name.to_string(),
+    }
 }
 
 pub fn specs() -> Vec<Value> {
@@ -126,7 +164,7 @@ pub fn specs() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write",
-                "description": "Create or overwrite a file; produces a diff. Requires user approval.",
+                "description": "Create or overwrite a file; produces a diff. Runs automatically inside the workspace; a path outside the workspace requires user approval.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -141,7 +179,7 @@ pub fn specs() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "edit",
-                "description": "Replace an exact string in a file; produces a diff. Requires user approval.",
+                "description": "Replace an exact string in a file; produces a diff. Runs automatically inside the workspace; a path outside the workspace requires user approval.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -219,7 +257,7 @@ fn arg_str(args: &Value, key: &str) -> Result<String, String> {
 }
 
 fn read(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
-    let path = ctx.resolve(&arg_str(args, "path")?)?;
+    let path = ctx.classify(&arg_str(args, "path")?)?.path;
     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
     let limit = args
         .get("limit")
@@ -273,7 +311,7 @@ fn list(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
         out.push('\n');
         count += 1;
         if count >= 400 {
-            out.push_str("… truncated\n");
+            out.push_str("â€¦ truncated\n");
             break;
         }
     }
@@ -349,7 +387,7 @@ fn grep(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
         detail: if hits == 0 {
             "no matches".into()
         } else {
-            let marker = if truncated { "\n… truncated" } else { "" };
+            let marker = if truncated { "\nâ€¦ truncated" } else { "" };
             format!("{hits} matches in {files} files\n{out}{marker}")
         },
         diff: None,
@@ -381,7 +419,7 @@ fn walk(root: &Path) -> Vec<PathBuf> {
 }
 
 fn write(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
-    let path = ctx.resolve(&arg_str(args, "path")?)?;
+    let path = ctx.classify(&arg_str(args, "path")?)?.path;
     let content = arg_str(args, "content")?;
     let old = std::fs::read_to_string(&path).unwrap_or_default();
     if let Some(parent) = path.parent() {
@@ -399,7 +437,7 @@ fn write(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
 }
 
 fn edit(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
-    let path = ctx.resolve(&arg_str(args, "path")?)?;
+    let path = ctx.classify(&arg_str(args, "path")?)?.path;
     let old = arg_str(args, "old")?;
     let new = arg_str(args, "new")?;
     let replace_all = args
@@ -481,7 +519,7 @@ async fn shell(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
     let ok = output.status.success();
     let code = output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
     let detail = format!(
-        "exit {code} · {:.1}s\n{}",
+        "exit {code} Â· {:.1}s\n{}",
         started.elapsed().as_secs_f32(),
         if text.trim().is_empty() { "(no output)" } else { text.trim_end() }
     );
@@ -525,7 +563,7 @@ pub fn truncate(text: &mut String) {
     let omitted = tail_start - head_end;
     let head = text[..head_end].to_string();
     let tail = text[tail_start..].to_string();
-    *text = format!("{head}\n… {omitted} bytes omitted …\n{tail}");
+    *text = format!("{head}\nâ€¦ {omitted} bytes omitted â€¦\n{tail}");
 }
 
 fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
@@ -547,11 +585,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_escapes() {
+    fn classify_flags_outside_paths() {
         let (_d, c) = ctx();
-        assert!(c.resolve("../secret").is_err());
-        assert!(c.resolve("a/../../b").is_err());
-        assert!(c.resolve("a/b.txt").is_ok());
+        assert!(!c.classify("a/b.txt").unwrap().outside);
+        let up = c.classify("../secret").unwrap();
+        assert!(up.outside);
+        assert!(!up.path.starts_with(&c.root));
+        assert!(c.classify("a/../../b").unwrap().outside);
+        // A not-yet-existing file inside the workspace still classifies cleanly.
+        assert!(!c.classify("new/dir/file.txt").unwrap().outside);
+    }
+
+    #[test]
+    fn outside_target_and_key_only_for_external_paths() {
+        let (_d, c) = ctx();
+        // shell/grep have no path argument -> never flagged external.
+        assert!(outside_target("shell", &json!({"command": "ls"}), &c).is_none());
+        assert!(outside_target("grep", &json!({"pattern": "x"}), &c).is_none());
+        // inside path -> none.
+        assert!(outside_target("read", &json!({"path": "a.txt"}), &c).is_none());
+        // external path -> Some, key is tool:canonical-parent.
+        let external = std::env::temp_dir().join("evrax-outside-target.txt");
+        let raw = external.to_string_lossy().to_string();
+        let target = outside_target("read", &json!({"path": raw}), &c).unwrap();
+        let key = approval_key("read", Some(&target));
+        assert!(key.starts_with("read:"));
+        assert!(!key.contains("evrax-outside-target"), "key drops the file name: {key}");
+        assert_eq!(approval_key("shell", None), "shell");
     }
 
     #[test]

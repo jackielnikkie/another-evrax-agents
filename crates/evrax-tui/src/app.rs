@@ -20,6 +20,12 @@ pub struct App {
     pub mode: AgentMode,
     pub scroll_from_bottom: u16,
     pub viewport_height: u16,
+    /// Scroll bound measured while rendering the last frame. `ui::messages` fills it;
+    /// the event loop reads it instead of rebuilding the whole transcript again.
+    pub frame_max_scroll: u16,
+    /// Which backend is really wired up ("bebas", "mock", ...) — shown in the
+    /// status line and the sidebar.
+    pub backend_label: String,
     pub maximized: Option<bool>,
     pub selectable_area: Rect,
     pub selection: Selection,
@@ -55,6 +61,9 @@ pub struct App {
 pub struct Approval {
     pub name: String,
     pub summary: String,
+    /// Identity for "always allow": tool name, or `tool:dir` for outside-workspace
+    /// access, so granting one folder does not open the whole filesystem.
+    pub key: String,
     pub selected: usize,
 }
 
@@ -633,6 +642,8 @@ impl App {
             mode: AgentMode::Build,
             scroll_from_bottom: 0,
             viewport_height: 10,
+            frame_max_scroll: 0,
+            backend_label: "agent".to_string(),
             maximized: None,
             selectable_area: Rect::default(),
             selection: Selection::default(),
@@ -1653,7 +1664,7 @@ impl App {
         let allow = match decision {
             ApprovalDecision::Once => true,
             ApprovalDecision::Always => {
-                self.auto_allow.insert(approval.name);
+                self.auto_allow.insert(approval.key);
                 true
             }
             ApprovalDecision::Reject => false,
@@ -1681,7 +1692,7 @@ impl App {
 
     pub fn take_auto_approval(&mut self) -> bool {
         if let Some(approval) = &self.approval
-            && self.auto_allow.contains(&approval.name)
+            && self.auto_allow.contains(&approval.key)
         {
             self.approval = None;
             self.emit_approval_resolved("auto");
@@ -1919,7 +1930,7 @@ impl App {
                     });
                 }
             }
-            AgentEvent::ApprovalRequested { name, summary } => {
+            AgentEvent::ApprovalRequested { name, summary, key } => {
                 self.asst_open = false;
                 if let Some(turn) = &remote_turn {
                     self.emit_remote(evrax_remote::RemoteEvent::Approval {
@@ -1931,6 +1942,7 @@ impl App {
                 self.approval = Some(Approval {
                     name,
                     summary,
+                    key,
                     selected: 0,
                 });
             }
@@ -1978,6 +1990,39 @@ impl App {
             return;
         };
         evrax_remote::emit(server, &session_id, event);
+    }
+
+    /// Name shown in the status line and sidebar: the model actually in use,
+    /// or `mock` when the scripted backend is active.
+    pub fn set_backend_label(&mut self, label: impl Into<String>) {
+        self.backend_label = label.into();
+    }
+
+    /// Two-way Plan/Build sync: apply a mode requested from the web, then publish
+    /// the TUI's mode back so every tab shows the same state.
+    pub fn sync_remote_mode(&mut self) {
+        if self.remote.as_ref().map(|s| s.enabled) != Some(true) {
+            return;
+        }
+        let requested = {
+            let Some(server) = &self.remote_server else { return };
+            let Some(session_id) = self.remote.as_ref().map(|s| s.session_id.clone()) else {
+                return;
+            };
+            evrax_remote::take_pending_mode(server, &session_id)
+        };
+        if let Some(mode) = requested {
+            self.mode = match mode.as_str() {
+                "plan" => AgentMode::Plan,
+                "build" => AgentMode::Build,
+                _ => self.mode,
+            };
+        }
+        let Some(server) = &self.remote_server else { return };
+        let Some(session_id) = self.remote.as_ref().map(|s| s.session_id.clone()) else {
+            return;
+        };
+        evrax_remote::set_session_mode(server, &session_id, &self.mode.label().to_lowercase());
     }
 
     pub fn scroll_view(&mut self, amount: u16, up: bool, max_scroll: u16) {
@@ -2564,6 +2609,7 @@ mod tests {
         app.apply_event(AgentEvent::ApprovalRequested {
             name: "edit".into(),
             summary: "src/ui.rs".into(),
+            key: "edit".into(),
         });
         assert!(app.approval.is_some());
         app.approval_move(1);
@@ -2580,6 +2626,7 @@ mod tests {
         app.apply_event(AgentEvent::ApprovalRequested {
             name: "edit".into(),
             summary: "src/ui.rs".into(),
+            key: "edit".into(),
         });
         assert!(app.take_auto_approval(), "known tool auto-approves");
         assert!(app.approval.is_none());
@@ -2587,6 +2634,7 @@ mod tests {
         app.apply_event(AgentEvent::ApprovalRequested {
             name: "shell".into(),
             summary: "cargo test".into(),
+            key: "shell".into(),
         });
         assert!(!app.take_auto_approval());
         assert!(app.approval.is_some());
@@ -2595,11 +2643,35 @@ mod tests {
     }
 
     #[test]
+    fn auto_allow_is_scoped_to_the_approval_key() {
+        let mut app = app();
+        app.apply_event(AgentEvent::ApprovalRequested {
+            name: "read".into(),
+            summary: "C:/secrets/a.txt".into(),
+            key: "read:C:/secrets".into(),
+        });
+        assert_eq!(app.settle_approval(ApprovalDecision::Always), Some(true));
+        assert!(app.auto_allow.contains("read:C:/secrets"));
+
+        app.apply_event(AgentEvent::ApprovalRequested {
+            name: "read".into(),
+            summary: "C:/other/b.txt".into(),
+            key: "read:C:/other".into(),
+        });
+        assert!(
+            !app.take_auto_approval(),
+            "a different outside folder must still ask"
+        );
+        assert!(app.approval.is_some());
+    }
+
+    #[test]
     fn settle_remote_approval_maps_web_decisions() {
         let mut app = app();
         app.apply_event(AgentEvent::ApprovalRequested {
             name: "shell".into(),
             summary: "cargo test".into(),
+            key: "shell".into(),
         });
         assert_eq!(app.settle_remote_approval("bogus"), None, "unknown ignored");
         assert!(app.approval.is_some(), "unknown must not consume the dialog");
@@ -2609,6 +2681,7 @@ mod tests {
         app.apply_event(AgentEvent::ApprovalRequested {
             name: "shell".into(),
             summary: "cargo test".into(),
+            key: "shell".into(),
         });
         assert_eq!(app.settle_remote_approval("always"), Some(true));
         assert!(app.auto_allow.contains("shell"));
