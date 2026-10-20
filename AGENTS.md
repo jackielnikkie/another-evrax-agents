@@ -30,8 +30,13 @@ Detail besar dipindah ke `docs/` (tidak di-inject tiap turn): lihat **Detail ref
 - Riwayat detail tiap batch kerja (verbatim): `docs/work-log.md`
 
 ## Work State
-> **Aturan log (berlaku semua agent — opencode, Hermes, dll):** riwayat detail tiap batch kerja DIAPPEND ke `docs/work-log.md` (verbatim, satu bullet per batch). `AGENTS.md` ini cuma nyimpen ringkasan + state hidup — jangan gedein lagi (budget ~7KB; full text dipindah ke work-log 2026-10-20).
 ### Completed (detail penuh: `docs/work-log.md`)
+- **M1 backend asli SELESAI & TERBUKTI LIVE** — crate baru `crates/evrax-agent`: SSE parser (`SseDecoder`, flush sisa frame saat stream close tanpa `[DONE]`), `ToolCallAccumulator` (fix CRITICAL: 9router kirim `"id":""` di frame lanjutan → dulu dianggap tool-call baru, nama & argumen pecah), agent loop max 12 iterasi, history per session (`Mutex<HashMap<session, Vec<turn>>`, trim 100k char), tools `read/list/grep/write/edit/shell` (path guard anti-escape, output cap 30KB, PowerShell + timeout + kill_on_drop, PATH di-inject `%USERPROFILE%\.cargo\bin`), diff via `similar`, approval utk mutating saja, plan mode = read-only (tools di-filter + deny tanpa prompt). Config: `%APPDATA%\evrax\agent.json` + env `EVRAX_*` + CLI `--mock --model --base-url --api-key --max-iterations --root`; default `http://127.0.0.1:20128/v1` + `bebas`; retry 3× utk 429/5xx.
+- **API key 9router**: WAJIB (401 `Missing API key` kalau tanpa bearer) — value diambil dari `~/.config/opencode/opencode.json` provider `9router` (jangan ditulis ke file dalem repo) dan disimpan di `%APPDATA%\evrax\agent.json` (di luar repo, jangan pernah commit).
+- **Core**: `TurnRequest { prompt, session, plan_mode }` — MockBackend abaikan field baru.
+- **TUI wiring**: `main.rs` pilih backend real/mock + flash `backend · <model> · <url>`; `start_turn` kirim session+mode; transcript per session di App (`transcripts: HashMap<String, Vec<ChatEntry>>`) — ganti session replay tampilan, `/new` nama unik `session-<ms>-<counter>` (biar key history backend juga baru).
+- Live smoke (ignored, jalan manual): `cargo test -p evrax-agent -- --ignored` → 2 passed (teks "OK" + read Cargo.toml beneran).
+- **Checkpoint terakhir: 168 tests hijau (33 agent + 5 core + 23 remote + 107 tui), clippy 0, build OK.**
 - **LAN HP**: `remote.json` bind `0.0.0.0` + firewall rule `evrax remote 444` (inbound TCP 444, remoteip 192.168.1.0/24) → listener `0.0.0.0:444`, `/health` via `192.168.1.9` OK.
 - **UI dialog `/remote`**: baris info (bind/port/url/session = row 3/4/5/7) read-only, cursor skip, diblok-center di bawah tunnel; baris `url` tampilin IP LAN asli (`remote_display_url()` + `local_ipv4()`).
 - **Approval web**: `RemoteEvent::Approval`/`ApprovalResolved` (SSE) + `POST /api/session/{id}/approval` (once/always/reject), kartu 3 tombol di web; **bind/port hot-reload** (`/remote` OFF→ON tanpa restart app).
@@ -45,18 +50,18 @@ Detail besar dipindah ke `docs/` (tidak di-inject tiap turn): lihat **Detail ref
 - **C3**: forwarding AgentEvent→SSE, end-to-end terbukti.
 - **Fix `/remote` OFF→ON**: bind sinkron di `start()`, `AliveGuard`, bind gagal → revert `enabled=false` + flash.
 - 5 tema + swatch; paste/composer wrap; image attachment + preview kitty.
-- **Checkpoint terakhir: 133 tests hijau (5 core + 23 remote + 105 tui), clippy 0, build 2026-10-20 14:07.**
 
 ### Active
-- **M1 backend asli (9router SSE)** — plan disetujui, "gas semua sekaligus". Kerja berjalan: `Cargo.toml`/`evrax-core/src/lib.rs`/`Cargo.lock` modified (belum commit).
-- Verifikasi manual binary 14:07: info-row `/remote` center+muted+skip cursor & url IP LAN; approval web 3 tombol; LAN HP `http://192.168.1.9:444`; tunnel click-copy; guard password default; OFF→tunnel stop.
+- Verifikasi manual binary baru (`cargo run`): flash `backend · bebas · http://127.0.0.1:20128/v1`; minta "baca Cargo.toml" → tool `read` beneran; `/new` & ganti session → transcript replay + history backend ikut; approval write/edit/shell (TUI + web 3 tombol); Plan mode nolak mutating.
+- Belum diuji: edit file beneran + `cargo test` via shell tool (self-fix loop) — coba di sesi live berikutnya.
 
 ### Blocked
 - (none — instance mati, port 444 bebas; `cargo build` aman. Kalau instance jalan lagi: build/run kena `Access is denied`, `cargo test`/`clippy` tetap aman.)
 
 ## Next Move
-1. Lanjut **M1** (9router SSE) — deps/vendor: `docs/code-map.md`.
+1. Smoke live M1 di TUI (lihat Active) — perbaiki quirk stream/model yang muncul.
 2. **T3** tailscale serve + item menu kondisional + rombak `docs/remote-tunnel.md`.
+3. Ide M1.5: persist transcript+history ke disk antar-restart, token usage di status, `/model` picker.
 
 ## Catatan konfigurasi (opencode global)
 - MCP `~/.config/opencode/opencode.json(c)`: **OFF** = `rea`, `context7`, `memory`, `fetch`, `puppeteer`, `sequential-thinking`; **ON** = `serena` + `codebase-memory-mcp` (CBM v0.12.1, terinstal via `install.ps1` default di `%LOCALAPPDATA%\Programs\codebase-memory-mcp`). Re-enable CBM: hapus/rename entry. CBM menulis plugin `cbm-augment.ts` + skill + 3 agent + blok di `AGENTS.md` global (+~750 token/turn, tapi arahkan ke graph tools biar hemat).
