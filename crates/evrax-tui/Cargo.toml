@@ -1,0 +1,20 @@
+[package]
+name = "evrax-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "evrax"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+evrax-core = { path = "../evrax-core" }
+evrax-remote = { path = "../evrax-remote" }
+futures-util.workspace = true
+nucleo-matcher = "0.3"
+ratatui.workspace = true
+tokio.workspace = true
+unicode-width.workspace = true

@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a0a" />
+  <title>evrax remote</title>
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <style>
+    :root {
+      --bg: #0a0a0a;
+      --panel: #141414;
+      --panel2: #1a1a1a;
+      --border: #484848;
+      --text: #eeeeee;
+      --muted: #808080;
+      --accent: #9d7cd8;
+      --accent-hover: #b38ff4;
+      --interactive: #fab283;
+      --err: #e06c75;
+      --ok: #7fd88f;
+      --warn: #fab283;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    #app { max-width: 860px; margin: 0 auto; padding: 1rem; padding-top: max(1rem, env(safe-area-inset-top)); padding-bottom: max(1rem, env(safe-area-inset-bottom)); }
+    h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+    h2 { font-size: 1rem; margin: 0 0 .75rem; }
+    .box {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem;
+      margin-bottom: 1rem;
+    }
+    .row { display: flex; align-items: center; gap: .5rem; }
+    .spread { justify-content: space-between; }
+    input, textarea {
+      width: 100%;
+      box-sizing: border-box;
+      padding: .55rem .65rem;
+      background: var(--panel2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-family: inherit;
+      font-size: 16px;
+      resize: vertical;
+    }
+    input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+    button {
+      padding: .5rem 1rem;
+      min-height: 44px;
+      background: var(--accent);
+      color: #fff;
+      border: 0;
+      border-radius: 8px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 14px;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:disabled { opacity: .45; cursor: default; }
+    button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    button.ghost:hover { background: var(--panel2); }
+    ul { list-style: none; padding: 0; margin: 0; }
+    li.card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: .75rem;
+      padding: .75rem .85rem;
+      margin-bottom: .5rem;
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    li.card:hover { border-color: var(--accent); }
+    li.card .name { font-weight: 600; }
+    li.card .id { color: var(--muted); font-size: .8rem; }
+    .badge {
+      font-size: .72rem;
+      padding: .12rem .55rem;
+      border-radius: 999px;
+      background: #333;
+      color: #fff;
+      text-transform: uppercase;
+      letter-spacing: .03em;
+    }
+    .badge.read { background: #1f5f2f; }
+    .badge.write { background: #6b3d0f; }
+    .badge.readonly { background: #5a3a1f; }
+    .err { color: var(--err); }
+    .muted { color: var(--muted); }
+    .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+    .chat { display: flex; flex-direction: column; height: calc(100dvh - 2rem); min-height: 320px; }
+    @supports not (height: 100dvh) { .chat { height: 75vh; } }
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: .25rem .25rem .5rem;
+      display: flex;
+      flex-direction: column;
+      gap: .6rem;
+    }
+    .msg { display: flex; flex-direction: column; gap: .25rem; }
+    .msg .label { font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .bubble {
+      background: var(--panel2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: .55rem .75rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .bubble.user { background: var(--panel2); border-left: 3px solid var(--interactive); }
+    .bubble.delta { border-left: 3px solid var(--accent); }
+    .assistant-block { gap: .35rem; }
+    .thinking { color: var(--muted); font-style: italic; white-space: pre-wrap; word-break: break-word; padding-left: .75rem; border-left: 3px solid var(--border); }
+    .tool { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; padding-left: .75rem; }
+    .tool .tool-name { color: var(--warn); }
+    .approval {
+      margin-top: .35rem;
+      border: 1px solid var(--warn);
+      border-radius: 8px;
+      padding: .6rem .75rem;
+      display: flex;
+      flex-direction: column;
+      gap: .5rem;
+    }
+    .approval .approval-head { color: var(--warn); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
+    .approval .approval-summary { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+    .approval .approval-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+    .approval button { min-height: 40px; padding: .4rem .9rem; }
+    .approval button.danger { background: transparent; border: 1px solid var(--err); color: var(--err); }
+    .approval button.danger:hover { background: var(--panel2); }
+    .approval .approval-state { color: var(--muted); font-size: .8rem; }
+    .bubble.err { border-left: 3px solid var(--err); color: var(--err); }
+    .marker {
+      align-self: center;
+      font-size: .72rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      padding: .15rem .6rem;
+      border: 1px dashed var(--border);
+      border-radius: 999px;
+    }
+    .composer { border-top: 1px solid var(--border); padding-top: .75rem; margin-top: .75rem; }
+    .composer textarea { margin-bottom: .5rem; min-height: 64px; }
+    .composer .actions { display: flex; align-items: center; justify-content: flex-end; gap: .5rem; }
+    .status { color: var(--muted); font-size: .8rem; }
+    .status.live { color: var(--ok); }
+    .status.closed { color: var(--err); }
+    /* Mobile / touch */
+    html, body { overscroll-behavior-y: none; }
+    body { -webkit-text-size-adjust: 100%; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+    /* Login splash */
+    .login { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: calc(100dvh - 2rem); gap: 1.25rem; text-align: center; }
+    .brand { font-size: clamp(1.8rem, 9vw, 2.6rem); font-weight: 700; letter-spacing: .12em; color: var(--accent); }
+    .brand .thin { color: var(--interactive); font-weight: 400; }
+    .tagline { color: var(--muted); font-size: .8rem; letter-spacing: .18em; text-transform: uppercase; margin: -.5rem 0 0; }
+    .login-card { width: 100%; max-width: 340px; margin: 0; }
+    .login-card input { margin-bottom: .75rem; }
+    .login-card button { width: 100%; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <h1>evrax remote</h1>
+
+    <!-- Login view -->
+    <div v-if="!token" class="login">
+      <div class="brand">EVRAX<span class="thin">-AGENT</span></div>
+      <p class="tagline">remote web</p>
+      <div class="box login-card">
+        <input
+          type="password"
+          v-model="password"
+          placeholder="password"
+          autocomplete="current-password"
+          autocapitalize="off"
+          autocorrect="off"
+          @keyup.enter="login"
+        />
+        <button @click="login">Login</button>
+        <p v-if="error" class="err" style="margin:.75rem 0 0;">{{ error }}</p>
+      </div>
+    </div>
+
+    <!-- Session list view -->
+    <div v-else-if="!active" class="box">
+      <div class="toolbar">
+        <h2 style="margin:0;">Sessions ({{ sessions.length }})</h2>
+        <button class="ghost" @click="logout">Logout</button>
+      </div>
+      <ul>
+        <li v-for="s in sessions" :key="s.id" class="card" @click="open(s)">
+          <span class="row">
+            <span class="name">{{ s.name || s.id }}</span>
+            <span class="badge" :class="s.permit">{{ s.permit }}</span>
+          </span>
+          <span class="row">
+            <span class="id">{{ s.id }}</span>
+            <span class="muted">open &rarr;</span>
+          </span>
+        </li>
+      </ul>
+      <p v-if="sessions.length === 0" class="muted">No active sessions.</p>
+      <p v-if="pollError" class="err">{{ pollError }}</p>
+    </div>
+
+    <!-- Chat view -->
+    <div v-else class="box chat">
+      <div class="toolbar">
+        <div class="row">
+          <button class="ghost" @click="close">&larr; Back</button>
+          <span class="name">{{ active.name || active.id }}</span>
+          <span class="badge" :class="active.permit">{{ active.permit }}</span>
+          <span v-if="active.permit === 'read'" class="badge readonly">read-only</span>
+        </div>
+        <span class="status" :class="connState">{{ connLabel }}</span>
+      </div>
+
+      <div class="messages" ref="scroller">
+        <template v-for="(m, i) in messages" :key="i">
+          <div v-if="m.kind === 'user'" class="msg">
+            <span class="label">you</span>
+            <div class="bubble user">{{ m.text }}</div>
+          </div>
+          <div v-else-if="m.kind === 'turn'" class="msg assistant-block">
+            <span class="label">assistant</span>
+            <div v-if="m.thinking" class="thinking">{{ m.thinking }}</div>
+            <div v-for="(t, ti) in m.tools" :key="ti" class="tool">
+              <span class="tool-name">tool: {{ t.name }}</span> {{ t.status }}<span v-if="t.detail"> - {{ t.detail }}</span>
+            </div>
+            <div v-if="m.approval" class="approval">
+              <span class="approval-head">approval needed &middot; <span class="tool-name">{{ m.approval.name }}</span></span>
+              <div class="approval-summary">{{ m.approval.summary }}</div>
+              <div v-if="m.approval.state === 'pending'" class="approval-actions">
+                <button :disabled="m.approval.sending" @click="decideApproval(m, 'once')">approve</button>
+                <button class="ghost" :disabled="m.approval.sending" @click="decideApproval(m, 'always')">always allow</button>
+                <button class="danger" :disabled="m.approval.sending" @click="decideApproval(m, 'reject')">reject</button>
+              </div>
+              <span v-else class="approval-state">{{ m.approval.state }}</span>
+            </div>
+            <div v-if="m.text" class="bubble delta">{{ m.text }}</div>
+            <div v-else-if="!m.done && !m.error" class="muted">&hellip;</div>
+            <div v-if="m.error" class="bubble err">{{ m.error }}</div>
+          </div>
+          <div v-else-if="m.kind === 'error'" class="msg">
+            <div class="bubble err">{{ m.text }}</div>
+          </div>
+        </template>
+      </div>
+
+      <div class="composer">
+        <textarea
+          v-model="draft"
+          :disabled="active.permit === 'read'"
+          :placeholder="active.permit === 'read' ? 'This session is read-only' : 'Type a prompt... (Enter to send, Shift+Enter for newline)'"
+          @keydown.enter.exact.prevent="send"
+        ></textarea>
+        <div class="actions">
+          <span v-if="active.permit === 'read'" class="muted">read-only session</span>
+          <button :disabled="active.permit === 'read' || sending || !draft.trim()" @click="send">
+            {{ sending ? 'Sending...' : 'Send' }}
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /*
+     * ============================================================================
+     *  evrax remote - single-file Vue 3 web UI (no build step)
+     *
+     *  Auth model (from crates/evrax-remote/src/lib.rs):
+     *    - POST /login with JSON body { "password": "..." }
+     *      -> 200 { "token": "<32-hex>" }   (or 401 { "error": "invalid password" })
+     *    - The token is opaque to the client. The v1 server stores it in-memory and
+     *      does NOT currently validate it on /api/sessions or /api/session/*.
+     *      We send it as "Authorization: Bearer <token>" anyway so C3 can add
+     *      enforcement without changing this client.
+     *
+     *  Endpoints used by this UI:
+     *    POST /login                          body {"password"} -> {"token"}
+     *    GET  /api/sessions                   -> [{ "id", "name", "permit" }]
+     *    GET  /api/session/{id}/stream        -> Server-Sent Events (see contract below)
+     *    POST /api/session/{id}/prompt        body {"prompt": "..."}  (C3)
+     *    POST /api/session/{id}/approval      body {"decision": "once"|"always"|"reject"}
+     *
+     *  Session shape (serde Serialize on 'Session', permit is lowercase):
+     *    { "id": "abc", "name": "Shell", "permit": "read" | "write" }
+     *
+     *  ============================================================================
+     *  SSE EVENT CONTRACT  (backend C3 must emit these; current C2 stub only sends
+     *  a single 'data: {"type":"connected"}' and then closes).
+     *
+     *  Transport: text/event-stream, each frame is 'event: <name>' + 'data: <json>'.
+     *  Every data payload is a JSON object. Events, in expected order of use:
+     *
+     *    event: connected
+     *      data: { "type": "connected", "session": "<id>" }
+     *      Sent once when the stream is established.
+     *
+     *    event: turn_start
+     *      data: { "type": "turn_start", "turn": "<turn-id>" }
+     *      Marks the beginning of one assistant turn (one prompt -> one answer).
+     *      All subsequent delta/thinking/tool events belong to this turn until a
+     *      turn_done is received.
+     *
+     *    event: delta
+     *      data: { "type": "delta", "turn": "<turn-id>", "text": "<chunk>" }
+     *      Incremental assistant output. UI appends 'text' to the current turn's
+     *      streaming answer. 'text' is UTF-8, may be empty (should be ignored).
+     *
+     *    event: thinking
+     *      data: { "type": "thinking", "turn": "<turn-id>", "text": "<reasoning>" }
+     *      Optional reasoning/scratch text. UI renders it muted/italic; it is not
+     *      part of the final answer.
+     *
+     *    event: tool
+     *      data: { "type": "tool", "turn": "<turn-id>", "name": "<tool>",
+     *              "status": "<queued|running|done|error>", "detail": "<optional>" }
+     *      A tool invocation lifecycle. 'status' is one of:
+     *        - "queued"   tool selected, not yet started
+     *        - "running"  tool is executing
+     *        - "done"     tool finished successfully
+     *        - "error"    tool failed
+     *      'detail' may carry an error message or short summary (may be empty/absent).
+     *
+     *    event: approval
+     *      data: { "type": "approval", "turn": "<turn-id>", "name": "<tool>",
+     *              "summary": "<what it wants to do>" }
+     *      A tool needs the operator's consent before running. The UI renders
+     *      approve / always-allow / reject buttons; picking one POSTs to
+     *      /api/session/{id}/approval (the dialog also opens in the TUI, either
+     *      side may decide).
+     *
+     *    event: approval_resolved
+     *      data: { "type": "approval_resolved", "turn": "<turn-id>",
+     *              "decision": "<once|always|reject|auto>" }
+     *      The pending approval was settled (from the terminal or a web tab).
+     *      The UI replaces the buttons with the outcome.
+     *
+     *    event: turn_done
+     *      data: { "type": "turn_done", "turn": "<turn-id>" }
+     *      The current turn finished. UI inserts a "turn complete" marker.
+     *
+     *    event: error
+     *      data: { "type": "error", "turn": "<turn-id|null>", "message": "..." }
+     *      A stream-level or turn-level error. UI renders it in red.
+     *
+     *    event: done
+     *      data: { "type": "done" }
+     *      Server is closing the stream (no more events). UI marks the connection
+     *      closed and stops reconnecting automatically.
+     *
+     *  Note: the legacy v1 stub sends 'data: {"type":"connected"}' with no
+     *  'event:' line (the default "message" event). This client handles that too
+     *  by reading the JSON 'type' field as a fallback.
+     * ============================================================================
+     */
+
+    const { createApp, nextTick } = Vue;
+
+    createApp({
+      data() {
+        return {
+          token: localStorage.getItem("evrax_token") || "",
+          password: "",
+          sessions: [],
+          error: "",
+          pollError: "",
+          active: null,        // currently open Session (or null = list view)
+          messages: [],        // chat log entries
+          draft: "",
+          sending: false,
+          connState: "closed", // "closed" | "connecting" | "live"
+          es: null,            // EventSource handle
+          pollTimer: null,
+          currentTurn: null,   // id of the turn currently being streamed
+        };
+      },
+
+      computed: {
+        connLabel() {
+          if (this.connState === "live") return "live";
+          if (this.connState === "connecting") return "connecting...";
+          return "disconnected";
+        },
+      },
+
+      mounted() {
+        if (this.token) this.startPoll();
+      },
+
+      beforeUnmount() {
+        this.stopPoll();
+        this.closeStream();
+      },
+
+      methods: {
+        // ---- auth -------------------------------------------------------------
+        async login() {
+          this.error = "";
+          try {
+            const r = await fetch("/login", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ password: this.password }),
+            });
+            if (r.ok) {
+              const j = await r.json();
+              this.token = j.token;
+              localStorage.setItem("evrax_token", this.token);
+              this.password = "";
+              this.startPoll();
+            } else if (r.status === 429) {
+              this.error = "Too many attempts. Try again in a few minutes.";
+            } else {
+              this.error = "Login failed (" + r.status + ")";
+            }
+          } catch (e) {
+            this.error = String(e);
+          }
+        },
+
+        logout() {
+          if (this.token) {
+            // Best-effort server-side logout (invalidates the token).
+            fetch("/logout", {
+              method: "POST",
+              headers: { Authorization: "Bearer " + this.token },
+            }).catch(() => {});
+          }
+          this.stopPoll();
+          this.closeStream();
+          this.active = null;
+          this.messages = [];
+          this.token = "";
+          localStorage.removeItem("evrax_token");
+          this.sessions = [];
+        },
+
+        // ---- session polling ---------------------------------------------------
+        startPoll() {
+          this.stopPoll();
+          this.poll();
+          this.pollTimer = setInterval(this.poll, 2000);
+        },
+
+        stopPoll() {
+          if (this.pollTimer) {
+            clearInterval(this.pollTimer);
+            this.pollTimer = null;
+          }
+        },
+
+        async poll() {
+          if (!this.token) return;
+          try {
+            const r = await fetch("/api/sessions", {
+              headers: { Authorization: "Bearer " + this.token },
+            });
+            if (r.status === 401) {
+              this.logout();
+              return;
+            }
+            if (!r.ok) {
+              this.pollError = "sessions error (" + r.status + ")";
+              return;
+            }
+            this.pollError = "";
+            const list = await r.json();
+            this.sessions = Array.isArray(list) ? list : [];
+            // If the open session disappeared, drop back to the list.
+            if (this.active && !this.sessions.some((s) => s.id === this.active.id)) {
+              this.close();
+            }
+          } catch (e) {
+            this.pollError = String(e);
+          }
+        },
+
+        // ---- chat --------------------------------------------------------------
+        open(s) {
+          this.active = s;
+          this.messages = [];
+          this.draft = "";
+          this.connectStream(s.id);
+        },
+
+        close() {
+          this.closeStream();
+          this.active = null;
+          this.messages = [];
+          this.draft = "";
+        },
+
+        connectStream(id) {
+          this.closeStream();
+          this.connState = "connecting";
+          const url = "/api/session/" + encodeURIComponent(id) + "/stream?token=" + encodeURIComponent(this.token);
+          const es = new EventSource(url);
+          this.es = es;
+
+          es.onopen = () => { this.connState = "live"; };
+
+          // Register named event handlers from the contract above.
+          es.addEventListener("connected", (e) => { this.connState = "live"; });
+          es.addEventListener("user", (e) => this.onUser(e));
+          es.addEventListener("turn_start", (e) => this.onTurnStart(e));
+          es.addEventListener("delta", (e) => this.onDelta(e));
+          es.addEventListener("thinking", (e) => this.onThinking(e));
+          es.addEventListener("tool", (e) => this.onTool(e));
+          es.addEventListener("approval", (e) => this.onApproval(e));
+          es.addEventListener("approval_resolved", (e) => this.onApprovalResolved(e));
+          es.addEventListener("turn_done", (e) => this.onTurnDone(e));
+          es.addEventListener("error", (e) => this.onError(e));
+          es.addEventListener("done", (e) => this.onDone(e));
+
+          // Fallback: legacy stub sends data without an 'event:' name, which
+          // arrives via the default "message" listener.
+          es.onmessage = (e) => this.onLegacyMessage(e);
+
+          es.onerror = () => {
+            // EventSource does not expose a status code; assume the stream ended.
+            this.connState = "closed";
+          };
+        },
+
+        closeStream() {
+          if (this.es) {
+            this.es.close();
+            this.es = null;
+          }
+          this.connState = "closed";
+        },
+
+        parseData(e) {
+          try {
+            return JSON.parse(e.data || "{}");
+          } catch (err) {
+            return null;
+          }
+        },
+
+        curTurn() {
+          const last = this.messages[this.messages.length - 1];
+          if (last && last.kind === "turn") return last;
+          const t = { kind: "turn", turn: null, thinking: "", text: "", tools: [], approval: null, done: false, error: "" };
+          this.messages.push(t);
+          return t;
+        },
+
+        onUser(e) {
+          const d = this.parseData(e);
+          if (!d || d.text == null) return;
+          this.messages.push({ kind: "user", text: d.text });
+          this.scrollDown();
+        },
+
+        onTurnStart(e) {
+          // Open a fresh assistant block; thinking, deltas and tools for this
+          // turn coalesce into it (mirrors the TUI's single turn block).
+          const d = this.parseData(e);
+          this.messages.push({ kind: "turn", turn: d && d.turn ? d.turn : null, thinking: "", text: "", tools: [], approval: null, done: false, error: "" });
+          this.currentTurn = d && d.turn ? d.turn : null;
+          this.scrollDown();
+        },
+
+        onDelta(e) {
+          const d = this.parseData(e);
+          if (!d || d.text == null) return;
+          this.curTurn().text += d.text;
+          this.scrollDown();
+        },
+
+        onThinking(e) {
+          const d = this.parseData(e);
+          if (!d || d.text == null) return;
+          this.curTurn().thinking += d.text;
+          this.scrollDown();
+        },
+
+        onTool(e) {
+          const d = this.parseData(e);
+          if (!d) return;
+          const name = d.name || "tool";
+          const status = d.status || "queued";
+          const detail = d.detail || "";
+          const tools = this.curTurn().tools;
+          let row = null;
+          for (let i = tools.length - 1; i >= 0; i--) {
+            if (tools[i].name === name) { row = tools[i]; break; }
+          }
+          if (row) { row.status = status; if (detail) row.detail = detail; }
+          else tools.push({ name, status, detail });
+          this.scrollDown();
+        },
+
+        onApproval(e) {
+          const d = this.parseData(e);
+          if (!d) return;
+          this.curTurn().approval = {
+            name: d.name || "tool",
+            summary: d.summary || "",
+            state: "pending",
+            sending: false,
+          };
+          this.scrollDown();
+        },
+
+        onApprovalResolved(e) {
+          const d = this.parseData(e);
+          const t = this.curTurn();
+          if (!t.approval) return;
+          t.approval.sending = false;
+          t.approval.state =
+            d && d.decision === "reject"
+              ? "rejected"
+              : d && d.decision === "auto"
+                ? "auto-approved"
+                : "approved";
+          this.scrollDown();
+        },
+
+        async decideApproval(m, decision) {
+          const a = m && m.approval;
+          if (!this.active || !a || a.state !== "pending" || a.sending) return;
+          a.sending = true;
+          try {
+            const r = await fetch(
+              "/api/session/" + encodeURIComponent(this.active.id) + "/approval",
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: "Bearer " + this.token,
+                },
+                body: JSON.stringify({ decision }),
+              }
+            );
+            if (!r.ok) {
+              let msg = "approval failed (" + r.status + ")";
+              try {
+                const j = await r.json();
+                if (j && j.error) msg = j.error;
+              } catch (ignore) {}
+              a.state = msg;
+              a.sending = false;
+            }
+            // On success keep the buttons disabled; the server's
+            // approval_resolved event flips the card once the TUI settles it.
+          } catch (err) {
+            a.state = String(err);
+            a.sending = false;
+          }
+        },
+
+        onTurnDone(e) {
+          this.curTurn().done = true;
+          this.scrollDown();
+        },
+
+        onError(e) {
+          const d = this.parseData(e);
+          const msg = d && d.message ? d.message : "stream error";
+          this.curTurn().error = msg;
+          this.scrollDown();
+        },
+
+        onDone(e) {
+          this.connState = "closed";
+          this.closeStream();
+        },
+
+        onLegacyMessage(e) {
+          const d = this.parseData(e);
+          if (!d) return;
+          // Only the v1 stub emits this shape; named events are handled above.
+          if (d.type === "connected") {
+            this.connState = "live";
+          }
+        },
+
+        scrollDown() {
+          nextTick(() => {
+            const el = this.$refs.scroller;
+            if (el) el.scrollTop = el.scrollHeight;
+          });
+        },
+
+        // ---- composer ----------------------------------------------------------
+        async send() {
+          if (!this.active) return;
+          if (this.active.permit === "read") return;
+          const text = this.draft.trim();
+          if (!text || this.sending) return;
+
+          this.sending = true;
+          this.draft = "";
+          // The user bubble is rendered from the server's `user` echo, so every
+          // open tab (including this one) stays in sync.
+          this.scrollDown();
+
+          try {
+            const r = await fetch(
+              "/api/session/" + encodeURIComponent(this.active.id) + "/prompt",
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: "Bearer " + this.token,
+                },
+                body: JSON.stringify({ prompt: text }),
+              }
+            );
+            if (!r.ok) {
+              let msg = "prompt failed (" + r.status + ")";
+              try {
+                const j = await r.json();
+                if (j && j.error) msg = j.error;
+              } catch (ignore) {}
+              this.messages.push({ kind: "error", text: msg });
+              this.scrollDown();
+            }
+          } catch (e) {
+            this.messages.push({ kind: "error", text: String(e) });
+            this.scrollDown();
+          } finally {
+            this.sending = false;
+          }
+        },
+      },
+    }).mount("#app");
+  </script>
+</body>
+</html>

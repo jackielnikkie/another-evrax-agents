@@ -1,0 +1,20 @@
+# Peta kode & nomor baris
+
+Dipindah dari AGENTS.md agar file itu ramping. Update saat refactor besar.
+
+## Kode konteks (path & nomor baris)
+- `D:\another-evrax-agent\crates\evrax-tui\src\theme.rs` (~440 baris setelah edit): struct `Theme { key, label + 36 field }` (`base, raised, text, muted, border, accent, interactive, error, success, selection, action_dim, diff_add, diff_rem, diff_add_bg, diff_rem_bg, diff_add_gutter, diff_rem_gutter, diff_ctx_gutter, diff_ctx_text, md_heading, md_strong, md_emphasis, md_quote, md_code, md_list, md_link, md_link_label, md_rule, syn_comment, syn_string, syn_number, syn_keyword, syn_function, syn_type, syn_variable, syn_operator`).
+  - `EVRAX` 50-97 (JANGAN diubah). `OPENCODE` ~91-130 (accent `#fab283`, selection/action_dim `#3d1d06`, rainbow md/syn).
+  - **SUDAH DITAMBAH**: `CATPPUCCIN`, `DRACULA`, `GRUVBOX`, `NORD`, `TOKYONIGHT` consts setelah `OPENCODE`; `THEMES` sekarang 7 entry: `&[EVRAX, OPENCODE, CATPPUCCIN, DRACULA, GRUVBOX, NORD, TOKYONIGHT]`.
+  - **SUDAH**: `#[cfg(test)] mod tests` di EOF ada — `theme_keys_are_unique` (assert 7) + `set_index_roundtrips_by_key`.
+  - Accessors: `current()`, `index()`, `set_index(idx)` clamp, `count()`, `label()`, `by_key(key)→Option<usize>`; `config_file()`=`APPDATA\evrax\theme`; `load_saved()`; `save_current()` (non-test) + `#[cfg(test)] pub fn save_current() {}` stub. `label_at` & `visual_line_count` SUDAH dihapus (dead code).
+- `D:\another-evrax-agent\crates\evrax-tui\src\ui.rs` (~1730 baris): `modal()` 806-823; `modal_row(inner, label, selected) -> Line` 826-840; `theme_row(inner, idx, selected)` swatch 2 dot (accent+interactive tema target) — dipakai `theme_modal`; `theme_modal` 1049+ (`modal(frame,"themes",44,count+3)`, list `theme_row`, hint `" enter save · esc revert"`); `input()` render wrap-aware pakai `visual_rows` + scroll vertikal; tests mod + `theme_modal_lists_themes` (assert "dracula"), `input_scrolls_to_keep_cursor_visible` (300 char @ 20 wide).
+- `D:\another-evrax-agent\crates\evrax-tui\src\app.rs` (~1620 baris): `SlashCommand { name, aliases, description, command }`; baris ~109-114 `theme`/`aliases: &[]` (SUDAH dihapus alias); `LineEditor` punya `visual_rows(width)`, `cursor_visual(width)`, `insert_str` (splice O(n)); `composer_height(width)` clamp 1..7 → max 9 baris.
+- `D:\another-evrax-agent\docs\opencode-ui-reference.md`: baris 129 SUDAH diamend (alias `/themes` dihapus, sebut 7 preset + swatch 2 dot).
+- `D:\another-evrax-agent\agent-reference\opencode\packages\tui\src\theme\assets\` — `catppuccin.json`, `dracula.json`, `gruvbox.json`, `nord.json`, `tokyonight.json` (semua sudah dibaca penuh sesi ini); `v2\opencode.json` sumber rainbow OPENCODE.
+- `D:\another-evrax-agent\crates\evrax-tui\src\main.rs` — routing key + startup `theme::load_saved()`.
+- `D:\another-evrax-agent\crates\evrax-tui\src\markdown.rs` (`parse`,`inline`,`highlight`,`wrap_segs`,`style_of`,`SegStyle`), `window.rs`, `crates\evrax-core\src\lib.rs` — konteks U5/M1.
+- Keybinds: Ctrl+C quit; Ctrl+Y copy; Ctrl+P palette; Ctrl+N new; Ctrl+O session dialog; Tab/Shift+Tab mode; Enter submit; shift/ctrl/alt+enter + ctrl+j newline; ↑/↓ composer; PgUp/PgDn + wheel; drag seleksi auto-copy; Esc×2 cancel (`ESC_CANCEL_TICKS=20`).
+- Render order: header→body→footer→selection→palette→session_modal→theme_modal; approval panel "Allow once / Always allow / Reject".
+- Test konvensi: `renders_mock_conversation` 100x60; `assistant_markdown_gets_styles` 80x12; hindari "Build"/"Plan" di teks demo.
+- Recon M1+ (hermes-agent): loop `agent/conversation_loop.py:1656-1703`; accumulator `chat_completion_helpers_tool_calls.py:8`; `delta.reasoning_content`; `tools/registry.py:462`; approval `tools/approval.py::check_all_command_guards:1151`; prompt `agent/system_prompt.py:736` + AGENTS.md `prompt_builder.py:1706`; compression 0.50; SQLite `hermes_state.py:460`; provider `transports/chat_completions.py:516` (SSE fallback :170); default 9router `http://127.0.0.1:20128/v1`, model `bebas`, flag `--mock` dipertahankan.
