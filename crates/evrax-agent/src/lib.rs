@@ -687,7 +687,7 @@ fn trunc(text: &str, max: usize) -> String {
 fn provider_error(status: reqwest::StatusCode, body: &str, model: &str) -> String {
     let detail = trunc(body.trim(), 400);
     let hint = match status.as_u16() {
-        401 => "API key ditolak 9router — cek `api_key` di agent.json",
+        401 => "API key ditolak 9router (invalid/nonaktif) — cek `api_key` di agent.json dan status key di dashboard 9router",
         402 => "kuota/kredit provider habis",
         403 => "9router menolak key ini untuk model tersebut — buka dashboard 9router → API Keys, izinkan model itu atau matikan restrict access",
         _ => "",
