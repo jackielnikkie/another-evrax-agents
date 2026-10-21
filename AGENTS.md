@@ -72,6 +72,7 @@ Detail besar dipindah ke `docs/` (tidak di-inject tiap turn): lihat **Detail ref
 - 5 tema + swatch; paste/composer wrap; image attachment + preview kitty.
 
 ### Active
+- **Smoke first-run wizard (profil fresh, belum diuji manual)**: `$env:APPDATA="$env:TEMP\evrax-fresh"; .\target\release\evrax.exe --setup` ? Test connection ? Simpan ? kirim prompt **tanpa restart** (flash `backend ? <model> ? <url>`); cek `%TEMP%\evrax-fresh\evrax\agent.json`. Rilis `v0.1.2` (CI hijau, asset terverifikasi, 257 test).
 - **Fase 2 SELESAI (rilis `v0.1.1` live, 254 test hijau, clippy clean)**: crate `evrax-store` (layout `%LOCALAPPDATA%\evrax\projects\<slug>-<hash16>\`, `plain_path` buang prefix `\\?\`, prune 50); `App.store` + `attach_project`/`resume`/`save_current`/`load_from_disk` + save point (submit/TurnFinished/Failed/title/new/quit); agent `new_with_project` + lazy `load_history` + `commit`→`history.json`; CLI `-c/-s <spec>/-l/--setup/--no-save` + `resolve_session` (id → prefix unik → judul) + `print_sessions`; wizard first-run (`--setup` atau api key kosong, bukan mock) preset 9router/OpenRouter/DeepSeek/Custom + Test connection (`evrax_agent::test_provider`) + simpan (`save_config`); fix mojibake emoji di `app.rs` (`image …`); versi `0.1.1`. Belum di-tag.
 - **Smoke Fase 2 (baru)**: `evrax --list` / `--help` / `-c` (tanpa sesi → error rapi); di TUI: kirim prompt → keluar → `evrax -c` lanjut konteks; `evrax --setup` (dan first-run tanpa api key) → Test connection + Simpan.
 - **Smoke banner/welcome**: binary release `target\release\evrax.exe` (28 MB, 13:22) sudah baru → pakai itu (atau `cargo run`). Cek empty state 3 kolom (skills kiri, banner tengah, MCP+tools kanan), auto-scroll skill setelah daftar > viewport, signature `FAUST55`, sidebar sesi kembali setelah kirim prompt.
@@ -86,11 +87,10 @@ Detail besar dipindah ke `docs/` (tidak di-inject tiap turn): lihat **Detail ref
 - ~~Instance evrax user jalan (PID **360**)~~ → **2026-10-21 12:2x: TIDAK ada proses evrax** (`Get-Process evrax` kosong) → `cargo build`/`run` bebas; smoke bisa lanjut. `cargo test`/`clippy`/`check` tetap aman kapan pun.
 
 ## Next Move
-1. **Fase 3**: clean-install test di Sandbox (admin + reboot + firewall 20128) — tujuan utama user.
+1. **Fase 3**: clean-install test di Sandbox (admin + reboot + firewall 20128) ? tujuan utama user.
 2. Smoke Fase 2 interaktif (lihat Active) + smoke UI/tools/iterasi/M3 + ukur CPU idle.
-3. **Fase 3**: clean-install test di Sandbox (admin + reboot + firewall 20128) — tujuan utama user.
-4. **Fase 4**: batch skills (embed 42 via `build.rs`, `skills_list`/`skill_view`/`skill_manage`, `/skills`, `/<nama>`, `docs/skills.md`) → `v0.1.2`; backup temp 169 skill dihapus setelah ini.
-5. Opsional: T3 tailscale serve, token usage di status, `/model` picker.
+3. **Fase 4**: batch skills (embed 42 via `build.rs`, `skills_list`/`skill_view`/`skill_manage`, `/skills`, `/<nama>`, `docs/skills.md`) ? `v0.1.3`; backup temp 169 skill dihapus setelah ini.
+4. Opsional: T3 tailscale serve, token usage di status, `/model` picker.
 
 ## Catatan konfigurasi (opencode global)
 - MCP `~/.config/opencode/opencode.json(c)`: **OFF** = `rea`, `context7`, `memory`, `fetch`, `puppeteer`, `sequential-thinking`; **ON** = `serena` + `codebase-memory-mcp` (CBM v0.12.1, terinstal via `install.ps1` default di `%LOCALAPPDATA%\Programs\codebase-memory-mcp`). Re-enable CBM: hapus/rename entry. CBM menulis plugin `cbm-augment.ts` + skill + 3 agent + blok di `AGENTS.md` global (+~750 token/turn, tapi arahkan ke graph tools biar hemat).
