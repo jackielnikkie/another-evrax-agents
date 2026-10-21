@@ -56,6 +56,8 @@ pub struct App {
     pub chip_rects: Vec<Rect>,
     pub chip_x_rects: Vec<Rect>,
     pub wizard: Option<Wizard>,
+    /// Config saved by the setup wizard; the run loop swaps the backend once.
+    pub reload_config: Option<evrax_agent::AgentConfig>,
     pub session_id: String,
     pub sessions: Vec<String>,
     /// Project store for on-disk persistence (None with `--no-save`/`--mock`).
@@ -802,6 +804,7 @@ impl App {
             chip_rects: Vec::new(),
             chip_x_rects: Vec::new(),
             wizard: None,
+            reload_config: None,
             session_id: unique_session_id(),
             sessions: Vec::new(),
             store: None,
@@ -896,10 +899,17 @@ impl App {
             }
             _ => {
                 let cfg = self.wizard_config();
-                self.wizard = None;
                 cfg.map(WizardAction::Save).unwrap_or(WizardAction::None)
             }
         }
+    }
+
+    pub fn queue_backend_reload(&mut self, cfg: evrax_agent::AgentConfig) {
+        self.reload_config = Some(cfg);
+    }
+
+    pub fn take_reload_config(&mut self) -> Option<evrax_agent::AgentConfig> {
+        self.reload_config.take()
     }
 
     pub fn wizard_escape(&mut self) -> bool {
@@ -3895,5 +3905,27 @@ mod tests {
         assert_eq!(cfg.base_url, "http://x/v1");
         assert_eq!(cfg.model, "m");
         assert!(cfg.api_key.is_none());
+    }
+
+    #[test]
+    fn wizard_save_keeps_modal_open_until_saved() {
+        let mut app = App::new();
+        app.open_wizard(&evrax_agent::AgentConfig::default());
+        if let Some(wizard) = app.wizard.as_mut() {
+            wizard.row = 5;
+        }
+        assert!(matches!(app.wizard_enter(), WizardAction::Save(_)));
+        assert!(app.wizard.is_some());
+    }
+
+    #[test]
+    fn reload_config_is_taken_once() {
+        let mut app = App::new();
+        app.queue_backend_reload(evrax_agent::AgentConfig {
+            model: "m".into(),
+            ..Default::default()
+        });
+        assert_eq!(app.take_reload_config().unwrap().model, "m");
+        assert!(app.take_reload_config().is_none());
     }
 }

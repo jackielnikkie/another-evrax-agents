@@ -59,3 +59,8 @@ Verbatim dari blok Completed AGENTS.md (2026-10-20). AGENTS.md cuma nyimpen ring
 - Wizard first-run: App.wizard + WIZARD_PRESETS (9router/OpenRouter/DeepSeek/Custom), modal ui::wizard_modal (provider/base url/model/api key/test/save), handle_wizard_key di main.rs + channel hasil 	est_provider, simpan via save_config; aktif saat --setup atau api key kosong (bukan mock, bukan EVRAX_API_KEY).
 - Fix mojibake sisa di pp.rs (image …); --version/--help dirapikan (HELP const; sebelumnya regex patch menelan arm --help → hang).
 - Gate: **254 test hijau** (72 agent + 5 core + 5 graph unit + 1 graph e2e + 29 remote + 7 store + 135 tui), clippy -D warnings clean, release build OK; smoke --help/--version/--list/-c OK.
+## Fix first-run wizard reload backend (2026-10-21, v0.1.2)
+- Bug: ackend dibuat di main.rs sebelum wizard; Simpan hanya menulis ` %APPDATA%\evrax\agent.json `, backend in-memory tetap config lama → turn pertama 401 sampai restart. wizard_enter() juga menutup modal sebelum hasil simpan diketahui.
+- Fix: App.reload_config + queue_backend_reload/	ake_reload_config; wizard_enter() row 5 tidak menutup modal; save sukses → queue + wizard_close; loop drain di tick → chat_backend() bangun ulang backend + set_backend_label + flash ackend · <model> · <url>. Guard --mock: config disimpan tapi backend tetap mock.
+- Helper baru chat_backend(cfg, store, mock) -> (Box<dyn AgentBackend>, label, note) dipakai startup + reload (test label mock/real tanpa jaringan).
+- Test: +3 (wizard save keeps modal, reload taken once, chat_backend labels) → **257 test hijau**, clippy clean.

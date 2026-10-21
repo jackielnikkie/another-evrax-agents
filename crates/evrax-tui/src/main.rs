@@ -269,6 +269,34 @@ fn setup_panic_hook() {
     }));
 }
 
+/// Builds the active backend. `mock` (or a client build failure) yields the
+/// mock; the label feeds `App.backend_label`, the note the startup flash.
+fn chat_backend(
+    cfg: evrax_agent::AgentConfig,
+    store: Option<ProjectStore>,
+    mock: bool,
+) -> (Box<dyn AgentBackend>, String, Option<String>) {
+    if mock {
+        return (
+            Box::new(MockBackend::new()),
+            "mock".to_string(),
+            Some("backend · mock".to_string()),
+        );
+    }
+    match evrax_agent::ChatBackend::new_with_project(cfg, store) {
+        Ok(real) => {
+            let label = real.model().to_string();
+            let note = format!("backend · {label} · {}", real.base_url());
+            (Box::new(real), label, Some(note))
+        }
+        Err(e) => (
+            Box::new(MockBackend::new()),
+            "mock".to_string(),
+            Some(format!("backend gagal ({e}) · pakai mock")),
+        ),
+    }
+}
+
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     loaded: evrax_agent::LoadedConfig,
@@ -276,27 +304,8 @@ async fn run(
     resume: Option<String>,
     need_wizard: bool,
 ) -> Result<()> {
-    let (backend, backend_note, backend_label): (Box<dyn AgentBackend>, String, String) =
-        if loaded.mock {
-            (
-                Box::new(MockBackend::new()),
-                "backend · mock".to_string(),
-                "mock".to_string(),
-            )
-        } else {
-            match evrax_agent::ChatBackend::new_with_project(loaded.config.clone(), store.clone()) {
-                Ok(real) => {
-                    let label = real.model().to_string();
-                    let note = format!("backend · {} · {}", label, real.base_url());
-                    (Box::new(real), note, label)
-                }
-                Err(e) => (
-                    Box::new(MockBackend::new()),
-                    format!("backend gagal ({e}) · pakai mock"),
-                    "mock".to_string(),
-                ),
-            }
-        };
+    let (mut backend, backend_label, backend_note) =
+        chat_backend(loaded.config.clone(), store.clone(), loaded.mock);
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let (wizard_tx, mut wizard_rx) = mpsc::channel::<Result<String, String>>(4);
     let mut turn_task: Option<JoinHandle<()>> = None;
@@ -315,8 +324,8 @@ async fn run(
     }
     app.catalog = evrax_agent::catalog::Catalog::load();
     app.set_backend_label(backend_label);
-    if !backend_note.is_empty() {
-        app.set_flash(backend_note);
+    if let Some(note) = backend_note {
+        app.set_flash(note);
     }
     let mut subagent_link = subagent_id.and_then(|id| {
         let mut link = subagent_link::Link::load(&id)?;
@@ -346,6 +355,19 @@ async fn run(
             match result {
                 Ok(text) => app.wizard_status(format!("OK \u{b7} {text}"), false),
                 Err(err) => app.wizard_status(format!("gagal \u{b7} {err}"), false),
+            }
+            needs_draw = true;
+        }
+        if let Some(cfg) = app.take_reload_config() {
+            if loaded.mock {
+                app.set_flash("config tersimpan · mock tetap aktif".to_string());
+            } else {
+                let (next, label, note) = chat_backend(cfg, store.clone(), false);
+                backend = next;
+                app.set_backend_label(label);
+                if let Some(note) = note {
+                    app.set_flash(note);
+                }
             }
             needs_draw = true;
         }
@@ -817,8 +839,9 @@ fn handle_wizard_key(
             }
             WizardAction::Save(cfg) => match evrax_agent::save_config(&cfg, false) {
                 Ok(path) => {
+                    app.queue_backend_reload(cfg);
                     app.wizard_close();
-                    app.set_flash(format!("config saved \u{b7} {}", path.display()));
+                    app.set_flash(format!("config tersimpan · {}", path.display()));
                 }
                 Err(e) => app.wizard_status(format!("save gagal: {e}"), false),
             },
@@ -1279,5 +1302,20 @@ mod cli_tests {
             .save_meta(&evrax_store::SessionMeta::new("session-1-2", "b", "build"))
             .unwrap();
         assert!(resolve_session(&store, "session-1").is_err());
+    }
+
+    #[test]
+    fn chat_backend_builds_mock_and_real_labels() {
+        let (_, label, note) = chat_backend(evrax_agent::AgentConfig::default(), None, true);
+        assert_eq!(label, "mock");
+        assert!(note.unwrap().contains("mock"));
+
+        let cfg = evrax_agent::AgentConfig {
+            model: "bebas".into(),
+            ..Default::default()
+        };
+        let (_, label, note) = chat_backend(cfg, None, false);
+        assert_eq!(label, "bebas");
+        assert!(note.unwrap().contains("bebas"));
     }
 }
