@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use evrax_agent::catalog::Catalog;
 use evrax_core::{AgentEvent, DiffLine};
+use evrax_store::{ProjectStore, SessionMeta};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::layout::Rect;
@@ -54,8 +55,11 @@ pub struct App {
     pub pending_kitty: Vec<String>,
     pub chip_rects: Vec<Rect>,
     pub chip_x_rects: Vec<Rect>,
+    pub wizard: Option<Wizard>,
     pub session_id: String,
     pub sessions: Vec<String>,
+    /// Project store for on-disk persistence (None with `--no-save`/`--mock`).
+    store: Option<ProjectStore>,
     /// Message history kept per named session (replayed when switching back).
     pub transcripts: std::collections::HashMap<String, Vec<ChatEntry>>,
     /// Display titles per session id; `session_id` itself never changes so the
@@ -91,6 +95,34 @@ pub enum ApprovalDecision {
     Once,
     Always,
     Reject,
+}
+
+pub const WIZARD_PRESETS: [(&str, &str, &str); 4] = [
+    ("9router", "http://127.0.0.1:20128/v1", "bebas"),
+    (
+        "OpenRouter",
+        "https://openrouter.ai/api/v1",
+        "deepseek/deepseek-chat",
+    ),
+    ("DeepSeek", "https://api.deepseek.com/v1", "deepseek-chat"),
+    ("Custom", "", ""),
+];
+
+pub struct Wizard {
+    pub row: usize,
+    pub editing: bool,
+    pub provider: usize,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: String,
+    pub status: Option<String>,
+    pub testing: bool,
+}
+
+pub enum WizardAction {
+    None,
+    Test(evrax_agent::AgentConfig),
+    Save(evrax_agent::AgentConfig),
 }
 
 pub struct SessionDialog {
@@ -342,6 +374,7 @@ impl Selection {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum ChatEntry {
     User(String),
     Assistant(String),
@@ -498,6 +531,7 @@ impl Attachment {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub name: String,
     pub summary: String,
@@ -505,6 +539,7 @@ pub struct ToolCall {
     pub detail: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum ToolStatus {
     Running,
     Done,
@@ -717,6 +752,14 @@ impl Default for LineEditor {
     }
 }
 
+fn mode_from(mode: &str) -> AgentMode {
+    if mode.eq_ignore_ascii_case("plan") {
+        AgentMode::Plan
+    } else {
+        AgentMode::Build
+    }
+}
+
 impl App {
     pub fn new() -> Self {
         Self {
@@ -758,8 +801,10 @@ impl App {
             pending_kitty: Vec::new(),
             chip_rects: Vec::new(),
             chip_x_rects: Vec::new(),
+            wizard: None,
             session_id: unique_session_id(),
             sessions: Vec::new(),
+            store: None,
             transcripts: std::collections::HashMap::new(),
             titles: std::collections::HashMap::new(),
             manual_titles: std::collections::HashSet::new(),
@@ -769,6 +814,241 @@ impl App {
             content_rev: 0,
             last_esc: None,
             asst_open: false,
+        }
+    }
+
+    pub fn open_wizard(&mut self, cfg: &evrax_agent::AgentConfig) {
+        self.wizard = Some(Wizard {
+            row: 0,
+            editing: false,
+            provider: 0,
+            base_url: cfg.base_url.clone(),
+            model: cfg.model.clone(),
+            api_key: cfg.api_key.clone().unwrap_or_default(),
+            status: None,
+            testing: false,
+        });
+    }
+
+    pub fn wizard_row(&self) -> usize {
+        self.wizard.as_ref().map(|w| w.row).unwrap_or(0)
+    }
+
+    pub fn wizard_config(&self) -> Option<evrax_agent::AgentConfig> {
+        let wizard = self.wizard.as_ref()?;
+        Some(evrax_agent::AgentConfig {
+            base_url: wizard.base_url.trim().to_string(),
+            model: wizard.model.trim().to_string(),
+            api_key: Some(wizard.api_key.trim().to_string()).filter(|key| !key.is_empty()),
+            ..evrax_agent::AgentConfig::default()
+        })
+    }
+
+    pub fn wizard_move(&mut self, delta: i32) {
+        if let Some(wizard) = self.wizard.as_mut() {
+            wizard.editing = false;
+            wizard.row = ((wizard.row as i32 + delta).rem_euclid(6)) as usize;
+        }
+    }
+
+    pub fn wizard_preset(&mut self, delta: i32) {
+        if let Some(wizard) = self.wizard.as_mut() {
+            let count = WIZARD_PRESETS.len() as i32;
+            wizard.provider = ((wizard.provider as i32 + delta).rem_euclid(count)) as usize;
+            let (_, url, model) = WIZARD_PRESETS[wizard.provider];
+            if !url.is_empty() {
+                wizard.base_url = url.to_string();
+            }
+            if !model.is_empty() {
+                wizard.model = model.to_string();
+            }
+        }
+    }
+
+    pub fn wizard_enter(&mut self) -> WizardAction {
+        let Some(row) = self.wizard.as_ref().map(|wizard| wizard.row) else {
+            return WizardAction::None;
+        };
+        if self.wizard.as_ref().is_some_and(|wizard| wizard.editing) {
+            if let Some(wizard) = self.wizard.as_mut() {
+                wizard.editing = false;
+            }
+            return WizardAction::None;
+        }
+        match row {
+            0 => {
+                self.wizard_preset(1);
+                WizardAction::None
+            }
+            1..=3 => {
+                if let Some(wizard) = self.wizard.as_mut() {
+                    wizard.editing = true;
+                }
+                WizardAction::None
+            }
+            4 => {
+                let cfg = self.wizard_config();
+                if let Some(wizard) = self.wizard.as_mut() {
+                    wizard.testing = true;
+                    wizard.status = Some("testing...".to_string());
+                }
+                cfg.map(WizardAction::Test).unwrap_or(WizardAction::None)
+            }
+            _ => {
+                let cfg = self.wizard_config();
+                self.wizard = None;
+                cfg.map(WizardAction::Save).unwrap_or(WizardAction::None)
+            }
+        }
+    }
+
+    pub fn wizard_escape(&mut self) -> bool {
+        if let Some(wizard) = self.wizard.as_mut()
+            && wizard.editing
+        {
+            wizard.editing = false;
+            return true;
+        }
+        false
+    }
+
+    pub fn wizard_type(&mut self, c: char) {
+        if let Some(wizard) = self.wizard.as_mut() {
+            match wizard.row {
+                1 => wizard.base_url.push(c),
+                2 => wizard.model.push(c),
+                3 => wizard.api_key.push(c),
+                _ => {}
+            }
+        }
+    }
+
+    pub fn wizard_backspace(&mut self) {
+        if let Some(wizard) = self.wizard.as_mut() {
+            match wizard.row {
+                1 => {
+                    wizard.base_url.pop();
+                }
+                2 => {
+                    wizard.model.pop();
+                }
+                3 => {
+                    wizard.api_key.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub fn wizard_status(&mut self, status: impl Into<String>, testing: bool) {
+        if let Some(wizard) = self.wizard.as_mut() {
+            wizard.status = Some(status.into());
+            wizard.testing = testing;
+        }
+    }
+
+    pub fn wizard_close(&mut self) {
+        self.wizard = None;
+    }
+
+    /// Wires a project store: loads the session list + titles from disk.
+    pub fn attach_project(&mut self, store: ProjectStore) {
+        if let Ok(metas) = store.list() {
+            self.sessions = metas.iter().map(|m| m.id.clone()).collect();
+            for meta in &metas {
+                if !meta.title.is_empty() {
+                    self.titles.insert(meta.id.clone(), meta.title.clone());
+                }
+                if meta.title_pending {
+                    self.title_pending.insert(meta.id.clone());
+                }
+            }
+        }
+        self.store = Some(store);
+    }
+
+    /// Loads a persisted session (metadata + transcript). Returns false when unknown.
+    pub fn resume(&mut self, id: &str) -> bool {
+        let Some(store) = self.store.clone() else {
+            return false;
+        };
+        let Ok(Some(meta)) = store.load_meta(id) else {
+            return false;
+        };
+        if self.session_id != id && !self.messages.is_empty() {
+            self.save_current();
+        }
+        self.session_id = id.to_string();
+        self.messages = store
+            .read_json(id, "transcript.json")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        self.mode = mode_from(&meta.mode);
+        if !meta.title.is_empty() {
+            self.titles.insert(id.to_string(), meta.title.clone());
+            self.title_pending.insert(id.to_string());
+        }
+        if !self.sessions.contains(&id.to_string()) {
+            self.sessions.insert(0, id.to_string());
+        }
+        self.input.take();
+        self.attachments.clear();
+        self.asst_open = false;
+        self.busy = false;
+        self.scroll_from_bottom = 0;
+        self.transcript.invalidate();
+        true
+    }
+
+    /// Flushes the active session (transcript + metadata) to disk, if any.
+    pub fn save_current(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let id = self.session_id.clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let created = store
+            .load_meta(&id)
+            .ok()
+            .flatten()
+            .map(|m| m.created_at)
+            .filter(|c| *c > 0)
+            .unwrap_or(now);
+        let meta = SessionMeta {
+            id: id.clone(),
+            title: self.titles.get(&id).cloned().unwrap_or_default(),
+            mode: self.mode.label().to_lowercase(),
+            title_pending: self.title_pending.contains(&id) || self.titles.contains_key(&id),
+            created_at: created,
+            updated_at: now,
+        };
+        let _ = store.write_json(&id, "transcript.json", &self.messages);
+        let _ = store.save_meta(&meta);
+        if !self.sessions.contains(&id) {
+            self.sessions.insert(0, id);
+        }
+    }
+
+    fn load_from_disk(&self, id: &str) -> Option<Vec<ChatEntry>> {
+        self.store
+            .as_ref()?
+            .read_json(id, "transcript.json")
+            .ok()
+            .flatten()
+    }
+
+    fn restore_mode(&mut self, id: &str) {
+        if let Some(store) = self.store.as_ref()
+            && let Ok(Some(meta)) = store.load_meta(id)
+        {
+            self.mode = mode_from(&meta.mode);
         }
     }
 
@@ -839,6 +1119,7 @@ impl App {
                 .unwrap_or_default();
             evrax_remote::rename_session(server, &turn_id, title);
         }
+        self.save_current();
     }
 
     /// `/rename <title>` — a manual title survives later model suggestions.
@@ -912,7 +1193,13 @@ impl App {
                 .find(|name| **name != self.session_id && self.transcripts.contains_key(*name))
                 .cloned();
             match victim {
-                Some(victim) => self.forget_session(&victim),
+                Some(victim) => {
+                    if self.store.is_some() {
+                        self.transcripts.remove(&victim);
+                    } else {
+                        self.forget_session(&victim);
+                    }
+                }
                 None => break,
             }
         }
@@ -927,6 +1214,7 @@ impl App {
     }
 
     pub fn quit(&mut self) {
+        self.save_current();
         self.should_quit = true;
     }
 
@@ -1159,6 +1447,7 @@ impl App {
     }
 
     pub fn new_session(&mut self) {
+        self.save_current();
         self.palette = None;
         self.slash = None;
         self.slash_dismissed = None;
@@ -1236,11 +1525,17 @@ impl App {
                 let target = idx - 2;
                 if target < self.sessions.len() {
                     let target_id = self.sessions.remove(target);
+                    self.save_current();
                     let old = std::mem::replace(&mut self.session_id, target_id.clone());
                     self.sessions.insert(0, old.clone());
                     let archived = std::mem::take(&mut self.messages);
                     self.remember_transcript(old, archived);
-                    self.messages = self.transcripts.remove(&target_id).unwrap_or_default();
+                    self.messages = self
+                        .transcripts
+                        .remove(&target_id)
+                        .or_else(|| self.load_from_disk(&target_id))
+                        .unwrap_or_default();
+                    self.restore_mode(&target_id);
                     self.input.take();
                     self.asst_open = false;
                     self.scroll_from_bottom = 0;
@@ -1970,6 +2265,7 @@ impl App {
         self.input.take();
         self.attachments.clear();
         self.push_entry(ChatEntry::User(prompt.clone()));
+        self.save_current();
         self.ensure_placeholder_title(&prompt);
         self.busy = true;
         self.iteration = None;
@@ -2225,6 +2521,7 @@ impl App {
                 self.busy = false;
                 self.iteration = None;
                 self.asst_open = false;
+                self.save_current();
                 self.plan_title_job();
                 if let Some(turn) = &remote_turn {
                     self.emit_remote(evrax_remote::RemoteEvent::TurnDone { turn: turn.clone() });
@@ -2256,6 +2553,7 @@ impl App {
                 self.busy = false;
                 self.iteration = None;
                 self.asst_open = false;
+                self.save_current();
                 self.push_entry(ChatEntry::Assistant(format!("error: {message}")));
                 if let Some(turn) = &remote_turn {
                     self.emit_remote(evrax_remote::RemoteEvent::Error {
@@ -3541,5 +3839,61 @@ mod tests {
         assert!(matches!(app.tunnel_follow_remote(), TunnelEffect::None));
         let (flash, _) = app.flash.as_ref().expect("hint flashed");
         assert!(flash.contains("hostname"), "flash: {flash}");
+    }
+    #[test]
+    fn sessions_persist_and_resume_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let store =
+            evrax_store::ProjectStore::open_in(dir.path(), &dir.path().join("data")).unwrap();
+        let mut app = App::new();
+        app.attach_project(store.clone());
+        let id = app.session_id.clone();
+        app.push_entry(ChatEntry::User("halo".into()));
+        app.push_entry(ChatEntry::Assistant("hai".into()));
+        app.save_current();
+
+        let mut resumed = App::new();
+        resumed.attach_project(store);
+        assert!(resumed.resume(&id));
+        assert_eq!(resumed.messages.len(), 2);
+        assert!(matches!(resumed.messages[0], ChatEntry::User(_)));
+        assert!(resumed.sessions.contains(&id));
+    }
+
+    #[test]
+    fn empty_sessions_are_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let store =
+            evrax_store::ProjectStore::open_in(dir.path(), &dir.path().join("data")).unwrap();
+        let mut app = App::new();
+        app.attach_project(store.clone());
+        app.save_current();
+        assert!(store.list().unwrap().is_empty());
+    }
+    #[test]
+    fn wizard_presets_fill_provider_defaults() {
+        let mut app = App::new();
+        app.open_wizard(&evrax_agent::AgentConfig::default());
+        app.wizard_preset(1);
+        let wizard = app.wizard.as_ref().unwrap();
+        assert_eq!(wizard.base_url, "https://openrouter.ai/api/v1");
+        assert!(!wizard.model.is_empty());
+    }
+
+    #[test]
+    fn wizard_config_trims_and_drops_empty_key() {
+        let mut app = App::new();
+        app.open_wizard(&evrax_agent::AgentConfig::default());
+        if let Some(wizard) = app.wizard.as_mut() {
+            wizard.base_url = "  http://x/v1  ".into();
+            wizard.model = " m ".into();
+            wizard.api_key = "   ".into();
+        }
+        let cfg = app.wizard_config().unwrap();
+        assert_eq!(cfg.base_url, "http://x/v1");
+        assert_eq!(cfg.model, "m");
+        assert!(cfg.api_key.is_none());
     }
 }

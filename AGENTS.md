@@ -6,7 +6,7 @@ Detail besar dipindah ke `docs/` (tidak di-inject tiap turn): lihat **Detail ref
 
 ## Objective
 - Bangun **"evrax"**: agent coding TUI di **Rust + ratatui** (`D:\another-evrax-agent`) — ringan (satu binary), backend LLM asli ([OI]-compatible + SSE), tools lengkap, web remote.
-- **Batch aktif: installer + rilis publik.** Urutan: (0) bersih-bersih ✅, (1) scrub + installer/CI → tag `v0.1.0`, (2) `evrax-store` + persist + wizard → `v0.1.1`, (3) clean-install Sandbox, (4) batch skills → `v0.1.2`. Detail: `docs/handoff-2026-10-21.md`.
+- **Batch aktif: installer + rilis publik.** Urutan: (0) bersih-bersih ✅, (1) scrub + installer/CI → tag `v0.1.0` ✅, (2) `evrax-store` + persist + wizard → `v0.1.1` (kode selesai, 254 test hijau, siap tag), (3) clean-install Sandbox, (4) batch skills → `v0.1.2`. Detail: `docs/handoff-2026-10-21.md`.
 - **Repo rilis `another-evrax-agents`**: `https://github.com/jackielnikkie/another-evrax-agents` (public, MIT; main awal hanya LICENSE). Backup: `evrax-ui` (`main` @ `4fb1804` sebelum batch ini). `target/`, `dist/`, `agent-reference/`, `.serena/` di-ignore; AGENTS.md **ikut** (keputusan user).
 
 ## Aturan kerja (user)
@@ -72,6 +72,8 @@ Detail besar dipindah ke `docs/` (tidak di-inject tiap turn): lihat **Detail ref
 - 5 tema + swatch; paste/composer wrap; image attachment + preview kitty.
 
 ### Active
+- **Fase 2 SELESAI (kode, 254 test hijau, clippy clean)**: crate `evrax-store` (layout `%LOCALAPPDATA%\evrax\projects\<slug>-<hash16>\`, `plain_path` buang prefix `\\?\`, prune 50); `App.store` + `attach_project`/`resume`/`save_current`/`load_from_disk` + save point (submit/TurnFinished/Failed/title/new/quit); agent `new_with_project` + lazy `load_history` + `commit`→`history.json`; CLI `-c/-s <spec>/-l/--setup/--no-save` + `resolve_session` (id → prefix unik → judul) + `print_sessions`; wizard first-run (`--setup` atau api key kosong, bukan mock) preset 9router/OpenRouter/DeepSeek/Custom + Test connection (`evrax_agent::test_provider`) + simpan (`save_config`); fix mojibake emoji di `app.rs` (`image …`); versi `0.1.1`. Belum di-tag.
+- **Smoke Fase 2 (baru)**: `evrax --list` / `--help` / `-c` (tanpa sesi → error rapi); di TUI: kirim prompt → keluar → `evrax -c` lanjut konteks; `evrax --setup` (dan first-run tanpa api key) → Test connection + Simpan.
 - **Smoke banner/welcome**: binary release `target\release\evrax.exe` (28 MB, 13:22) sudah baru → pakai itu (atau `cargo run`). Cek empty state 3 kolom (skills kiri, banner tengah, MCP+tools kanan), auto-scroll skill setelah daftar > viewport, signature `FAUST55`, sidebar sesi kembali setelah kirim prompt.
 - **Smoke tools baru**: `web_fetch` URL docs, `todo` add/list, `git status`, `ast_grep` search, `graph index` lalu `graph search`/`outline`, `subagent start` membuka Windows Terminal baru dan `send/status/stop` lewat state file.
 - **Smoke batch iterasi/retry (masih relevan)**: kirim prompt → footer `iterasi n/500`; `--max-iterations 3` → setelah 3 tool round keluar `Notice` + ringkasan + `TurnFinished` (bukan error), lalu `continue` → konteks lanjut; matikan 9router saat turn → flash `retry 1/10`, bukan langsung gagal.
@@ -84,12 +86,11 @@ Detail besar dipindah ke `docs/` (tidak di-inject tiap turn): lihat **Detail ref
 - ~~Instance evrax user jalan (PID **360**)~~ → **2026-10-21 12:2x: TIDAK ada proses evrax** (`Get-Process evrax` kosong) → `cargo build`/`run` bebas; smoke bisa lanjut. `cargo test`/`clippy`/`check` tetap aman kapan pun.
 
 ## Next Move
-1. **Selesaiin rilis v0.1.0**: `git remote add another https://github.com/jackielnikkie/another-evrax-agents.git` → fetch → merge `--allow-unrelated-histories` (konflik cuma LICENSE, pakai MIT kita) → push `main` ke `another` + `origin` → tag `v0.1.0` → tunggu Actions (`gh` lokal belum ada; cek via API `/actions/runs` & `/releases/latest`) → smoke one-liner install + `-LocalZip` dari asset.
-2. Smoke UI (lihat Active) + smoke tools/iterasi/M3 + ukur CPU idle.
-3. **Fase 2**: `evrax-store` (crate + layout `%LOCALAPPDATA%\evrax\projects\<slug>-<hash16>\`) → agent provider/history per project → TUI serde+persist+CLI (`-c/-s/-l/--no-save`) → wizard first-run → gate → tag `v0.1.1`.
-4. **Fase 3**: clean-install test di Sandbox (admin + reboot + firewall 20128) — tujuan utama user.
-5. **Fase 4**: batch skills (embed 42 via `build.rs`, `skills_list`/`skill_view`/`skill_manage`, `/skills`, `/<nama>`, `docs/skills.md`) → `v0.1.2`; backup temp 169 skill dihapus setelah ini.
-6. Opsional: T3 tailscale serve, token usage di status, `/model` picker.
+1. **Rilis `v0.1.1`**: commit Fase 2 → push `main` ke `origin` + `another` → tag `v0.1.1` → tunggu Actions (cek API `/actions/runs`, `/releases/latest`) → smoke install one-liner + `-LocalZip` dari asset.
+2. Smoke Fase 2 (lihat Active) + smoke UI/tools/iterasi/M3 + ukur CPU idle.
+3. **Fase 3**: clean-install test di Sandbox (admin + reboot + firewall 20128) — tujuan utama user.
+4. **Fase 4**: batch skills (embed 42 via `build.rs`, `skills_list`/`skill_view`/`skill_manage`, `/skills`, `/<nama>`, `docs/skills.md`) → `v0.1.2`; backup temp 169 skill dihapus setelah ini.
+5. Opsional: T3 tailscale serve, token usage di status, `/model` picker.
 
 ## Catatan konfigurasi (opencode global)
 - MCP `~/.config/opencode/opencode.json(c)`: **OFF** = `rea`, `context7`, `memory`, `fetch`, `puppeteer`, `sequential-thinking`; **ON** = `serena` + `codebase-memory-mcp` (CBM v0.12.1, terinstal via `install.ps1` default di `%LOCALAPPDATA%\Programs\codebase-memory-mcp`). Re-enable CBM: hapus/rename entry. CBM menulis plugin `cbm-augment.ts` + skill + 3 agent + blok di `AGENTS.md` global (+~750 token/turn, tapi arahkan ke graph tools biar hemat).

@@ -11,16 +11,17 @@ mod window;
 use std::io::Stdout;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use evrax_core::{AgentBackend, AgentEvent, MockBackend, TurnRequest};
+use evrax_store::ProjectStore;
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -28,25 +29,181 @@ use ratatui::layout::Position;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::app::{AgentMode, App, ApprovalDecision, TunnelEditResult, TunnelEffect};
+use crate::app::{AgentMode, App, ApprovalDecision, TunnelEditResult, TunnelEffect, WizardAction};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     if cli_info_flag() {
         return Ok(());
     }
+    let cli = Cli::parse();
+    let loaded = evrax_agent::config_from_args();
+    let store = if cli.no_save {
+        None
+    } else {
+        match ProjectStore::open(&loaded.config.root) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                eprintln!("evrax: session store unavailable ({e})");
+                None
+            }
+        }
+    };
+    if cli.list {
+        match store.as_ref() {
+            Some(store) => print_sessions(store)?,
+            None => println!("(session store disabled)"),
+        }
+        return Ok(());
+    }
+    let resume = if cli.continue_latest || cli.session.is_some() {
+        let store = store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("session store disabled (--no-save/--mock)"))?;
+        let id = match cli.session.as_deref() {
+            Some(spec) => resolve_session(store, spec)?,
+            None => store
+                .list()?
+                .first()
+                .map(|m| m.id.clone())
+                .ok_or_else(|| anyhow::anyhow!("belum ada sesi tersimpan"))?,
+        };
+        Some(id)
+    } else {
+        None
+    };
     setup_panic_hook();
     if let Some(idx) = theme::load_saved() {
         theme::set_index(idx);
     }
+    let need_wizard = cli.setup
+        || (!loaded.mock
+            && loaded
+                .config
+                .api_key
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            && std::env::var_os("EVRAX_API_KEY").is_none());
     let mut terminal = init_terminal().context("evrax needs an interactive terminal")?;
-    let result = run(&mut terminal).await;
+    let result = run(&mut terminal, loaded, store, resume, need_wizard).await;
     let restored = restore_terminal(&mut terminal);
     restored.context("failed to restore terminal state")?;
     result
 }
 
+#[derive(Default)]
+struct Cli {
+    list: bool,
+    continue_latest: bool,
+    session: Option<String>,
+    no_save: bool,
+    setup: bool,
+}
+
+impl Cli {
+    fn parse() -> Self {
+        let mut list = false;
+        let mut continue_latest = false;
+        let mut session = None;
+        let mut no_save = false;
+        let mut setup = false;
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--list" | "-l" | "sessions" => list = true,
+                "--continue" | "-c" => continue_latest = true,
+                "--session" | "-s" => session = args.next(),
+                "--no-save" => no_save = true,
+                "--setup" => setup = true,
+                _ => {}
+            }
+        }
+        Cli {
+            list,
+            continue_latest,
+            session,
+            no_save,
+            setup,
+        }
+    }
+}
+
+fn print_sessions(store: &ProjectStore) -> Result<()> {
+    println!("project: {}", store.root().display());
+    let metas = store.list()?;
+    if metas.is_empty() {
+        println!("(belum ada sesi)");
+        return Ok(());
+    }
+    for meta in metas {
+        println!(
+            "{:<28}  {:<16}  {}",
+            meta.id,
+            fmt_ms(meta.updated_at),
+            meta.title
+        );
+    }
+    Ok(())
+}
+
+fn resolve_session(store: &ProjectStore, spec: &str) -> Result<String> {
+    let metas = store.list()?;
+    if metas.iter().any(|m| m.id == spec) {
+        return Ok(spec.to_string());
+    }
+    let by_prefix: Vec<&evrax_store::SessionMeta> =
+        metas.iter().filter(|m| m.id.starts_with(spec)).collect();
+    if by_prefix.len() == 1 {
+        return Ok(by_prefix[0].id.clone());
+    }
+    if by_prefix.len() > 1 {
+        bail!(
+            "session prefix '{spec}' ambigu ({} kandidat)",
+            by_prefix.len()
+        );
+    }
+    let by_title: Vec<&evrax_store::SessionMeta> = metas
+        .iter()
+        .filter(|m| m.title.eq_ignore_ascii_case(spec))
+        .collect();
+    if by_title.len() == 1 {
+        return Ok(by_title[0].id.clone());
+    }
+    if by_title.len() > 1 {
+        bail!("judul '{spec}' ambigu ({} sesi)", by_title.len());
+    }
+    bail!("session '{spec}' tidak ditemukan; coba evrax --list")
+}
+
+fn fmt_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 fn cli_info_flag() -> bool {
+    const HELP: &str = "USAGE:\n    evrax [OPTIONS]\n\nOPTIONS:\n    -c, --continue         resume the most recent session\n    -s, --session <spec>   resume by id, unique prefix, or title\n    -l, --list             list saved sessions and exit\n        --setup            open the provider setup wizard\n        --no-save          do not persist sessions\n        --mock             run with the built-in mock backend\n        --model <name>     model id\n        --base-url <url>   [OI]-compatible base URL\n        --api-key <key>    API key (else agent.json / EVRAX_API_KEY)\n        --max-iterations <n>  tool rounds per turn (default 500)\n        --root <path>      workspace root\n    -V, --version          print version and exit\n    -h, --help             print this help and exit";
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -54,10 +211,7 @@ fn cli_info_flag() -> bool {
                 return true;
             }
             "--help" | "-h" => {
-                println!(
-                    "evrax {}\n\nUSAGE:\n    evrax [OPTIONS]\n\nOPTIONS:\n    --mock                 run with the built-in mock backend\n    --model <name>         model id\n    --base-url <url>       OpenAI-compatible base URL\n    --api-key <key>        API key (else agent.json / EVRAX_API_KEY)\n    --max-iterations <n>   tool rounds per turn (default 500)\n    --root <path>          workspace root\n    -V, --version          print version and exit\n    -h, --help             print this help and exit",
-                    env!("CARGO_PKG_VERSION")
-                );
+                println!("evrax {}\n\n{HELP}", env!("CARGO_PKG_VERSION"));
                 return true;
             }
             _ => {}
@@ -115,8 +269,13 @@ fn setup_panic_hook() {
     }));
 }
 
-async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    let loaded = evrax_agent::config_from_args();
+async fn run(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    loaded: evrax_agent::LoadedConfig,
+    store: Option<ProjectStore>,
+    resume: Option<String>,
+    need_wizard: bool,
+) -> Result<()> {
     let (backend, backend_note, backend_label): (Box<dyn AgentBackend>, String, String) =
         if loaded.mock {
             (
@@ -125,7 +284,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 "mock".to_string(),
             )
         } else {
-            match evrax_agent::ChatBackend::new(loaded.config.clone()) {
+            match evrax_agent::ChatBackend::new_with_project(loaded.config.clone(), store.clone()) {
                 Ok(real) => {
                     let label = real.model().to_string();
                     let note = format!("backend · {} · {}", label, real.base_url());
@@ -139,14 +298,27 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             }
         };
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+    let (wizard_tx, mut wizard_rx) = mpsc::channel::<Result<String, String>>(4);
     let mut turn_task: Option<JoinHandle<()>> = None;
     let mut app = App::new();
+    let subagent_id = arg_value("--subagent-id");
+    if subagent_id.is_none()
+        && let Some(store) = store.clone()
+    {
+        app.attach_project(store);
+        if let Some(id) = resume.as_deref() {
+            app.resume(id);
+        }
+    }
+    if need_wizard {
+        app.open_wizard(&loaded.config);
+    }
     app.catalog = evrax_agent::catalog::Catalog::load();
     app.set_backend_label(backend_label);
     if !backend_note.is_empty() {
         app.set_flash(backend_note);
     }
-    let mut subagent_link = arg_value("--subagent-id").and_then(|id| {
+    let mut subagent_link = subagent_id.and_then(|id| {
         let mut link = subagent_link::Link::load(&id)?;
         app.session_id = id.clone();
         let name = link.name().to_string();
@@ -170,6 +342,13 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut input_open = true;
 
     while !app.should_quit {
+        while let Ok(result) = wizard_rx.try_recv() {
+            match result {
+                Ok(text) => app.wizard_status(format!("OK \u{b7} {text}"), false),
+                Err(err) => app.wizard_status(format!("gagal \u{b7} {err}"), false),
+            }
+            needs_draw = true;
+        }
         if needs_draw {
             terminal.draw(|frame| ui::render(frame, &mut app))?;
             flush_kitty(terminal, &mut app);
@@ -224,6 +403,8 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                                 max_scroll,
                             );
                         }
+                    } else if app.wizard.is_some() {
+                        handle_wizard_key(&mut app, key, &wizard_tx);
                     } else {
                         handle_event(
                             &mut app,
@@ -336,6 +517,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     if let Some(link) = subagent_link.as_mut() {
         link.publish_final(&app, "stopped");
     }
+    app.save_current();
     if let Some(task) = turn_task.take() {
         task.abort();
     }
@@ -606,6 +788,51 @@ fn drain_remote_approvals(app: &mut App, decision_tx: &mut Option<mpsc::Sender<b
         && let Some(tx) = decision_tx
     {
         let _ = tx.try_send(allow);
+    }
+}
+
+fn handle_wizard_key(
+    app: &mut App,
+    key: KeyEvent,
+    wizard_tx: &mpsc::Sender<Result<String, String>>,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            if !app.wizard_escape() {
+                app.wizard_close();
+                app.set_flash("setup dilewati".to_string());
+            }
+        }
+        KeyCode::Up => app.wizard_move(-1),
+        KeyCode::Down => app.wizard_move(1),
+        KeyCode::Left if app.wizard_row() == 0 => app.wizard_preset(-1),
+        KeyCode::Right if app.wizard_row() == 0 => app.wizard_preset(1),
+        KeyCode::Enter => match app.wizard_enter() {
+            WizardAction::Test(cfg) => {
+                let tx = wizard_tx.clone();
+                tokio::spawn(async move {
+                    let result = evrax_agent::test_provider(&cfg).await;
+                    let _ = tx.send(result).await;
+                });
+            }
+            WizardAction::Save(cfg) => match evrax_agent::save_config(&cfg, false) {
+                Ok(path) => {
+                    app.wizard_close();
+                    app.set_flash(format!("config saved \u{b7} {}", path.display()));
+                }
+                Err(e) => app.wizard_status(format!("save gagal: {e}"), false),
+            },
+            WizardAction::None => {}
+        },
+        KeyCode::Backspace => app.wizard_backspace(),
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.wizard_type(c);
+        }
+        _ => {}
     }
 }
 
@@ -1004,4 +1231,53 @@ fn copy_to_clipboard(text: String) {
             .status();
         let _ = std::fs::remove_file(&path);
     });
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn store() -> (tempfile::TempDir, ProjectStore) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let store = ProjectStore::open_in(dir.path(), &dir.path().join("data")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn resolves_exact_prefix_and_title() {
+        let (_dir, store) = store();
+        let mut first = evrax_store::SessionMeta::new("session-100-1", "Rilis v0.1.1", "build");
+        first.updated_at = 2;
+        store.save_meta(&first).unwrap();
+        let mut second = evrax_store::SessionMeta::new("session-200-1", "Lain", "plan");
+        second.updated_at = 1;
+        store.save_meta(&second).unwrap();
+
+        assert_eq!(
+            resolve_session(&store, "session-100-1").unwrap(),
+            "session-100-1"
+        );
+        assert_eq!(
+            resolve_session(&store, "session-2").unwrap(),
+            "session-200-1"
+        );
+        assert_eq!(
+            resolve_session(&store, "rilis V0.1.1").unwrap(),
+            "session-100-1"
+        );
+        assert!(resolve_session(&store, "tidak-ada").is_err());
+    }
+
+    #[test]
+    fn ambiguous_prefix_is_rejected() {
+        let (_dir, store) = store();
+        store
+            .save_meta(&evrax_store::SessionMeta::new("session-1-1", "a", "build"))
+            .unwrap();
+        store
+            .save_meta(&evrax_store::SessionMeta::new("session-1-2", "b", "build"))
+            .unwrap();
+        assert!(resolve_session(&store, "session-1").is_err());
+    }
 }

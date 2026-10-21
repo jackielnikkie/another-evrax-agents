@@ -14,8 +14,13 @@ crossterm.workspace = true
 evrax-agent = { path = "../evrax-agent" }
 evrax-core = { path = "../evrax-core" }
 evrax-remote = { path = "../evrax-remote" }
+evrax-store = { path = "../evrax-store" }
 futures-util.workspace = true
 nucleo-matcher = "0.3"
 ratatui.workspace = true
+serde.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

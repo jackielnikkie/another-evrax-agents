@@ -11,7 +11,9 @@ use ratatui::widgets::{
 use evrax_core::DiffKind;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{APPROVAL_OPTIONS, AgentMode, App, ChatEntry, ToolStatus, TunnelEditKind};
+use crate::app::{
+    APPROVAL_OPTIONS, AgentMode, App, ChatEntry, ToolStatus, TunnelEditKind, WIZARD_PRESETS,
+};
 use crate::markdown;
 use crate::theme::current;
 
@@ -34,6 +36,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     ])
     .split(area);
 
+    if app.wizard.is_some() {
+        wizard_modal(frame, app);
+        return;
+    }
+
     header(frame, rows[0]);
     let messages_rect = body(frame, rows[1], app);
     footer(frame, rows[2], app);
@@ -45,6 +52,87 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     remote_modal(frame, app);
     tunnel_modal(frame, app);
     preview_modal(frame, app);
+}
+
+fn wizard_modal(frame: &mut Frame, app: &App) {
+    let Some(wizard) = app.wizard.as_ref() else {
+        return;
+    };
+    let Some(inner) = modal(frame, "setup", 68, 16) else {
+        return;
+    };
+    let muted = Style::default().fg(current().muted);
+    let row_style = |selected: bool| {
+        if selected {
+            Style::default()
+                .fg(current().interactive)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(current().text)
+        }
+    };
+    let field = |label: &str, value: String, row: usize| {
+        let selected = wizard.row == row;
+        let editing = selected && wizard.editing;
+        let shown = if editing {
+            format!("{value}\u{2588}")
+        } else if value.is_empty() {
+            "(kosong)".to_string()
+        } else {
+            value
+        };
+        Line::from(vec![
+            Span::styled(format!(" {label:<10} "), muted),
+            Span::styled(shown, row_style(selected)),
+        ])
+    };
+    let key_display = if wizard.row == 3 && wizard.editing {
+        wizard.api_key.clone()
+    } else {
+        "*".repeat(wizard.api_key.chars().count().min(28))
+    };
+    let mut lines = vec![
+        Line::from(" evrax butuh konfigurasi provider"),
+        Line::from(""),
+        field(
+            "provider",
+            format!("{}  (\u{25c0}/\u{25b6})", WIZARD_PRESETS[wizard.provider].0),
+            0,
+        ),
+        field("base url", wizard.base_url.clone(), 1),
+        field("model", wizard.model.clone(), 2),
+        field("api key", key_display, 3),
+        Line::from(Span::styled(
+            if wizard.row == 4 {
+                " [ test connection ]"
+            } else {
+                " test connection"
+            },
+            row_style(wizard.row == 4),
+        )),
+        Line::from(Span::styled(
+            if wizard.row == 5 {
+                " [ simpan & tutup ]"
+            } else {
+                " simpan & tutup"
+            },
+            row_style(wizard.row == 5),
+        )),
+        Line::from(""),
+    ];
+    if let Some(status) = &wizard.status {
+        lines.push(Line::from(Span::styled(
+            format!(" {status}"),
+            Style::default().fg(current().muted),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        " enter: edit/pilih \u{b7} esc: tutup",
+        muted,
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn sidebar_visible(app: &App, width: u16) -> bool {
@@ -2620,5 +2708,20 @@ mod tests {
         let shortened = shorten_path(long, 20);
         assert_eq!(shortened.chars().count(), 20);
         assert!(shortened.starts_with('…'));
+    }
+    #[test]
+    fn wizard_modal_renders_setup_fields() {
+        let mut app = App::new();
+        app.open_wizard(&evrax_agent::AgentConfig::default());
+        let text = render_text_with(&mut app, 100, 30);
+        for needle in [
+            "provider",
+            "base url",
+            "api key",
+            "test connection",
+            "simpan",
+        ] {
+            assert!(text.contains(needle), "missing {needle}:\n{text}");
+        }
     }
 }

@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 evrax-core = { path = "../evrax-core" }
 evrax-graph = { path = "../../evrax-graph/evrax-graph" }
+evrax-store = { path = "../evrax-store" }
 futures-util.workspace = true
 glob.workspace = true
 regex.workspace = true

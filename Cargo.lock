@@ -447,6 +447,7 @@ dependencies = [
  "anyhow",
  "evrax-core",
  "evrax-graph",
+ "evrax-store",
  "futures-util",
  "glob",
  "regex",
@@ -464,6 +465,7 @@ name = "evrax-core"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "serde",
  "tokio",
 ]
 
@@ -502,6 +504,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "evrax-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "evrax-tui"
 version = "0.1.0"
 dependencies = [
@@ -510,9 +523,12 @@ dependencies = [
  "evrax-agent",
  "evrax-core",
  "evrax-remote",
+ "evrax-store",
  "futures-util",
  "nucleo-matcher",
  "ratatui",
+ "serde",
+ "tempfile",
  "tokio",
  "unicode-width",
 ]

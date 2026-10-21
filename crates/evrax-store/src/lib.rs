@@ -53,6 +53,7 @@ struct ProjectFile {
     name: String,
 }
 
+#[derive(Clone)]
 pub struct ProjectStore {
     root: PathBuf,
     dir: PathBuf,
@@ -125,7 +126,7 @@ impl ProjectStore {
                 out.push(meta);
             }
         }
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by_key(|meta| std::cmp::Reverse(meta.updated_at));
         Ok(out)
     }
 
@@ -192,12 +193,20 @@ impl ProjectStore {
 /// Walks up from `cwd` to the nearest `.git` entry, else returns `cwd`.
 pub fn project_root(cwd: &Path) -> PathBuf {
     let start = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    for dir in start.ancestors() {
-        if dir.join(".git").exists() {
-            return dir.to_path_buf();
-        }
+    let found = start
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(Path::to_path_buf)
+        .unwrap_or(start);
+    plain_path(found)
+}
+
+fn plain_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix("\\\\?\\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => path,
     }
-    start
 }
 
 fn default_projects_dir() -> Result<PathBuf> {
@@ -299,7 +308,10 @@ mod tests {
     #[test]
     fn project_root_walks_up_to_git() {
         let (dir, nested) = temp_project();
-        assert_eq!(project_root(&nested), fs::canonicalize(dir.path()).unwrap());
+        assert_eq!(
+            project_root(&nested),
+            plain_path(fs::canonicalize(dir.path()).unwrap())
+        );
     }
 
     #[test]
@@ -378,7 +390,10 @@ mod tests {
         store
             .write_json("session-1-1", "history.json", &vec!["b"])
             .unwrap();
-        let back: Vec<String> = store.read_json("session-1-1", "history.json").unwrap().unwrap();
+        let back: Vec<String> = store
+            .read_json("session-1-1", "history.json")
+            .unwrap()
+            .unwrap();
         assert_eq!(back, vec!["b"]);
     }
 }

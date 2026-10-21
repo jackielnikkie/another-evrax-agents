@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 futures-util.workspace = true
+serde.workspace = true
 tokio.workspace = true

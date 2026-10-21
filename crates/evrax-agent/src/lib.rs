@@ -152,16 +152,106 @@ pub fn config_from_args() -> LoadedConfig {
     loaded
 }
 
-fn config_file_path() -> Option<PathBuf> {
+pub fn config_file_path() -> Option<PathBuf> {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .map(|dir| dir.join("evrax").join("agent.json"))
 }
 
+/// Persists provider settings, preserving unrelated fields and backing up the
+/// previous file as `agent.json.bak-<ms>`.
+pub fn save_config(cfg: &AgentConfig, mock: bool) -> anyhow::Result<PathBuf> {
+    let path = config_file_path().ok_or_else(|| anyhow::anyhow!("no config directory"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut value = if path.is_file() {
+        let text = std::fs::read_to_string(&path)?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = std::fs::copy(&path, path.with_extension(format!("json.bak-{stamp}")));
+        serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::Object(Default::default()))
+    } else {
+        Value::Object(Default::default())
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("agent.json is not a JSON object"))?;
+    object.insert("base_url".into(), Value::String(cfg.base_url.clone()));
+    object.insert("model".into(), Value::String(cfg.model.clone()));
+    match cfg.api_key.as_deref() {
+        Some(key) if !key.is_empty() => {
+            object.insert("api_key".into(), Value::String(key.to_string()));
+        }
+        _ => {
+            object.remove("api_key");
+        }
+    }
+    object.insert(
+        "max_iterations".into(),
+        Value::Number(cfg.max_iterations.into()),
+    );
+    object.insert("mock".into(), Value::Bool(mock));
+    std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
+    Ok(path)
+}
+
+/// One-shot provider check used by the setup wizard: a tiny chat request (never
+/// `/models`, which some gateways answer even when the key is rejected).
+pub async fn test_provider(cfg: &AgentConfig) -> Result<String, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(30));
+    let lower = cfg.base_url.to_lowercase();
+    if lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("[::1]") {
+        builder = builder.no_proxy();
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let body = json!({
+        "model": cfg.model,
+        "messages": [{"role": "user", "content": "Reply with the single word OK."}],
+        "max_tokens": 16,
+        "temperature": 0,
+        "stream": false,
+    });
+    let mut request = client.post(url).json(&body);
+    if let Some(key) = cfg.api_key.as_deref().filter(|k| !k.is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            trunc(&text, 240).replace('\n', " ")
+        ));
+    }
+    let value: Value = serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
+    let reply = value["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if reply.is_empty() {
+        Ok(format!("HTTP {} OK", status.as_u16()))
+    } else {
+        Ok(reply)
+    }
+}
+
 struct Inner {
     cfg: AgentConfig,
     client: reqwest::Client,
+    store: Option<evrax_store::ProjectStore>,
     conversations: Mutex<HashMap<String, Vec<Vec<Value>>>>,
     /// Recency clock per session, used to evict cold conversations.
     session_use: Mutex<HashMap<String, u64>>,
@@ -180,6 +270,7 @@ impl Inner {
                 root: std::env::temp_dir(),
             },
             client: reqwest::Client::new(),
+            store: None,
             conversations: Mutex::new(HashMap::new()),
             session_use: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(0),
@@ -196,6 +287,7 @@ impl Inner {
 
     fn replay(&self, session: &str) -> Vec<Value> {
         self.bump(session);
+        self.load_history(session);
         let conversations = self.conversations.lock().unwrap();
         conversations
             .get(session)
@@ -206,29 +298,59 @@ impl Inner {
             .collect()
     }
 
+    fn load_history(&self, session: &str) {
+        if self.store.is_none() {
+            return;
+        }
+        if self.conversations.lock().unwrap().contains_key(session) {
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        if let Ok(Some(history)) = store.read_json::<Vec<Vec<Value>>>(session, "history.json") {
+            self.conversations
+                .lock()
+                .unwrap()
+                .insert(session.to_string(), history);
+        }
+    }
+
     fn commit(&self, session: &str, turn: Vec<Value>) {
         self.bump(session);
-        let mut conversations = self.conversations.lock().unwrap();
-        let turns = conversations.entry(session.to_string()).or_default();
-        turns.push(turn);
-        let size = |messages: &[Value]| -> usize { messages.iter().map(message_chars).sum() };
-        let mut total: usize = turns.iter().map(|t| size(t)).sum();
-        while total > MAX_HISTORY_CHARS && turns.len() > 1 {
-            total = total.saturating_sub(size(&turns[0]));
-            turns.remove(0);
-        }
-        if conversations.len() > MAX_HISTORY_SESSIONS {
-            let mut use_map = self.session_use.lock().unwrap();
-            let current = session.to_string();
-            let victim = conversations
-                .keys()
-                .filter(|key| **key != current)
-                .min_by_key(|key| use_map.get(*key).copied().unwrap_or(0))
-                .cloned();
-            if let Some(victim) = victim {
-                conversations.remove(&victim);
-                use_map.remove(&victim);
+        {
+            let mut conversations = self.conversations.lock().unwrap();
+            let turns = conversations.entry(session.to_string()).or_default();
+            turns.push(turn);
+            let size = |messages: &[Value]| -> usize { messages.iter().map(message_chars).sum() };
+            let mut total: usize = turns.iter().map(|t| size(t)).sum();
+            while total > MAX_HISTORY_CHARS && turns.len() > 1 {
+                total = total.saturating_sub(size(&turns[0]));
+                turns.remove(0);
             }
+            if conversations.len() > MAX_HISTORY_SESSIONS {
+                let mut use_map = self.session_use.lock().unwrap();
+                let current = session.to_string();
+                let victim = conversations
+                    .keys()
+                    .filter(|key| **key != current)
+                    .min_by_key(|key| use_map.get(*key).copied().unwrap_or(0))
+                    .cloned();
+                if let Some(victim) = victim {
+                    conversations.remove(&victim);
+                    use_map.remove(&victim);
+                }
+            }
+        }
+        if let Some(store) = self.store.as_ref() {
+            let snapshot = self
+                .conversations
+                .lock()
+                .unwrap()
+                .get(session)
+                .cloned()
+                .unwrap_or_default();
+            let _ = store.write_json(session, "history.json", &snapshot);
         }
     }
 }
@@ -263,6 +385,13 @@ pub struct ChatBackend {
 
 impl ChatBackend {
     pub fn new(cfg: AgentConfig) -> anyhow::Result<Self> {
+        Self::new_with_project(cfg, None)
+    }
+
+    pub fn new_with_project(
+        cfg: AgentConfig,
+        store: Option<evrax_store::ProjectStore>,
+    ) -> anyhow::Result<Self> {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(180));
@@ -274,6 +403,7 @@ impl ChatBackend {
             inner: Arc::new(Inner {
                 cfg,
                 client: builder.build()?,
+                store,
                 conversations: Mutex::new(HashMap::new()),
                 session_use: Mutex::new(HashMap::new()),
                 clock: AtomicU64::new(0),
