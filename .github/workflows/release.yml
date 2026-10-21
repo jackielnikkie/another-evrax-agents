@@ -1,0 +1,38 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-msvc
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - name: install toolchain
+        run: rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p evrax-tui
+      - name: package
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $zip = "evrax-$tag-x86_64-pc-windows-msvc.zip"
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Compress-Archive -Path 'target/release/evrax.exe' -DestinationPath "dist/$zip" -Force
+          $hash = (Get-FileHash -LiteralPath "dist/$zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path 'dist/SHA256SUMS' -Value "$hash  $zip"
+          Get-Content -LiteralPath 'dist/SHA256SUMS'
+      - name: publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release create $tag "dist/evrax-$tag-x86_64-pc-windows-msvc.zip" 'dist/SHA256SUMS' --title $tag --notes "evrax $tag"
