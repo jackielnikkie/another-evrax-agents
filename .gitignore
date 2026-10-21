@@ -1,4 +1,9 @@
 /target
 /agent-reference
+/dist/
 .codebase-memory/
+.serena/
 *.log
+.evrax/
+evrax-graph/evrax-graph/target/
+skill-evrax/**/bin/

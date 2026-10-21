@@ -1,20 +1,61 @@
-# Peta kode & nomor baris
+# Peta kode evrax
 
-Dipindah dari AGENTS.md agar file itu ramping. Update saat refactor besar.
+Di-refresh 2026-10-21. **Jangan pakai nomor baris** — kode sering geser; cari simbol pakai tool `evrax-graph` (`graph search`/`outline`/`callers`) atau `rg`. Halaman ini cuma peta modul + alur.
 
-## Kode konteks (path & nomor baris)
-- `D:\another-evrax-agent\crates\evrax-tui\src\theme.rs` (~440 baris setelah edit): struct `Theme { key, label + 36 field }` (`base, raised, text, muted, border, accent, interactive, error, success, selection, action_dim, diff_add, diff_rem, diff_add_bg, diff_rem_bg, diff_add_gutter, diff_rem_gutter, diff_ctx_gutter, diff_ctx_text, md_heading, md_strong, md_emphasis, md_quote, md_code, md_list, md_link, md_link_label, md_rule, syn_comment, syn_string, syn_number, syn_keyword, syn_function, syn_type, syn_variable, syn_operator`).
-  - `EVRAX` 50-97 (JANGAN diubah). `OPENCODE` ~91-130 (accent `#fab283`, selection/action_dim `#3d1d06`, rainbow md/syn).
-  - **SUDAH DITAMBAH**: `CATPPUCCIN`, `DRACULA`, `GRUVBOX`, `NORD`, `TOKYONIGHT` consts setelah `OPENCODE`; `THEMES` sekarang 7 entry: `&[EVRAX, OPENCODE, CATPPUCCIN, DRACULA, GRUVBOX, NORD, TOKYONIGHT]`.
-  - **SUDAH**: `#[cfg(test)] mod tests` di EOF ada — `theme_keys_are_unique` (assert 7) + `set_index_roundtrips_by_key`.
-  - Accessors: `current()`, `index()`, `set_index(idx)` clamp, `count()`, `label()`, `by_key(key)→Option<usize>`; `config_file()`=`APPDATA\evrax\theme`; `load_saved()`; `save_current()` (non-test) + `#[cfg(test)] pub fn save_current() {}` stub. `label_at` & `visual_line_count` SUDAH dihapus (dead code).
-- `D:\another-evrax-agent\crates\evrax-tui\src\ui.rs` (~1730 baris): `modal()` 806-823; `modal_row(inner, label, selected) -> Line` 826-840; `theme_row(inner, idx, selected)` swatch 2 dot (accent+interactive tema target) — dipakai `theme_modal`; `theme_modal` 1049+ (`modal(frame,"themes",44,count+3)`, list `theme_row`, hint `" enter save · esc revert"`); `input()` render wrap-aware pakai `visual_rows` + scroll vertikal; tests mod + `theme_modal_lists_themes` (assert "dracula"), `input_scrolls_to_keep_cursor_visible` (300 char @ 20 wide).
-- `D:\another-evrax-agent\crates\evrax-tui\src\app.rs` (~1620 baris): `SlashCommand { name, aliases, description, command }`; baris ~109-114 `theme`/`aliases: &[]` (SUDAH dihapus alias); `LineEditor` punya `visual_rows(width)`, `cursor_visual(width)`, `insert_str` (splice O(n)); `composer_height(width)` clamp 1..7 → max 9 baris.
-- `D:\another-evrax-agent\docs\opencode-ui-reference.md`: baris 129 SUDAH diamend (alias `/themes` dihapus, sebut 7 preset + swatch 2 dot).
-- `D:\another-evrax-agent\agent-reference\opencode\packages\tui\src\theme\assets\` — `catppuccin.json`, `dracula.json`, `gruvbox.json`, `nord.json`, `tokyonight.json` (semua sudah dibaca penuh sesi ini); `v2\opencode.json` sumber rainbow OPENCODE.
-- `D:\another-evrax-agent\crates\evrax-tui\src\main.rs` — routing key + startup `theme::load_saved()`.
-- `D:\another-evrax-agent\crates\evrax-tui\src\markdown.rs` (`parse`,`inline`,`highlight`,`wrap_segs`,`style_of`,`SegStyle`), `window.rs`, `crates\evrax-core\src\lib.rs` — konteks U5/M1.
-- Keybinds: Ctrl+C quit; Ctrl+Y copy; Ctrl+P palette; Ctrl+N new; Ctrl+O session dialog; Tab/Shift+Tab mode; Enter submit; shift/ctrl/alt+enter + ctrl+j newline; ↑/↓ composer; PgUp/PgDn + wheel; drag seleksi auto-copy; Esc×2 cancel (`ESC_CANCEL_TICKS=20`).
-- Render order: header→body→footer→selection→palette→session_modal→theme_modal; approval panel "Allow once / Always allow / Reject".
-- Test konvensi: `renders_mock_conversation` 100x60; `assistant_markdown_gets_styles` 80x12; hindari "Build"/"Plan" di teks demo.
-- Recon M1+ (hermes-agent): loop `agent/conversation_loop.py:1656-1703`; accumulator `chat_completion_helpers_tool_calls.py:8`; `delta.reasoning_content`; `tools/registry.py:462`; approval `tools/approval.py::check_all_command_guards:1151`; prompt `agent/system_prompt.py:736` + AGENTS.md `prompt_builder.py:1706`; compression 0.50; SQLite `hermes_state.py:460`; provider `transports/chat_completions.py:516` (SSE fallback :170); default 9router `http://127.0.0.1:20128/v1`, model `bebas`, flag `--mock` dipertahankan.
+## Crate (workspace `Cargo.toml`)
+
+| Crate | Isi |
+|---|---|
+| `crates/evrax-core` | Kontrak: `TurnRequest { prompt, session, plan_mode }`, `AgentEvent`, trait `AgentBackend`, `MockBackend`, `DiffLine`/`DiffKind` |
+| `crates/evrax-agent` | Backend LLM asli + agent loop + tools + catalog |
+| `crates/evrax-remote` | Server web remote (`tiny_http`) + SSE + tunnel |
+| `crates/evrax-tui` | Aplikasi TUI (ratatui) + banner + markdown + tema |
+| `evrax-graph/evrax-graph` | Indexer graph kode (SQLite) + CLI, dipakai tool `evrax-graph` |
+
+### evrax-agent
+- `lib.rs` — `ChatBackend`: config (`%APPDATA%\evrax\agent.json` → env `EVRAX_*` → CLI), `stream_round`, loop agent (default 500 iterasi tool-round, `commit_partial`, `finish_budget`/summary toolless), `suggest_title`, `provider_error`, `authorize_and_run`.
+- `sse.rs` — `SseDecoder` + `ToolCallAccumulator` (menangani frame dengan `"id":""`).
+- `retry.rs` — retry 429/5xx/408/transport/`x-should-retry`, tanpa retry 4xx lain.
+- `guardrails.rs` — deteksi streak/siklus tool-call identik.
+- `diff.rs` — diff `similar`.
+- `tools.rs` — `specs()` 12 tool (`read list grep write edit shell web_fetch todo git ast_grep evrax-graph subagent`), `Context::classify()`, `outside_target()`, `approval_key()`, `is_mutating/requires_approval/approval_key_for`, plan mode read-only.
+- `tools/{web,todo,git,ast_grep,graph}.rs` — implementasi tool non-core.
+- `catalog.rs` — `Catalog::load()`: tools + skills (scan `skill-evrax/` + `%APPDATA%\evrax\skills`, override `EVRAX_SKILLS_DIR`) + MCP (`%APPDATA%\evrax\mcp.json`, override `EVRAX_MCP_CONFIG`).
+- `subagent.rs` — state `%APPDATA%\evrax\subagents\<id>\` (inbox `prompt.txt`, `stop`).
+
+### evrax-remote
+- `lib.rs` — `RemoteConfig{password,bind,port,public_url}`, `Permit`, `Session`, `RemoteEvent` (termasuk `Approval`/`ApprovalResolved`), token bearer + expiry 24 h, rate-limit `/login`, `spawn_stream` SSE flush per frame + heartbeat, endpoint `/api/session/{id}/{prompt,mode,approval}`, `rename_session`, `take_pending_prompt/approval`, web UI Vue 3 CDN single HTML (`include_str!`).
+- `tunnel.rs` — `TunnelManager` quick tunnel + `start_domain()` (cloudflared login/create/route dns), `generation` counter anti-orphan.
+
+### evrax-tui
+- `main.rs` — event loop, pilih backend real/mock, polling remote + subagent, drain prompt/approval web, spawn job judul LLM, arg parsing.
+- `app.rs` — `App`: transcript per sesi, composer/`LineEditor`, slash command + palette, dialog (session/theme/remote/tunnel/approval/preview), `TranscriptCache`, retensi sesi, `titles`/`manual_titles`, `backend_label`, iteration footer.
+- `ui.rs` — render: header/transcript/composer/footer, modal (`dialog_window` + PgUp/PgDn), diff wrap, click target sebagian (tunnel URL copy).
+- `banner.rs` + `banner_wide.txt`/`banner_compact.txt` — sprite half-block truecolor, glow, bob, blink, wordmark `E V R A X`, signature `FAUST55`.
+- `welcome.rs` — empty state 3 kolom: skills | banner | MCP + tools.
+- `theme.rs` — 7 tema (`evrax`, `opencode`, catppuccin, dracula, gruvbox, nord, tokyonight), simpan pilihan ke `%APPDATA%\evrax\theme`.
+- `markdown.rs`, `image.rs` (paste + preview kitty), `window.rs` (maximized/resize), `subagent_link.rs` (poll inbox 250 ms).
+
+### evrax-graph
+`schema.rs`/`extract.rs`/`lang.rs`/`resolve.rs`/`index.rs`/`store.rs`/`query.rs` + `main.rs` (CLI). DB `<root>/.evrax/graph.db`; indexer skip `agent-reference`, `skill-evrax`, `.serena`, `.codebase-memory`. Catatan desain (hasil bedah tool graph lain) ada di `docs/evrax-graph-notes.md`.
+
+## Alur utama
+1. Prompt → `App::start_turn` → `AgentBackend::run(TurnRequest)` → `ChatBackend` loop: request SSE → delta `AgentEvent` (`TextDelta`/`ThinkingDelta`/`Iteration`/`ToolCall`/`Notice`/`Retrying`) → eksekusi tool → commit history per turn → `TurnFinished`.
+2. Tool mutating / path luar workspace → `AgentEvent::ApprovalRequested{key}` → dialog TUI (Once/Always/Reject) atau tombol di web → `authorize_and_run`.
+3. Plan mode → tools di-filter read-only; mutating → `blocked: plan mode is read-only`.
+4. Remote ON → `App` register ke `RemoteServer`; prompt/mode/approval dua arah via antrean + SSE broadcast; TUI authoritative, web ikut poll.
+5. Judul sesi: heuristik instan saat prompt pertama, LLM (`suggest_title`) menyusul, `/rename` manual sticky, id sesi tidak pernah berubah.
+
+## Keybind & interaksi
+Ctrl+C quit · Ctrl+P palette · Ctrl+O sesi · Ctrl+N sesi baru · Ctrl+Y copy transcript · Tab/BackTab mode Plan/Build · Enter kirim · Ctrl+J newline · PgUp/PgDn scroll & dialog page · Up/Down history/move · Esc cancel/close · drag seleksi auto-copy · klik URL tunnel = copy.
+
+## Test
+- `cargo test --workspace` → 240 (72 agent, 5 core, 5 graph unit, 1 graph integration, 29 remote, 128 tui).
+- Live smoke (butuh 9router + key): `cargo test -p evrax-agent -- --ignored` → 2 test.
+- Render test TUI pakai `ratatui` `TestBackend` (mis. 100x60); hindari kata "Build"/"Plan" di teks demo.
+- Gate: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
+
+## Konvensi
+- Toolchain GNU pinned; prefix PATH tiap shell (lihat `AGENTS.md`).
+- Jangan `Set-Content`/`Out-File` PS 5.1 untuk file source (BOM).
+- `build`/`run` terkunci kalau instance evrax hidup.
