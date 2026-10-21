@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/evrax-core", "crates/evrax-agent", "crates/evrax-remote", "crates/evrax-tui", "evrax-graph/evrax-graph"]
+members = ["crates/evrax-core", "crates/evrax-agent", "crates/evrax-remote", "crates/evrax-tui", "crates/evrax-store", "evrax-graph/evrax-graph"]
 resolver = "3"
 
 [workspace.package]
