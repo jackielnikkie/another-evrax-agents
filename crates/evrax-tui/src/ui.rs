@@ -2003,8 +2003,8 @@ mod tests {
         assert!(text.contains("themes"), "title missing:\n{text}");
         assert!(text.contains("evrax"), "evrax option missing:\n{text}");
         assert!(
-            text.contains("opencode"),
-            "opencode option missing:\n{text}"
+            text.contains("spectrum"),
+            "spectrum option missing:\n{text}"
         );
         assert!(text.contains("dracula"), "dracula option missing:\n{text}");
         app.theme_close();
@@ -2017,15 +2017,15 @@ mod tests {
         app.messages
             .push(ChatEntry::Assistant("hello **bold** world".into()));
         let original = crate::theme::index();
-        crate::theme::set_index(crate::theme::by_key("opencode").unwrap());
+        crate::theme::set_index(crate::theme::by_key("spectrum").unwrap());
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let repainted = (0..buffer.area.height).any(|y| {
-            (0..buffer.area.width).any(|x| buffer[(x, y)].fg == crate::theme::OPENCODE.md_strong)
+            (0..buffer.area.width).any(|x| buffer[(x, y)].fg == crate::theme::SPECTRUM.md_strong)
         });
         crate::theme::set_index(original);
-        assert!(repainted, "opencode strong token should repaint markdown");
+        assert!(repainted, "spectrum strong token should repaint markdown");
     }
 
     #[test]
@@ -2037,7 +2037,7 @@ mod tests {
             key: "edit".into(),
         });
         let original = crate::theme::index();
-        crate::theme::set_index(crate::theme::by_key("opencode").unwrap());
+        crate::theme::set_index(crate::theme::by_key("spectrum").unwrap());
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -2054,7 +2054,7 @@ mod tests {
         crate::theme::set_index(original);
         assert_eq!(
             button_bg,
-            Some(crate::theme::OPENCODE.accent),
+            Some(crate::theme::SPECTRUM.accent),
             "selected approval button should follow the active theme globally"
         );
     }
@@ -2472,7 +2472,7 @@ mod tests {
         );
         assert!(
             buffer[(kx, ky)].modifier.contains(Modifier::ITALIC),
-            "rust keywords are italic in opencode"
+            "rust keywords are italic in spectrum"
         );
         let (nx, ny) = find("1;");
         assert_eq!(buffer[(nx, ny)].fg, current().syn_number);
@@ -2528,7 +2528,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_lines_get_opencode_backgrounds() {
+    fn diff_lines_get_spectrum_backgrounds() {
         let mut app = App::new();
         app.messages.clear();
         app.messages.push(ChatEntry::Diff {

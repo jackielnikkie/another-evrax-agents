@@ -2,8 +2,7 @@ use std::path::Path;
 
 /// Reads an image from the OS clipboard and stages it as a PNG in the temp dir.
 /// Windows terminals (conhost / Windows Terminal) paste a *file path* for
-/// screenshots, so the real pixels must be pulled from the clipboard the way
-/// opencode does (`clipboard.read({ preferredTypes: ["image/png"] })`).
+/// screenshots, so the real pixels are pulled straight from the OS clipboard.
 /// Returns the staged path on success.
 #[cfg(windows)]
 pub fn clipboard_image_png() -> Option<String> {

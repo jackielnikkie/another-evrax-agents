@@ -26,7 +26,7 @@ pub struct App {
     /// Scroll bound measured while rendering the last frame. `ui::messages` fills it;
     /// the event loop reads it instead of rebuilding the whole transcript again.
     pub frame_max_scroll: u16,
-    /// Which backend is really wired up ("bebas", "mock", ...) â€” shown in the
+    /// Which backend is really wired up ("bebas", "mock", ...) — shown in the
     /// status line and the sidebar.
     pub backend_label: String,
     pub catalog: Catalog,
@@ -442,7 +442,7 @@ pub fn title_from_prompt(prompt: &str) -> Option<String> {
 }
 
 /// Copies a staged clipboard image to a friendlier `screenshot-HHMMSS.png`
-/// name so the composer chip reads like opencode's.
+/// name so the composer chip stays readable.
 fn stage_named_copy(staged: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -841,7 +841,7 @@ impl App {
         }
     }
 
-    /// `/rename <title>` â€” a manual title survives later model suggestions.
+    /// `/rename <title>` — a manual title survives later model suggestions.
     pub fn rename_session_title(&mut self, arg: &str) {
         let title: String = arg.split_whitespace().collect::<Vec<_>>().join(" ");
         let title: String = title.chars().take(60).collect();
@@ -1479,8 +1479,8 @@ impl App {
         vec![
             "stop tunnel".to_string(),
             "quick tunnel (trycloudflare.com)".to_string(),
-            "custom domainâ€¦".to_string(),
-            "manual urlâ€¦".to_string(),
+            "custom domain…".to_string(),
+            "manual url…".to_string(),
             "copy url".to_string(),
         ]
     }
@@ -1527,8 +1527,8 @@ impl App {
                     "off".to_string()
                 }
             }
-            TunnelStatus::Downloading => "downloading cloudflaredâ€¦".to_string(),
-            TunnelStatus::Starting => format!("{short} · startingâ€¦"),
+            TunnelStatus::Downloading => "downloading cloudflared…".to_string(),
+            TunnelStatus::Starting => format!("{short} · starting…"),
             TunnelStatus::Login { url } => format!("login cloudflare · {url}"),
             TunnelStatus::Running { url } => format!("{short} · {url}"),
             TunnelStatus::Error { message } => format!("error · {message}"),
@@ -1780,11 +1780,11 @@ impl App {
                     return;
                 }
                 state.tunnel.start_domain(port, hostname.clone());
-                self.set_flash(format!("custom domain mulaiâ€¦ ({hostname})"));
+                self.set_flash(format!("custom domain mulai… ({hostname})"));
             }
             _ => {
                 state.tunnel.start_quick(port);
-                self.set_flash("quick tunnel mulaiâ€¦".to_string());
+                self.set_flash("quick tunnel mulai…".to_string());
             }
         }
     }
@@ -2066,7 +2066,7 @@ impl App {
         }
     }
 
-    /// Handles a paste-like burst the opencode way: pull real image pixels from
+    /// Handles a paste-like burst: pull real image pixels from
     /// the clipboard first (screenshot), then try a pasted file path, and only
     /// fall back to literal text. Returns true when handled as an attachment.
     pub fn ingest_paste(&mut self, text: &str) -> bool {
@@ -2164,7 +2164,7 @@ impl App {
                     name: name.clone(),
                     summary,
                     status: ToolStatus::Running,
-                    detail: "runningâ€¦".to_string(),
+                    detail: "running…".to_string(),
                 }));
                 if let Some(turn) = &remote_turn {
                     self.emit_remote(evrax_remote::RemoteEvent::Tool {

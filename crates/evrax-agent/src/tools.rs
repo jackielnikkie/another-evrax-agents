@@ -557,7 +557,7 @@ fn list(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
         out.push('\n');
         count += 1;
         if count >= 400 {
-            out.push_str("â€¦ truncated\n");
+            out.push_str("… truncated\n");
             break;
         }
     }
@@ -630,7 +630,7 @@ fn grep(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
         detail: if hits == 0 {
             "no matches".into()
         } else {
-            let marker = if truncated { "\nâ€¦ truncated" } else { "" };
+            let marker = if truncated { "\n… truncated" } else { "" };
             format!("{hits} matches in {files} files\n{out}{marker}")
         },
         diff: None,
@@ -870,7 +870,7 @@ pub fn truncate(text: &mut String) {
     let omitted = tail_start - head_end;
     let head = text[..head_end].to_string();
     let tail = text[tail_start..].to_string();
-    *text = format!("{head}\nâ€¦ {omitted} bytes omitted â€¦\n{tail}");
+    *text = format!("{head}\n… {omitted} bytes omitted …\n{tail}");
 }
 
 fn floor_char_boundary(text: &str, mut idx: usize) -> usize {

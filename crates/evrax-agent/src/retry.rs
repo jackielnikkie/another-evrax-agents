@@ -1,4 +1,4 @@
-//! Provider retry policy mirrored from opencode: only transient failures are
+//! Provider retry policy: only transient failures are
 //! retried, with exponential backoff, jitter and provider-requested delays.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -130,7 +130,7 @@ pub fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
 }
 
 /// Exponential 2s, 4s, 8s, then 10s per gap; a provider-requested delay wins
-/// (capped at 15 minutes), matching opencode's schedule.
+/// (capped at 15 minutes).
 pub fn delay_ms(attempt: u32, retry_after_ms: Option<u64>) -> u64 {
     let shift = attempt.saturating_sub(1).min(10);
     let exponential = BASE_DELAY_MS

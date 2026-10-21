@@ -1,4 +1,4 @@
-//! Tool-call loop guardrails modeled on hermes' `tool_guardrails`:
+//! Tool-call loop guardrails:
 //! identical-result streaks and short cycles raise a notice, identical failures
 //! block the next call, and byte-identical large results collapse to a stub.
 

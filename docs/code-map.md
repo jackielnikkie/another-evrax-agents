@@ -33,7 +33,7 @@ Di-refresh 2026-10-21. **Jangan pakai nomor baris** — kode sering geser; cari 
 - `ui.rs` — render: header/transcript/composer/footer, modal (`dialog_window` + PgUp/PgDn), diff wrap, click target sebagian (tunnel URL copy).
 - `banner.rs` + `banner_wide.txt`/`banner_compact.txt` — sprite half-block truecolor, glow, bob, blink, wordmark `E V R A X`, signature `FAUST55`.
 - `welcome.rs` — empty state 3 kolom: skills | banner | MCP + tools.
-- `theme.rs` — 7 tema (`evrax`, `opencode`, catppuccin, dracula, gruvbox, nord, tokyonight), simpan pilihan ke `%APPDATA%\evrax\theme`.
+- `theme.rs` — 7 tema (`evrax`, `spectrum`, catppuccin, dracula, gruvbox, nord, tokyonight), simpan pilihan ke `%APPDATA%\evrax\theme`.
 - `markdown.rs`, `image.rs` (paste + preview kitty), `window.rs` (maximized/resize), `subagent_link.rs` (poll inbox 250 ms).
 
 ### evrax-graph

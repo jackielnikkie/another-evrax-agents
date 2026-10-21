@@ -1,6 +1,6 @@
 # Referensi tema (hex lengkap)
 
-Dipindah dari AGENTS.md agar file itu ramping. Sumber aset: `agent-reference/opencode/packages/tui/src/theme/assets/*.json`.
+Dipindah dari AGENTS.md agar file itu ramping. Sumber aset: palet internal v2 (`crates/evrax-tui/src/theme.rs`).
 
 ## Mapping 5 tema baru
 Formula: accent=signature chrome, interactive=sekunder, selection/action_dim=surface tint, raised=backgroundPanel, md/syn/diff persis aset.

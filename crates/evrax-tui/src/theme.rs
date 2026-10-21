@@ -3,9 +3,8 @@ use std::path::PathBuf;
 
 use ratatui::style::Color;
 
-// Theme tokens follow opencode's v2 theme assets
-// (packages/tui/src/theme/assets/v2/opencode.json). "evrax" keeps the purple
-// letter scale; "opencode" restores the original markdown/syntax rainbow.
+// Theme tokens: "evrax" keeps the purple letter scale; "spectrum" restores the
+// full rainbow markdown/syntax palette.
 pub struct Theme {
     pub key: &'static str,
     pub label: &'static str,
@@ -88,9 +87,9 @@ pub const EVRAX: Theme = Theme {
     syn_operator: Color::Rgb(0x80, 0x80, 0x80), // muted
 };
 
-pub const OPENCODE: Theme = Theme {
-    key: "opencode",
-    label: "opencode",
+pub const SPECTRUM: Theme = Theme {
+    key: "spectrum",
+    label: "spectrum",
     base: Color::Rgb(0x0a, 0x0a, 0x0a),
     raised: Color::Rgb(0x14, 0x14, 0x14),
     text: Color::Rgb(0xee, 0xee, 0xee),
@@ -335,7 +334,7 @@ pub const TOKYONIGHT: Theme = Theme {
 };
 
 pub static THEMES: &[Theme] = &[
-    EVRAX, OPENCODE, CATPPUCCIN, DRACULA, GRUVBOX, NORD, TOKYONIGHT,
+    EVRAX, SPECTRUM, CATPPUCCIN, DRACULA, GRUVBOX, NORD, TOKYONIGHT,
 ];
 
 thread_local! {

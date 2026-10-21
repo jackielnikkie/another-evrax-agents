@@ -32,6 +32,9 @@ use crate::app::{AgentMode, App, ApprovalDecision, TunnelEditResult, TunnelEffec
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if cli_info_flag() {
+        return Ok(());
+    }
     setup_panic_hook();
     if let Some(idx) = theme::load_saved() {
         theme::set_index(idx);
@@ -41,6 +44,26 @@ async fn main() -> Result<()> {
     let restored = restore_terminal(&mut terminal);
     restored.context("failed to restore terminal state")?;
     result
+}
+
+fn cli_info_flag() -> bool {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("evrax {}", env!("CARGO_PKG_VERSION"));
+                return true;
+            }
+            "--help" | "-h" => {
+                println!(
+                    "evrax {}\n\nUSAGE:\n    evrax [OPTIONS]\n\nOPTIONS:\n    --mock                 run with the built-in mock backend\n    --model <name>         model id\n    --base-url <url>       OpenAI-compatible base URL\n    --api-key <key>        API key (else agent.json / EVRAX_API_KEY)\n    --max-iterations <n>   tool rounds per turn (default 500)\n    --root <path>          workspace root\n    -V, --version          print version and exit\n    -h, --help             print this help and exit",
+                    env!("CARGO_PKG_VERSION")
+                );
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -179,7 +202,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                             // Terminal paste without bracketed-paste support arrives
                             // as a key burst. Screenshot pastes show up as a temp
                             // file path (or as raw pixels only in the clipboard), so
-                            // try the clipboard image first â€” opencode-style â€” then
+                            // try the clipboard image first, then
                             // fall back to path detection, then literal text.
                             if is_paste_like(&chars) {
                                 if !app.ingest_paste(&chars) {
@@ -450,7 +473,7 @@ fn commit_tunnel_url(app: &mut App) {
         }
         Ok(TunnelEditResult::HostReady) => {
             persist_remote(app);
-            app.set_flash("custom domain: menyiapkan tunnelâ€¦".to_string());
+            app.set_flash("custom domain: menyiapkan tunnel…".to_string());
             tunnel_start(app);
         }
         Err(msg) => app.set_flash(msg),

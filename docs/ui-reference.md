@@ -1,6 +1,6 @@
-# OpenCode TUI Reference
+# UI reference (TUI)
 
-Condensed reference for reimplementing OpenCode's TUI in evrax. Source: `agent-reference/opencode/packages/tui/src` (cloned repo). Purpose: avoid re-dissecting the source. All paths below are relative to `packages/tui/src` unless stated otherwise.
+Catatan desain untuk implementasi TUI evrax. Referensi provenance: TUI proyek lain dipelajari untuk perilaku/layout; evrax mengimplementasikan ulang secara independen. Source: `agent-reference/opencode/packages/tui/src` (cloned repo). Purpose: avoid re-dissecting the source. All paths below are relative to `packages/tui/src` unless stated otherwise.
 
 ## 1. Layout
 
