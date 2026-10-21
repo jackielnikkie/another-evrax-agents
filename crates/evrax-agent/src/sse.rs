@@ -137,7 +137,11 @@ pub fn parse_frame(payload: &str) -> Frame {
                 // Providers stream continuation fragments with `"id": ""`;
                 // an empty id must never look like the start of a new call.
                 id: non_empty(call.get("id").and_then(|v| v.as_str())),
-                name: non_empty(function.and_then(|f| f.get("name")).and_then(|v| v.as_str())),
+                name: non_empty(
+                    function
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str()),
+                ),
                 arguments: function
                     .and_then(|f| f.get("arguments"))
                     .and_then(|v| v.as_str())
@@ -324,14 +328,11 @@ mod tests {
     #[test]
     fn parse_content_reasoning_and_done() {
         assert_eq!(parse_frame("[DONE]"), Frame::Done);
-        let Frame::Delta(d) =
-            parse_frame(r#"{"choices":[{"delta":{"content":"hi "}}]}"#)
-        else {
+        let Frame::Delta(d) = parse_frame(r#"{"choices":[{"delta":{"content":"hi "}}]}"#) else {
             panic!("expected delta");
         };
         assert_eq!(d.text, "hi ");
-        let Frame::Delta(d) =
-            parse_frame(r#"{"choices":[{"delta":{"reasoning_content":"hm"}}]}"#)
+        let Frame::Delta(d) = parse_frame(r#"{"choices":[{"delta":{"reasoning_content":"hm"}}]}"#)
         else {
             panic!("expected delta");
         };

@@ -8,7 +8,7 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::mpsc::{RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -82,19 +82,51 @@ pub struct Session {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteEvent {
-    Connected { session: String },
-    TurnStart { turn: String },
-    User { turn: String, text: String },
-    Delta { turn: String, text: String },
-    Thinking { turn: String, text: String },
-    Tool { turn: String, name: String, status: String, detail: Option<String> },
-    Approval { turn: String, name: String, summary: String },
-    ApprovalResolved { turn: String, decision: String },
+    Connected {
+        session: String,
+    },
+    TurnStart {
+        turn: String,
+    },
+    User {
+        turn: String,
+        text: String,
+    },
+    Delta {
+        turn: String,
+        text: String,
+    },
+    Thinking {
+        turn: String,
+        text: String,
+    },
+    Tool {
+        turn: String,
+        name: String,
+        status: String,
+        detail: Option<String>,
+    },
+    Approval {
+        turn: String,
+        name: String,
+        summary: String,
+    },
+    ApprovalResolved {
+        turn: String,
+        decision: String,
+    },
     /// Authoritative session mode changed ("plan" | "build"). Broadcast by the
     /// owning TUI via `set_session_mode`; carries no turn id.
-    Mode { mode: String },
-    TurnDone { turn: String },
-    Error { turn: Option<String>, message: String },
+    Mode {
+        mode: String,
+    },
+    TurnDone {
+        turn: String,
+    },
+    Error {
+        turn: Option<String>,
+        message: String,
+    },
     Done,
 }
 
@@ -102,17 +134,56 @@ impl RemoteEvent {
     /// Serialize to a single SSE frame (`event: <name>\ndata: <json>\n\n`).
     fn to_sse(&self) -> String {
         let (name, payload) = match self {
-            RemoteEvent::Connected { session } => ("connected", serde_json::json!({"type":"connected","session":session})),
-            RemoteEvent::TurnStart { turn } => ("turn_start", serde_json::json!({"type":"turn_start","turn":turn})),
-            RemoteEvent::User { turn, text } => ("user", serde_json::json!({"type":"user","turn":turn,"text":text})),
-            RemoteEvent::Delta { turn, text } => ("delta", serde_json::json!({"type":"delta","turn":turn,"text":text})),
-            RemoteEvent::Thinking { turn, text } => ("thinking", serde_json::json!({"type":"thinking","turn":turn,"text":text})),
-            RemoteEvent::Tool { turn, name, status, detail } => ("tool", serde_json::json!({"type":"tool","turn":turn,"name":name,"status":status,"detail":detail})),
-            RemoteEvent::Approval { turn, name, summary } => ("approval", serde_json::json!({"type":"approval","turn":turn,"name":name,"summary":summary})),
-            RemoteEvent::ApprovalResolved { turn, decision } => ("approval_resolved", serde_json::json!({"type":"approval_resolved","turn":turn,"decision":decision})),
+            RemoteEvent::Connected { session } => (
+                "connected",
+                serde_json::json!({"type":"connected","session":session}),
+            ),
+            RemoteEvent::TurnStart { turn } => (
+                "turn_start",
+                serde_json::json!({"type":"turn_start","turn":turn}),
+            ),
+            RemoteEvent::User { turn, text } => (
+                "user",
+                serde_json::json!({"type":"user","turn":turn,"text":text}),
+            ),
+            RemoteEvent::Delta { turn, text } => (
+                "delta",
+                serde_json::json!({"type":"delta","turn":turn,"text":text}),
+            ),
+            RemoteEvent::Thinking { turn, text } => (
+                "thinking",
+                serde_json::json!({"type":"thinking","turn":turn,"text":text}),
+            ),
+            RemoteEvent::Tool {
+                turn,
+                name,
+                status,
+                detail,
+            } => (
+                "tool",
+                serde_json::json!({"type":"tool","turn":turn,"name":name,"status":status,"detail":detail}),
+            ),
+            RemoteEvent::Approval {
+                turn,
+                name,
+                summary,
+            } => (
+                "approval",
+                serde_json::json!({"type":"approval","turn":turn,"name":name,"summary":summary}),
+            ),
+            RemoteEvent::ApprovalResolved { turn, decision } => (
+                "approval_resolved",
+                serde_json::json!({"type":"approval_resolved","turn":turn,"decision":decision}),
+            ),
             RemoteEvent::Mode { mode } => ("mode", serde_json::json!({"type":"mode","mode":mode})),
-            RemoteEvent::TurnDone { turn } => ("turn_done", serde_json::json!({"type":"turn_done","turn":turn})),
-            RemoteEvent::Error { turn, message } => ("error", serde_json::json!({"type":"error","turn":turn,"message":message})),
+            RemoteEvent::TurnDone { turn } => (
+                "turn_done",
+                serde_json::json!({"type":"turn_done","turn":turn}),
+            ),
+            RemoteEvent::Error { turn, message } => (
+                "error",
+                serde_json::json!({"type":"error","turn":turn,"message":message}),
+            ),
             RemoteEvent::Done => ("done", serde_json::json!({"type":"done"})),
         };
         let json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".into());
@@ -184,7 +255,11 @@ struct ModeBody {
 /// Normalize an incoming mode to the closed set the rest of the system assumes.
 /// Anything other than `"plan"` (including a missing field) becomes `"build"`.
 fn normalize_mode(mode: &str) -> String {
-    if mode == "plan" { "plan".to_string() } else { "build".to_string() }
+    if mode == "plan" {
+        "plan".to_string()
+    } else {
+        "build".to_string()
+    }
 }
 
 /// Shared server state.
@@ -255,7 +330,10 @@ pub fn start(config: RemoteConfig) -> RemoteServer {
         Err(e) => eprintln!("evrax-remote: failed to bind {addr}: {e}"),
     }
 
-    RemoteServer { state, shutdown: tx }
+    RemoteServer {
+        state,
+        shutdown: tx,
+    }
 }
 
 fn run_server(state: State, server: tiny_http::Server, rx: std::sync::mpsc::Receiver<()>) {
@@ -300,10 +378,19 @@ fn read_body(req: &mut tiny_http::Request) -> String {
     buf
 }
 
-fn respond_json<T: Serialize>(req: tiny_http::Request, status: u16, value: &T) -> std::io::Result<()> {
+fn respond_json<T: Serialize>(
+    req: tiny_http::Request,
+    status: u16,
+    value: &T,
+) -> std::io::Result<()> {
     let body = serde_json::to_string(value).unwrap_or_else(|_| "{}".into());
-    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header");
-    req.respond(tiny_http::Response::from_string(body).with_status_code(status).with_header(header))
+    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+        .expect("static header");
+    req.respond(
+        tiny_http::Response::from_string(body)
+            .with_status_code(status)
+            .with_header(header),
+    )
 }
 
 /// Push an event to every live subscriber of a session, dropping dead senders.
@@ -322,7 +409,11 @@ fn broadcast(subs: &Arc<Mutex<Vec<Sender<RemoteEvent>>>>, event: RemoteEvent) {
 /// `Read` returns EOF, which would hold every SSE frame until the idle timeout.
 /// Taking the raw writer lets us emit the HTTP preamble ourselves and flush
 /// after each frame, so events arrive in real time.
-fn spawn_stream(req: tiny_http::Request, id: String, subs: Arc<Mutex<Vec<Sender<RemoteEvent>>>>) -> std::io::Result<()> {
+fn spawn_stream(
+    req: tiny_http::Request,
+    id: String,
+    subs: Arc<Mutex<Vec<Sender<RemoteEvent>>>>,
+) -> std::io::Result<()> {
     let (tx, rx) = channel::<RemoteEvent>();
     if let Ok(mut list) = subs.lock() {
         list.push(tx);
@@ -380,14 +471,19 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
 
     // Password policy gate (health is always reachable).
     if path != "/health" && !allow_remote(password_default, remote_ip) {
-        return respond_json(req, 403, &serde_json::json!({"error": "tunnel requires non-default password"}));
+        return respond_json(
+            req,
+            403,
+            &serde_json::json!({"error": "tunnel requires non-default password"}),
+        );
     }
 
     // Public routes need no token. Everything else does: a tunneled request
     // from the same host looks like loopback, so the password gate alone cannot
     // protect it — the bearer token is the real authority.
-    let is_public =
-        path == "/health" || path == "/login" || (matches!(method, tiny_http::Method::Get) && path == "/");
+    let is_public = path == "/health"
+        || path == "/login"
+        || (matches!(method, tiny_http::Method::Get) && path == "/");
     if !is_public && !auth_token_valid(state, &req) {
         return respond_json(req, 401, &serde_json::json!({"error": "unauthorized"}));
     }
@@ -396,8 +492,11 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
 
     match (method, path.as_str()) {
         (Method::Get, "/") => {
-            let header =
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).expect("static header");
+            let header = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"text/html; charset=utf-8"[..],
+            )
+            .expect("static header");
             req.respond(tiny_http::Response::from_string(WEBUI).with_header(header))
         }
 
@@ -414,7 +513,11 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
 
         (Method::Post, "/login") => {
             if !login_allowed(state, remote_ip) {
-                return respond_json(req, 429, &serde_json::json!({"error": "too many attempts, try again later"}));
+                return respond_json(
+                    req,
+                    429,
+                    &serde_json::json!({"error": "too many attempts, try again later"}),
+                );
             }
             let body = read_body(&mut req);
             let parsed: Option<LoginBody> = serde_json::from_str(&body).ok();
@@ -445,9 +548,18 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
             let body = read_body(&mut req);
             match serde_json::from_str::<RegisterBody>(&body) {
                 Ok(b) if !b.id.trim().is_empty() => {
-                    let name = if b.name.trim().is_empty() { b.id.clone() } else { b.name };
+                    let name = if b.name.trim().is_empty() {
+                        b.id.clone()
+                    } else {
+                        b.name
+                    };
                     let mode = normalize_mode(&b.mode);
-                    let session = Session { id: b.id.clone(), name, permit: b.permit, mode };
+                    let session = Session {
+                        id: b.id.clone(),
+                        name,
+                        permit: b.permit,
+                        mode,
+                    };
                     if let Ok(mut reg) = state.registry.lock() {
                         let existed = reg.contains_key(&session.id);
                         if existed {
@@ -468,13 +580,21 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                     }
                     respond_json(req, 200, &serde_json::json!({"ok": true}))
                 }
-                _ => respond_json(req, 400, &serde_json::json!({"error": "invalid register body"})),
+                _ => respond_json(
+                    req,
+                    400,
+                    &serde_json::json!({"error": "invalid register body"}),
+                ),
             }
         }
 
         (Method::Delete, _) if path.starts_with("/register/") => {
             let id = path.trim_start_matches("/register/").to_string();
-            let removed = state.registry.lock().map(|mut reg| reg.remove(&id).is_some()).unwrap_or(false);
+            let removed = state
+                .registry
+                .lock()
+                .map(|mut reg| reg.remove(&id).is_some())
+                .unwrap_or(false);
             if removed {
                 state.refcount.fetch_sub(1, Ordering::SeqCst);
                 respond_json(req, 200, &serde_json::json!({"ok": true}))
@@ -521,10 +641,14 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                 .ok()
                 .and_then(|r| r.get(&id).map(|reg| reg.session.permit));
             match (permit, parsed) {
-                (None, _) => respond_json(req, 404, &serde_json::json!({"error": "unknown session"})),
-                (Some(Permit::Read), _) => {
-                    respond_json(req, 403, &serde_json::json!({"error": "session is read-only"}))
+                (None, _) => {
+                    respond_json(req, 404, &serde_json::json!({"error": "unknown session"}))
                 }
+                (Some(Permit::Read), _) => respond_json(
+                    req,
+                    403,
+                    &serde_json::json!({"error": "session is read-only"}),
+                ),
                 (Some(Permit::Write), Some(p)) if !p.prompt.trim().is_empty() => {
                     // Queue the prompt for the owning TUI and echo it as a
                     // `user` event so every open tab renders the same bubble.
@@ -540,7 +664,13 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                     if let Some(subs) = subs {
                         // Only echo the user bubble; the TUI emits its own
                         // TurnStart/Delta/... stream when it runs the prompt.
-                        broadcast(&subs, RemoteEvent::User { turn: turn.clone(), text: p.prompt });
+                        broadcast(
+                            &subs,
+                            RemoteEvent::User {
+                                turn: turn.clone(),
+                                text: p.prompt,
+                            },
+                        );
                     }
                     respond_json(req, 200, &serde_json::json!({"ok": true, "turn": turn}))
                 }
@@ -563,7 +693,9 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                 .ok()
                 .and_then(|r| r.get(&id).map(|reg| reg.pending_approvals.clone()));
             match (queue, parsed) {
-                (None, _) => respond_json(req, 404, &serde_json::json!({"error": "unknown session"})),
+                (None, _) => {
+                    respond_json(req, 404, &serde_json::json!({"error": "unknown session"}))
+                }
                 (Some(q), Some(p))
                     if matches!(p.decision.as_str(), "once" | "always" | "reject") =>
                 {
@@ -588,16 +720,19 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                 .to_string();
             let body = read_body(&mut req);
             let parsed = serde_json::from_str::<ModeBody>(&body).ok();
-            let entry = state
-                .registry
-                .lock()
-                .ok()
-                .and_then(|r| r.get(&id).map(|reg| (reg.session.permit, reg.pending_modes.clone())));
+            let entry = state.registry.lock().ok().and_then(|r| {
+                r.get(&id)
+                    .map(|reg| (reg.session.permit, reg.pending_modes.clone()))
+            });
             match (entry, parsed) {
-                (None, _) => respond_json(req, 404, &serde_json::json!({"error": "unknown session"})),
-                (Some((Permit::Read, _)), _) => {
-                    respond_json(req, 403, &serde_json::json!({"error": "session is read-only"}))
+                (None, _) => {
+                    respond_json(req, 404, &serde_json::json!({"error": "unknown session"}))
                 }
+                (Some((Permit::Read, _)), _) => respond_json(
+                    req,
+                    403,
+                    &serde_json::json!({"error": "session is read-only"}),
+                ),
                 (Some((_, q)), Some(m)) if m.mode == "plan" || m.mode == "build" => {
                     // Only queue the request; the owning TUI applies it and
                     // confirms via `set_session_mode`, which broadcasts the
@@ -607,7 +742,9 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                     }
                     respond_json(req, 202, &serde_json::json!({"ok": true}))
                 }
-                (Some(_), _) => respond_json(req, 400, &serde_json::json!({"error": "invalid mode"})),
+                (Some(_), _) => {
+                    respond_json(req, 400, &serde_json::json!({"error": "invalid mode"}))
+                }
             }
         }
 
@@ -617,7 +754,8 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
 
 fn health_ok(state: &State, req: tiny_http::Request) -> std::io::Result<()> {
     let n = state.registry.lock().map(|r| r.len()).unwrap_or(0);
-    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header");
+    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+        .expect("static header");
     let body = format!("{{\"ok\":true,\"sessions\":{n}}}");
     req.respond(tiny_http::Response::from_string(body).with_header(header))
 }
@@ -673,7 +811,10 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// Token from the `Authorization: Bearer` header, else the `?token=` query
 /// (EventSource cannot set headers, so the stream carries it in the URL).
 fn request_token(req: &tiny_http::Request) -> Option<String> {
-    if let Some(h) = req.headers().iter().find(|h| h.field.equiv("Authorization"))
+    if let Some(h) = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
         && let Some(t) = h.value.as_str().strip_prefix("Bearer ")
     {
         return Some(t.to_string());
@@ -732,7 +873,12 @@ fn note_login_success(state: &State, ip: Option<IpAddr>) {
 
 /// Register a session in the shared registry.
 pub fn register(server: &RemoteServer, id: String, name: String, permit: Permit) {
-    let session = Session { id: id.clone(), name, permit, mode: "build".into() };
+    let session = Session {
+        id: id.clone(),
+        name,
+        permit,
+        mode: "build".into(),
+    };
     if let Ok(mut reg) = server.state.registry.lock() {
         if let Some(existing) = reg.get_mut(&id) {
             existing.session = session;
@@ -821,7 +967,9 @@ pub fn set_session_mode(server: &RemoteServer, id: &str, mode: &str) {
     }
     // Clone the subscriber list and drop the registry lock before broadcasting.
     let subs = {
-        let Ok(mut reg) = server.state.registry.lock() else { return };
+        let Ok(mut reg) = server.state.registry.lock() else {
+            return;
+        };
         let Some(entry) = reg.get_mut(id) else { return };
         if entry.session.mode == mode {
             return;
@@ -829,7 +977,12 @@ pub fn set_session_mode(server: &RemoteServer, id: &str, mode: &str) {
         entry.session.mode = mode.to_string();
         entry.subs.clone()
     };
-    broadcast(&subs, RemoteEvent::Mode { mode: mode.to_string() });
+    broadcast(
+        &subs,
+        RemoteEvent::Mode {
+            mode: mode.to_string(),
+        },
+    );
 }
 
 /// The session's authoritative mode, if it is registered.
@@ -913,9 +1066,8 @@ pub fn load_remote_config() -> RemoteConfig {
 
 /// Persist the config to `%APPDATA%\evrax\remote.json`, creating the directory.
 pub fn save_remote_config(config: &RemoteConfig) -> std::io::Result<()> {
-    let path = remote_config_path().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "APPDATA is not set")
-    })?;
+    let path = remote_config_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "APPDATA is not set"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -969,7 +1121,10 @@ mod tests {
 
     #[test]
     fn register_deregister_refcount() {
-        let server = start(RemoteConfig { port: 0, ..Default::default() });
+        let server = start(RemoteConfig {
+            port: 0,
+            ..Default::default()
+        });
         register(&server, "s1".into(), "one".into(), Permit::Read);
         register(&server, "s2".into(), "two".into(), Permit::Write);
         assert_eq!(server.state.refcount.load(Ordering::SeqCst), 2);
@@ -981,7 +1136,10 @@ mod tests {
 
     #[test]
     fn rename_session_updates_name_only() {
-        let server = start(RemoteConfig { port: 0, ..Default::default() });
+        let server = start(RemoteConfig {
+            port: 0,
+            ..Default::default()
+        });
         register(&server, "s1".into(), "one".into(), Permit::Read);
         set_session_mode(&server, "s1", "plan");
         server
@@ -1008,7 +1166,12 @@ mod tests {
 
     #[test]
     fn session_serializes_lowercase_permit() {
-        let s = Session { id: "x".into(), name: "n".into(), permit: Permit::Write, mode: "build".into() };
+        let s = Session {
+            id: "x".into(),
+            name: "n".into(),
+            permit: Permit::Write,
+            mode: "build".into(),
+        };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"permit\":\"write\""));
     }
@@ -1024,18 +1187,27 @@ mod tests {
 
     #[test]
     fn stays_alive_after_deregister() {
-        let server = start(RemoteConfig { port: 0, ..Default::default() });
+        let server = start(RemoteConfig {
+            port: 0,
+            ..Default::default()
+        });
         assert!(server.is_running());
         register(&server, "s1".into(), "one".into(), Permit::Read);
         deregister(&server, "s1");
         // Idle with the handle still held: the server must NOT shut down.
         std::thread::sleep(Duration::from_millis(600));
-        assert!(server.is_running(), "live handle must keep the server running");
+        assert!(
+            server.is_running(),
+            "live handle must keep the server running"
+        );
     }
 
     #[test]
     fn stops_after_handle_drop_when_idle() {
-        let server = start(RemoteConfig { port: 0, ..Default::default() });
+        let server = start(RemoteConfig {
+            port: 0,
+            ..Default::default()
+        });
         let alive = server.state.alive.clone();
         assert!(alive.load(Ordering::SeqCst));
         drop(server);
@@ -1054,8 +1226,15 @@ mod tests {
     fn bind_failure_returns_dead_handle() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = start(RemoteConfig { bind: "127.0.0.1".into(), port, ..Default::default() });
-        assert!(!server.is_running(), "bind conflict must yield a dead handle");
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        });
+        assert!(
+            !server.is_running(),
+            "bind conflict must yield a dead handle"
+        );
         drop(listener);
         drop(server);
     }
@@ -1069,7 +1248,11 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let server = start(RemoteConfig { bind: "127.0.0.1".into(), port: free, ..Default::default() });
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port: free,
+            ..Default::default()
+        });
         assert!(server.is_running());
         register(&server, "s1".into(), "one".into(), Permit::Write);
         // Authenticate up-front: the stream route now requires a token.
@@ -1087,12 +1270,32 @@ mod tests {
         let n = c.read(&mut buf).unwrap();
         let first = String::from_utf8_lossy(&buf[..n]);
         assert!(first.contains("200 OK"), "no HTTP status line: {first:?}");
-        assert!(first.contains("text/event-stream"), "wrong content type: {first:?}");
-        assert!(first.contains("event: connected"), "no connected frame: {first:?}");
+        assert!(
+            first.contains("text/event-stream"),
+            "wrong content type: {first:?}"
+        );
+        assert!(
+            first.contains("event: connected"),
+            "no connected frame: {first:?}"
+        );
 
         // A broadcast event must be flushed promptly, not held until close.
-        let subs = server.state.registry.lock().unwrap().get("s1").unwrap().subs.clone();
-        broadcast(&subs, RemoteEvent::Delta { turn: "t".into(), text: "hello-prompt".into() });
+        let subs = server
+            .state
+            .registry
+            .lock()
+            .unwrap()
+            .get("s1")
+            .unwrap()
+            .subs
+            .clone();
+        broadcast(
+            &subs,
+            RemoteEvent::Delta {
+                turn: "t".into(),
+                text: "hello-prompt".into(),
+            },
+        );
 
         let mut got = String::new();
         for _ in 0..5 {
@@ -1107,12 +1310,18 @@ mod tests {
             }
         }
         assert!(got.contains("event: delta"), "no delta frame: {got:?}");
-        assert!(got.contains("hello-prompt"), "delta payload not delivered: {got:?}");
+        assert!(
+            got.contains("hello-prompt"),
+            "delta payload not delivered: {got:?}"
+        );
     }
 
     #[test]
     fn pending_prompt_roundtrip() {
-        let server = start(RemoteConfig { port: 0, ..Default::default() });
+        let server = start(RemoteConfig {
+            port: 0,
+            ..Default::default()
+        });
         register(&server, "s1".into(), "one".into(), Permit::Write);
         let q = server
             .state
@@ -1131,7 +1340,10 @@ mod tests {
 
     #[test]
     fn pending_approval_roundtrip() {
-        let server = start(RemoteConfig { port: 0, ..Default::default() });
+        let server = start(RemoteConfig {
+            port: 0,
+            ..Default::default()
+        });
         register(&server, "s1".into(), "one".into(), Permit::Write);
         let q = server
             .state
@@ -1143,7 +1355,10 @@ mod tests {
             .pending_approvals
             .clone();
         q.lock().unwrap().push_back("once".into());
-        assert_eq!(take_pending_approval(&server, "s1").as_deref(), Some("once"));
+        assert_eq!(
+            take_pending_approval(&server, "s1").as_deref(),
+            Some("once")
+        );
         assert_eq!(take_pending_approval(&server, "s1"), None);
         assert_eq!(take_pending_approval(&server, "missing"), None);
     }
@@ -1158,7 +1373,10 @@ mod tests {
         .to_sse();
         assert!(req.contains("event: approval\n"), "frame: {req:?}");
         assert!(req.contains("\"name\":\"shell\""), "frame: {req:?}");
-        assert!(req.contains("\"summary\":\"rm -rf build\""), "frame: {req:?}");
+        assert!(
+            req.contains("\"summary\":\"rm -rf build\""),
+            "frame: {req:?}"
+        );
 
         let res = RemoteEvent::ApprovalResolved {
             turn: "t1".into(),
@@ -1178,7 +1396,11 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let server = start(RemoteConfig { bind: "127.0.0.1".into(), port: free, ..Default::default() });
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port: free,
+            ..Default::default()
+        });
         assert!(server.is_running());
         register(&server, "s1".into(), "one".into(), Permit::Write);
         if let Ok(mut t) = server.state.token.lock() {
@@ -1200,7 +1422,10 @@ mod tests {
 
         let ok = post("/api/session/s1/approval", r#"{"decision":"always"}"#);
         assert!(ok.contains("200 OK"), "response: {ok:?}");
-        assert_eq!(take_pending_approval(&server, "s1").as_deref(), Some("always"));
+        assert_eq!(
+            take_pending_approval(&server, "s1").as_deref(),
+            Some("always")
+        );
 
         let bad = post("/api/session/s1/approval", r#"{"decision":"maybe"}"#);
         assert!(bad.contains("400"), "response: {bad:?}");
@@ -1244,15 +1469,24 @@ mod tests {
 
     #[test]
     fn login_rate_limit_locks_then_resets() {
-        let server = start(RemoteConfig { port: 0, ..Default::default() });
+        let server = start(RemoteConfig {
+            port: 0,
+            ..Default::default()
+        });
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         for _ in 0..LOGIN_MAX {
             assert!(login_allowed(&server.state, Some(ip)));
             note_login_failure(&server.state, Some(ip));
         }
-        assert!(!login_allowed(&server.state, Some(ip)), "locked after max failures");
+        assert!(
+            !login_allowed(&server.state, Some(ip)),
+            "locked after max failures"
+        );
         note_login_success(&server.state, Some(ip));
-        assert!(login_allowed(&server.state, Some(ip)), "success resets the counter");
+        assert!(
+            login_allowed(&server.state, Some(ip)),
+            "success resets the counter"
+        );
     }
 
     #[test]
@@ -1262,7 +1496,10 @@ mod tests {
             *t = Some(("tok".into(), Instant::now()));
         }
         set_password(&server, "newpass123".into());
-        assert!(server.state.token.lock().unwrap().is_none(), "token invalidated");
+        assert!(
+            server.state.token.lock().unwrap().is_none(),
+            "token invalidated"
+        );
         assert_eq!(config_snapshot(&server).password, "newpass123");
     }
 
@@ -1275,7 +1512,11 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let server = start(RemoteConfig { bind: "127.0.0.1".into(), port: free, ..Default::default() });
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port: free,
+            ..Default::default()
+        });
 
         let request = |raw: &[u8]| {
             let mut c = TcpStream::connect(("127.0.0.1", free)).unwrap();
@@ -1287,7 +1528,10 @@ mod tests {
         };
 
         let unauth = request(b"GET /api/sessions HTTP/1.1\r\nHost: x\r\n\r\n");
-        assert!(unauth.contains("401"), "expected 401 without token: {unauth:?}");
+        assert!(
+            unauth.contains("401"),
+            "expected 401 without token: {unauth:?}"
+        );
 
         let health = request(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(health.contains("200"), "health must stay open: {health:?}");
@@ -1295,13 +1539,20 @@ mod tests {
         if let Ok(mut t) = server.state.token.lock() {
             *t = Some(("tok".into(), Instant::now()));
         }
-        let authed = request(b"GET /api/sessions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\n\r\n");
-        assert!(authed.contains("200"), "expected 200 with token: {authed:?}");
+        let authed =
+            request(b"GET /api/sessions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\n\r\n");
+        assert!(
+            authed.contains("200"),
+            "expected 200 with token: {authed:?}"
+        );
     }
 
     #[test]
     fn mode_event_serializes_to_sse() {
-        let frame = RemoteEvent::Mode { mode: "plan".into() }.to_sse();
+        let frame = RemoteEvent::Mode {
+            mode: "plan".into(),
+        }
+        .to_sse();
         assert!(frame.contains("event: mode\n"), "frame: {frame:?}");
         assert!(frame.contains("\"type\":\"mode\""), "frame: {frame:?}");
         assert!(frame.contains("\"mode\":\"plan\""), "frame: {frame:?}");
@@ -1330,7 +1581,11 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let server = start(RemoteConfig { bind: "127.0.0.1".into(), port: free, ..Default::default() });
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port: free,
+            ..Default::default()
+        });
         assert!(server.is_running());
         register(&server, "s1".into(), "one".into(), Permit::Write);
         if let Ok(mut t) = server.state.token.lock() {
@@ -1345,7 +1600,10 @@ mod tests {
         let n = c.read(&mut buf).unwrap();
         let body = String::from_utf8_lossy(&buf[..n]);
         assert!(body.contains("200 OK"), "response: {body:?}");
-        assert!(body.contains("\"mode\":\"build\""), "default mode missing: {body:?}");
+        assert!(
+            body.contains("\"mode\":\"build\""),
+            "default mode missing: {body:?}"
+        );
     }
 
     #[test]
@@ -1357,7 +1615,11 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let server = start(RemoteConfig { bind: "127.0.0.1".into(), port: free, ..Default::default() });
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port: free,
+            ..Default::default()
+        });
         assert!(server.is_running());
         register(&server, "s1".into(), "one".into(), Permit::Write);
         register(&server, "ro".into(), "ro".into(), Permit::Read);
@@ -1384,7 +1646,11 @@ mod tests {
 
         let bad = post("/api/session/s1/mode", r#"{"mode":"turbo"}"#);
         assert!(bad.contains("400"), "response: {bad:?}");
-        assert_eq!(take_pending_mode(&server, "s1"), None, "invalid mode must not enqueue");
+        assert_eq!(
+            take_pending_mode(&server, "s1"),
+            None,
+            "invalid mode must not enqueue"
+        );
 
         let missing = post("/api/session/nope/mode", r#"{"mode":"plan"}"#);
         assert!(missing.contains("404"), "response: {missing:?}");
@@ -1396,9 +1662,20 @@ mod tests {
 
     #[test]
     fn set_session_mode_broadcasts_and_ignores_noops() {
-        let server = start(RemoteConfig { port: 0, ..Default::default() });
+        let server = start(RemoteConfig {
+            port: 0,
+            ..Default::default()
+        });
         register(&server, "s1".into(), "one".into(), Permit::Write);
-        let subs = server.state.registry.lock().unwrap().get("s1").unwrap().subs.clone();
+        let subs = server
+            .state
+            .registry
+            .lock()
+            .unwrap()
+            .get("s1")
+            .unwrap()
+            .subs
+            .clone();
         let (tx, rx) = channel::<RemoteEvent>();
         subs.lock().unwrap().push(tx);
 

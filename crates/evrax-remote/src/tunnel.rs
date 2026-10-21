@@ -11,8 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Managed cloudflared binary download (Windows amd64).
-pub const CLOUDFLARED_URL: &str =
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
+pub const CLOUDFLARED_URL: &str = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
 
 /// Name of the named tunnel created for custom domains.
 pub const TUNNEL_NAME: &str = "evrax";
@@ -24,9 +23,15 @@ pub enum TunnelStatus {
     Downloading,
     Starting,
     /// Waiting for the browser login to complete; `url` is the auth link.
-    Login { url: String },
-    Running { url: String },
-    Error { message: String },
+    Login {
+        url: String,
+    },
+    Running {
+        url: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 struct Inner {
@@ -491,7 +496,10 @@ fn ensure_login(
                         if g.generation != generation || g.cancel {
                             return;
                         }
-                        if !matches!(g.status, TunnelStatus::Starting | TunnelStatus::Login { .. }) {
+                        if !matches!(
+                            g.status,
+                            TunnelStatus::Starting | TunnelStatus::Login { .. }
+                        ) {
                             return;
                         }
                     }
@@ -500,7 +508,10 @@ fn ensure_login(
             }
             if let Ok(mut g) = watchdog.lock()
                 && g.generation == generation
-                && matches!(g.status, TunnelStatus::Starting | TunnelStatus::Login { .. })
+                && matches!(
+                    g.status,
+                    TunnelStatus::Starting | TunnelStatus::Login { .. }
+                )
             {
                 if let Some(child) = g.child.as_mut() {
                     let _ = child.kill();
@@ -610,8 +621,12 @@ fn extract_url(line: &str) -> Option<String> {
 }
 
 fn managed_bin_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA")
-        .map(|dir| PathBuf::from(dir).join("evrax").join("bin").join("cloudflared.exe"))
+    std::env::var_os("APPDATA").map(|dir| {
+        PathBuf::from(dir)
+            .join("evrax")
+            .join("bin")
+            .join("cloudflared.exe")
+    })
 }
 
 /// Managed binary first, then a `cloudflared` on PATH.
@@ -708,7 +723,10 @@ mod tests {
 
     #[test]
     fn extract_url_ignores_lines_without_url() {
-        assert_eq!(extract_url("INF Requesting new quick Tunnel on trycloudflare.com..."), None);
+        assert_eq!(
+            extract_url("INF Requesting new quick Tunnel on trycloudflare.com..."),
+            None
+        );
         assert_eq!(extract_url("INF +----------------------------+"), None);
         assert_eq!(extract_url(""), None);
     }

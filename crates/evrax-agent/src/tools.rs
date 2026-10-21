@@ -1,5 +1,11 @@
 //! Filesystem + shell tools exposed to the model.
 
+mod ast_grep;
+mod git;
+mod graph;
+mod todo;
+mod web;
+
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -65,7 +71,10 @@ impl Context {
         }
         let root = canonical(&self.root);
         let inside = out.starts_with(&self.root) || out.starts_with(&root);
-        Ok(Resolved { path: out, outside: !inside })
+        Ok(Resolved {
+            path: out,
+            outside: !inside,
+        })
     }
 
     fn display(&self, path: &Path) -> String {
@@ -93,13 +102,17 @@ fn strip_verbatim(path: &Path) -> PathBuf {
 /// when every candidate path stays inside the workspace.
 pub fn outside_target(name: &str, args: &Value, ctx: &Context) -> Option<PathBuf> {
     let key = match name {
-        "read" | "write" | "edit" => "path",
+        "read" | "write" | "edit" | "git" => "path",
         "list" => "pattern",
         _ => return None,
     };
     let raw = args.get(key)?.as_str()?;
     let resolved = ctx.classify(raw).ok()?;
-    if resolved.outside { Some(resolved.path) } else { None }
+    if resolved.outside {
+        Some(resolved.path)
+    } else {
+        None
+    }
 }
 
 /// Approval identity: `<tool>:<canonical parent dir>` for an external target,
@@ -107,11 +120,49 @@ pub fn outside_target(name: &str, args: &Value, ctx: &Context) -> Option<PathBuf
 pub fn approval_key(name: &str, target: Option<&Path>) -> String {
     match target {
         Some(path) => {
-            let dir = path.parent().map(canonical).unwrap_or_else(|| path.to_path_buf());
+            let dir = path
+                .parent()
+                .map(canonical)
+                .unwrap_or_else(|| path.to_path_buf());
             format!("{name}:{}", dir.to_string_lossy().replace('\\', "/"))
         }
         None => name.to_string(),
     }
+}
+
+pub fn approval_key_for(name: &str, args: Option<&Value>, target: Option<&Path>) -> String {
+    if name == "git"
+        && let Some(action) = args
+            .and_then(|a| a.get("action"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+    {
+        return format!("git:{}", action.to_ascii_lowercase());
+    }
+    approval_key(name, target)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolInfo {
+    pub name: String,
+    pub description: String,
+    pub risk: Risk,
+}
+
+pub fn catalog() -> Vec<ToolInfo> {
+    specs()
+        .into_iter()
+        .filter_map(|spec| {
+            let function = spec.get("function")?;
+            let name = function.get("name")?.as_str()?.to_string();
+            let description = function.get("description")?.as_str()?.to_string();
+            Some(ToolInfo {
+                risk: risk(&name),
+                name,
+                description,
+            })
+        })
+        .collect()
 }
 
 pub fn specs() -> Vec<Value> {
@@ -207,14 +258,154 @@ pub fn specs() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Fetch an http(s) URL and return readable text (or raw body). Useful for docs, issues, and API references.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "http:// or https:// URL" },
+                        "format": { "type": "string", "enum": ["text", "raw"], "description": "text strips HTML; raw returns the response body (default text)" },
+                        "max_chars": { "type": "integer", "description": "Maximum characters to return (default 16000)" }
+                    },
+                    "required": ["url"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "todo",
+                "description": "Maintain a workspace todo list in .evrax/todos.json. Use list/add/update/remove/clear.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "add", "update", "remove", "clear"] },
+                        "id": { "type": "integer", "description": "Todo id for update/remove" },
+                        "content": { "type": "string", "description": "Task text for add/update" },
+                        "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] },
+                        "priority": { "type": "string", "enum": ["low", "medium", "high"] }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "git",
+                "description": "Inspect or change the workspace git repository. Read-only actions run automatically; mutating actions require approval.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["status", "diff", "log", "show", "branch", "add", "commit", "push", "pull", "fetch", "checkout", "restore"] },
+                        "path": { "type": "string", "description": "Optional workspace-relative path" },
+                        "staged": { "type": "boolean", "description": "diff --cached" },
+                        "limit": { "type": "integer", "description": "Log entry limit (default 20)" },
+                        "ref": { "type": "string", "description": "Commit/branch ref for log/show/checkout" },
+                        "name": { "type": "string", "description": "Branch name for branch action" },
+                        "message": { "type": "string", "description": "Commit message" },
+                        "remote": { "type": "string", "description": "Remote for push/pull/fetch" },
+                        "branch": { "type": "string", "description": "Branch for push/pull" },
+                        "files": { "type": "array", "items": { "type": "string" }, "description": "Files for add/restore" }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ast_grep",
+                "description": "AST-aware structural code search/rewrite with ast-grep (sg). Use search first; replace with apply=true mutates files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["search", "replace"] },
+                        "pattern": { "type": "string", "description": "ast-grep pattern (use $VAR / $$$ wildcards, not regex)" },
+                        "lang": { "type": "string", "description": "Language, e.g. rust, ts, python" },
+                        "path": { "type": "string", "description": "Workspace-relative path (default .)" },
+                        "rewrite": { "type": "string", "description": "Replacement pattern for replace" },
+                        "apply": { "type": "boolean", "description": "Apply the rewrite (default false = preview)" }
+                    },
+                    "required": ["action", "pattern", "lang"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "evrax-graph",
+                "description": "Query the built-in code graph (symbols, callers/callees, impact, dead code, file outline). Run action=index first; the graph lives in .evrax/graph.db.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["index", "status", "search", "callers", "callees", "impact", "dead_code", "outline"] },
+                        "pattern": { "type": "string", "description": "Name pattern for search" },
+                        "symbol": { "type": "string", "description": "Qualified name (src/main.rs::run) or a unique short name" },
+                        "path": { "type": "string", "description": "Workspace-relative file for outline" },
+                        "depth": { "type": "integer", "description": "Impact depth (default 3, max 10)" },
+                        "limit": { "type": "integer", "description": "Search result limit (default 50, max 200)" },
+                        "project": { "type": "string", "description": "Project name (default: workspace dir name)" }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "subagent",
+                "description": "Launch and control another evrax agent in a separate terminal. start returns an id; use send/status/list/stop.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["start", "send", "status", "list", "stop"] },
+                        "id": { "type": "string", "description": "Subagent id returned by start" },
+                        "name": { "type": "string", "description": "Display name for start" },
+                        "prompt": { "type": "string", "description": "Initial or follow-up prompt" }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
     ]
 }
 
 pub fn risk(name: &str) -> Risk {
     match name {
-        "write" | "edit" | "shell" => Risk::Mutate,
+        "write" | "edit" | "shell" | "todo" | "git" | "subagent" => Risk::Mutate,
         _ => Risk::Read,
     }
+}
+
+pub fn is_mutating(name: &str, args: Option<&Value>) -> bool {
+    let action = args
+        .and_then(|a| a.get("action"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match name {
+        "write" | "edit" | "shell" => true,
+        "todo" => action != "list",
+        "git" => match action.as_str() {
+            "status" | "diff" | "log" | "show" => false,
+            "branch" => args.is_some_and(|a| a.get("name").is_some()),
+            _ => true,
+        },
+        "ast_grep" => {
+            action == "replace"
+                && args.is_some_and(|a| a.get("apply").and_then(Value::as_bool).unwrap_or(false))
+        }
+        "subagent" => action != "status" && action != "list",
+        _ => false,
+    }
+}
+
+pub fn requires_approval(name: &str, args: Option<&Value>) -> bool {
+    name == "shell" || (name == "git" && is_mutating(name, args))
 }
 
 /// Short human-readable label for the TUI tool card.
@@ -229,10 +420,55 @@ pub fn summary(name: &str, args: &Value) -> String {
         "read" | "write" | "edit" => field("path"),
         "list" => {
             let pattern = field("pattern");
-            if pattern.is_empty() { "**/*".into() } else { pattern }
+            if pattern.is_empty() {
+                "**/*".into()
+            } else {
+                pattern
+            }
         }
         "grep" => field("pattern"),
         "shell" => field("command"),
+        "web_fetch" => field("url"),
+        "todo" => {
+            let action = field("action");
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| field("content"));
+            format!("{action} {id}").trim().to_string()
+        }
+        "git" => {
+            let mut parts = vec![field("action")];
+            for key in ["path", "ref", "name", "message", "remote", "branch"] {
+                let value = field(key);
+                if !value.is_empty() {
+                    parts.push(value);
+                    break;
+                }
+            }
+            if let Some(files) = args.get("files").and_then(Value::as_array) {
+                parts.push(format!("{} files", files.len()));
+            }
+            parts.join(" ")
+        }
+        "ast_grep" => format!("{} {} {}", field("action"), field("pattern"), field("lang"))
+            .trim()
+            .to_string(),
+        "evrax-graph" => {
+            let mut parts = vec![field("action")];
+            for key in ["symbol", "pattern", "path", "project"] {
+                let value = field(key);
+                if !value.is_empty() {
+                    parts.push(value);
+                    break;
+                }
+            }
+            parts.join(" ")
+        }
+        "subagent" => format!("{} {}", field("action"), field("name"))
+            .trim()
+            .to_string(),
         _ => String::new(),
     }
 }
@@ -245,6 +481,12 @@ pub async fn run(name: &str, args: &Value, ctx: &Context) -> Result<ToolOutcome,
         "write" => write(args, ctx),
         "edit" => edit(args, ctx),
         "shell" => shell(args, ctx).await,
+        "web_fetch" => web::run(args).await,
+        "todo" => todo::run(args, ctx),
+        "git" => git::run(args, ctx).await,
+        "ast_grep" => ast_grep::run(args, ctx).await,
+        "evrax-graph" => graph::run(args, ctx),
+        "subagent" => crate::subagent::run(args, ctx),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -258,15 +500,19 @@ fn arg_str(args: &Value, key: &str) -> Result<String, String> {
 
 fn read(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
     let path = ctx.classify(&arg_str(args, "path")?)?.path;
-    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+    let offset = args
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .max(1) as usize;
     let limit = args
         .get("limit")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(300)
         .min(MAX_OUTPUT_LINES);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
     let total = text.lines().count();
     let body: Vec<&str> = text.lines().skip(offset - 1).take(limit).collect();
     let mut out = String::new();
@@ -341,10 +587,7 @@ fn grep(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
     {
-        Some(raw) => Some(
-            glob::Pattern::new(raw)
-                .map_err(|e| format!("bad include glob: {e}"))?,
-        ),
+        Some(raw) => Some(glob::Pattern::new(raw).map_err(|e| format!("bad include glob: {e}"))?),
         None => None,
     };
     let mut out = String::new();
@@ -447,8 +690,8 @@ fn edit(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
     if old.is_empty() {
         return Err("`old` must not be empty".into());
     }
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
     let occurrences = text.matches(&old).count();
     if occurrences == 0 {
         return Err(format!(
@@ -501,12 +744,12 @@ async fn shell(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
-    let output = match tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await
-    {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(format!("shell error: {e}")),
-        Err(_) => return Err(format!("command killed after {secs}s timeout")),
-    };
+    let output =
+        match tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => return Err(format!("shell error: {e}")),
+            Err(_) => return Err(format!("command killed after {secs}s timeout")),
+        };
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     let err = String::from_utf8_lossy(&output.stderr).to_string();
     if !err.trim().is_empty() {
@@ -517,17 +760,33 @@ async fn shell(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
     }
     truncate(&mut text);
     let ok = output.status.success();
-    let code = output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+    let code = output
+        .status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".into());
     let detail = format!(
-        "exit {code} Â· {:.1}s\n{}",
+        "exit {code} · {:.1}s\n{}",
         started.elapsed().as_secs_f32(),
-        if text.trim().is_empty() { "(no output)" } else { text.trim_end() }
+        if text.trim().is_empty() {
+            "(no output)"
+        } else {
+            text.trim_end()
+        }
     );
-    Ok(ToolOutcome { ok, detail, diff: None })
+    Ok(ToolOutcome {
+        ok,
+        detail,
+        diff: None,
+    })
 }
 
 fn shell_program() -> &'static str {
-    if cfg!(windows) { "powershell.exe" } else { "sh" }
+    if cfg!(windows) {
+        "powershell.exe"
+    } else {
+        "sh"
+    }
 }
 
 fn shell_args(command: &str) -> Vec<&str> {
@@ -536,6 +795,54 @@ fn shell_args(command: &str) -> Vec<&str> {
     } else {
         vec!["-c", command]
     }
+}
+
+pub(super) struct CmdResult {
+    pub ok: bool,
+    pub code: String,
+    pub text: String,
+}
+
+pub(super) async fn run_command(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    secs: u64,
+) -> Result<CmdResult, String> {
+    let child = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .env("PATH", path_with_cargo())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawn {program} failed: {e}"))?;
+    let output =
+        match tokio::time::timeout(Duration::from_secs(secs), child.wait_with_output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => return Err(format!("{program} error: {e}")),
+            Err(_) => return Err(format!("{program} killed after {secs}s timeout")),
+        };
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    let err = String::from_utf8_lossy(&output.stderr).to_string();
+    if !err.trim().is_empty() {
+        if !text.trim().is_empty() {
+            text.push_str("\n[stderr]\n");
+        }
+        text.push_str(&err);
+    }
+    truncate(&mut text);
+    Ok(CmdResult {
+        ok: output.status.success(),
+        code: output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into()),
+        text,
+    })
 }
 
 /// Make sure `cargo` is reachable even when evrax was started from a shell
@@ -610,7 +917,10 @@ mod tests {
         let target = outside_target("read", &json!({"path": raw}), &c).unwrap();
         let key = approval_key("read", Some(&target));
         assert!(key.starts_with("read:"));
-        assert!(!key.contains("evrax-outside-target"), "key drops the file name: {key}");
+        assert!(
+            !key.contains("evrax-outside-target"),
+            "key drops the file name: {key}"
+        );
         assert_eq!(approval_key("shell", None), "shell");
     }
 
@@ -629,7 +939,11 @@ mod tests {
         let (_d, c) = ctx();
         write(&json!({"path":"a.txt","content":"x\nx\n"}), &c).unwrap();
         assert!(edit(&json!({"path":"a.txt","old":"x","new":"y"}), &c).is_err());
-        let ok = edit(&json!({"path":"a.txt","old":"x","new":"y","replace_all":true}), &c).unwrap();
+        let ok = edit(
+            &json!({"path":"a.txt","old":"x","new":"y","replace_all":true}),
+            &c,
+        )
+        .unwrap();
         assert!(ok.ok);
     }
 

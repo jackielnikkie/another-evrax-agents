@@ -1,0 +1,12 @@
+NOTICE
+
+evrax-graph's storage schema, node/edge taxonomy, and the per-language
+tree-sitter node-type table approach are design-derived (rewritten in Rust,
+not code-copied) from:
+
+  codebase-memory-mcp — https://github.com/DeusData/codebase-memory-mcp
+  Copyright (c) 2025 DeusData
+  Licensed under the MIT License.
+
+If you redistribute code derived from that project, include its MIT license
+text and copyright notice per its terms.

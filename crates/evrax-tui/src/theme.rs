@@ -69,15 +69,15 @@ pub const EVRAX: Theme = Theme {
     diff_rem_gutter: Color::Rgb(0x2d, 0x1f, 0x26),
     diff_ctx_gutter: Color::Rgb(0x14, 0x14, 0x14),
     diff_ctx_text: Color::Rgb(0x82, 0x8b, 0xb8),
-    md_heading: Color::Rgb(0x9d, 0x7c, 0xd8), // accent.200
-    md_strong: Color::Rgb(0xb3, 0x8f, 0xf4),  // purple.100
+    md_heading: Color::Rgb(0x9d, 0x7c, 0xd8),  // accent.200
+    md_strong: Color::Rgb(0xb3, 0x8f, 0xf4),   // purple.100
     md_emphasis: Color::Rgb(0x9d, 0x7c, 0xd8), // accent.200
-    md_quote: Color::Rgb(0x88, 0x69, 0xbd),   // purple.300
-    md_code: Color::Rgb(0xb3, 0x8f, 0xf4),    // purple.100
-    md_list: Color::Rgb(0x9d, 0x7c, 0xd8),    // accent.200
-    md_link: Color::Rgb(0x88, 0x69, 0xbd),    // purple.300
+    md_quote: Color::Rgb(0x88, 0x69, 0xbd),    // purple.300
+    md_code: Color::Rgb(0xb3, 0x8f, 0xf4),     // purple.100
+    md_list: Color::Rgb(0x9d, 0x7c, 0xd8),     // accent.200
+    md_link: Color::Rgb(0x88, 0x69, 0xbd),     // purple.300
     md_link_label: Color::Rgb(0x9d, 0x7c, 0xd8), // accent.200
-    md_rule: Color::Rgb(0x48, 0x48, 0x48),    // dim rail / rule
+    md_rule: Color::Rgb(0x48, 0x48, 0x48),     // dim rail / rule
     syn_comment: Color::Rgb(0x80, 0x80, 0x80), // muted, italic
     syn_string: Color::Rgb(0x9d, 0x7c, 0xd8),  // accent.200
     syn_number: Color::Rgb(0xb3, 0x8f, 0xf4),  // purple.100
@@ -110,15 +110,15 @@ pub const OPENCODE: Theme = Theme {
     diff_rem_gutter: Color::Rgb(0x2d, 0x1f, 0x26),
     diff_ctx_gutter: Color::Rgb(0x14, 0x14, 0x14),
     diff_ctx_text: Color::Rgb(0x82, 0x8b, 0xb8),
-    md_heading: Color::Rgb(0x9d, 0x7c, 0xd8), // accent.200
-    md_strong: Color::Rgb(0xf5, 0xa7, 0x42),  // #f5a742
+    md_heading: Color::Rgb(0x9d, 0x7c, 0xd8),  // accent.200
+    md_strong: Color::Rgb(0xf5, 0xa7, 0x42),   // #f5a742
     md_emphasis: Color::Rgb(0xe5, 0xc0, 0x7b), // #e5c07b
-    md_quote: Color::Rgb(0xe5, 0xc0, 0x7b),   // #e5c07b
-    md_code: Color::Rgb(0x7f, 0xd8, 0x8f),    // green.200
-    md_list: Color::Rgb(0xfa, 0xb2, 0x83),    // interactive.200
-    md_link: Color::Rgb(0xfa, 0xb2, 0x83),    // interactive.200
+    md_quote: Color::Rgb(0xe5, 0xc0, 0x7b),    // #e5c07b
+    md_code: Color::Rgb(0x7f, 0xd8, 0x8f),     // green.200
+    md_list: Color::Rgb(0xfa, 0xb2, 0x83),     // interactive.200
+    md_link: Color::Rgb(0xfa, 0xb2, 0x83),     // interactive.200
     md_link_label: Color::Rgb(0x56, 0xb6, 0xc2), // cyan.200
-    md_rule: Color::Rgb(0x80, 0x80, 0x80),    // neutral.400
+    md_rule: Color::Rgb(0x80, 0x80, 0x80),     // neutral.400
     syn_comment: Color::Rgb(0x80, 0x80, 0x80), // neutral.400, italic
     syn_string: Color::Rgb(0x7f, 0xd8, 0x8f),  // green.200
     syn_number: Color::Rgb(0xf5, 0xa7, 0x42),  // #f5a742
@@ -339,6 +339,7 @@ pub static THEMES: &[Theme] = &[
 ];
 
 thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
     static CURRENT: Cell<usize> = const { Cell::new(0) };
 }
 

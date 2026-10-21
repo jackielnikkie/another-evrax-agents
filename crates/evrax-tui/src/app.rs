@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use evrax_agent::catalog::Catalog;
 use evrax_core::{AgentEvent, DiffLine};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -25,9 +26,10 @@ pub struct App {
     /// Scroll bound measured while rendering the last frame. `ui::messages` fills it;
     /// the event loop reads it instead of rebuilding the whole transcript again.
     pub frame_max_scroll: u16,
-    /// Which backend is really wired up ("bebas", "mock", ...) — shown in the
+    /// Which backend is really wired up ("bebas", "mock", ...) â€” shown in the
     /// status line and the sidebar.
     pub backend_label: String,
+    pub catalog: Catalog,
     pub maximized: Option<bool>,
     pub selectable_area: Rect,
     pub selection: Selection,
@@ -416,7 +418,10 @@ pub fn title_from_prompt(prompt: &str) -> Option<String> {
     title = title
         .trim_matches(|c: char| {
             c.is_whitespace()
-                || matches!(c, '"' | '\'' | ':' | ';' | '.' | ',' | '!' | '?' | '-' | '#')
+                || matches!(
+                    c,
+                    '"' | '\'' | ':' | ';' | '.' | ',' | '!' | '?' | '-' | '#'
+                )
         })
         .to_string();
     if title.chars().count() > 48 {
@@ -424,10 +429,11 @@ pub fn title_from_prompt(prompt: &str) -> Option<String> {
         if let Some(pos) = cut.rfind(' ') {
             cut.truncate(pos);
         }
-        title = cut.trim_end_matches(|c: char| {
-            matches!(c, '"' | '\'' | ':' | ';' | '.' | ',' | '!' | '?' | '-')
-        })
-        .to_string();
+        title = cut
+            .trim_end_matches(|c: char| {
+                matches!(c, '"' | '\'' | ':' | ';' | '.' | ',' | '!' | '?' | '-')
+            })
+            .to_string();
     }
     if title.chars().count() < 2 {
         return None;
@@ -443,7 +449,12 @@ fn stage_named_copy(staged: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let name = format!("screenshot-{:02}{:02}{:02}.png", secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    let name = format!(
+        "screenshot-{:02}{:02}{:02}.png",
+        secs / 3600 % 24,
+        secs / 60 % 60,
+        secs % 60
+    );
     let dest = std::env::temp_dir().join(&name);
     if std::fs::copy(staged, &dest).is_ok() {
         dest.display().to_string()
@@ -458,8 +469,7 @@ impl Attachment {
             return None;
         }
         let data = std::fs::read(path).ok()?;
-        let (width, height) =
-            crate::image::png_dimensions(&data).unwrap_or((0, 0));
+        let (width, height) = crate::image::png_dimensions(&data).unwrap_or((0, 0));
         let name = std::path::Path::new(path)
             .file_name()
             .and_then(|n| n.to_str())
@@ -481,9 +491,9 @@ impl Attachment {
             self.name.as_str()
         };
         if self.width > 0 {
-            format!("🖼 {} ({}×{})", name, self.width, self.height)
+            format!("ðŸ–¼ {} ({}Ã—{})", name, self.width, self.height)
         } else {
-            format!("🖼 {name}")
+            format!("ðŸ–¼ {name}")
         }
     }
 }
@@ -724,6 +734,7 @@ impl App {
             viewport_height: 10,
             frame_max_scroll: 0,
             backend_label: "agent".to_string(),
+            catalog: Catalog::default(),
             maximized: None,
             selectable_area: Rect::default(),
             selection: Selection::default(),
@@ -802,7 +813,10 @@ impl App {
 
     /// Title for any known session id (falls back to the id itself).
     pub fn title_of(&self, id: &str) -> String {
-        self.titles.get(id).cloned().unwrap_or_else(|| id.to_string())
+        self.titles
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| id.to_string())
     }
 
     /// Sets a session title and mirrors it to the remote registry, if on.
@@ -827,7 +841,7 @@ impl App {
         }
     }
 
-    /// `/rename <title>` — a manual title survives later model suggestions.
+    /// `/rename <title>` â€” a manual title survives later model suggestions.
     pub fn rename_session_title(&mut self, arg: &str) {
         let title: String = arg.split_whitespace().collect::<Vec<_>>().join(" ");
         let title: String = title.chars().take(60).collect();
@@ -968,8 +982,7 @@ impl App {
         if let Some(p) = &mut self.palette {
             let v = visible.min(len) as i32;
             let step = delta.signum() * v;
-            let next = (p.selected as i32 + step)
-                .clamp(0, len as i32 - 1);
+            let next = (p.selected as i32 + step).clamp(0, len as i32 - 1);
             p.selected = next as usize;
         }
     }
@@ -1121,8 +1134,7 @@ impl App {
         if let Some(menu) = &mut self.slash {
             let v = visible.min(len) as i32;
             let step = delta.signum() * v;
-            let next = (menu.selected as i32 + step)
-                .clamp(0, len as i32 - 1);
+            let next = (menu.selected as i32 + step).clamp(0, len as i32 - 1);
             menu.selected = next as usize;
         }
     }
@@ -1180,7 +1192,7 @@ impl App {
     }
 
     pub fn session_rows(&self) -> Vec<String> {
-        let mut rows = vec!["＋ new session".to_string()];
+        let mut rows = vec!["ï¼‹ new session".to_string()];
         rows.push(format!("{} (current)", self.display_name()));
         rows.extend(
             self.sessions
@@ -1208,8 +1220,7 @@ impl App {
         if let Some(dialog) = &mut self.session_dialog {
             let v = visible.min(len) as i32;
             let step = delta.signum() * v;
-            let next = (dialog.selected as i32 + step)
-                .clamp(0, len as i32 - 1);
+            let next = (dialog.selected as i32 + step).clamp(0, len as i32 - 1);
             dialog.selected = next as usize;
         }
     }
@@ -1267,8 +1278,7 @@ impl App {
         if let Some(dialog) = &mut self.theme_dialog {
             let v = visible.min(total) as i32;
             let step = delta.signum() * v;
-            let next = (dialog.selected as i32 + step)
-                .clamp(0, total as i32 - 1);
+            let next = (dialog.selected as i32 + step).clamp(0, total as i32 - 1);
             dialog.selected = next as usize;
             theme::set_index(dialog.selected);
         }
@@ -1308,7 +1318,10 @@ impl App {
         self.slash = None;
         self.slash_dismissed = None;
         self.ensure_remote();
-        self.remote_dialog = Some(RemoteDialog { selected: 0, editing: None });
+        self.remote_dialog = Some(RemoteDialog {
+            selected: 0,
+            editing: None,
+        });
     }
 
     /// Number of rows the remote dialog shows: enabled, permit, password, bind,
@@ -1466,8 +1479,8 @@ impl App {
         vec![
             "stop tunnel".to_string(),
             "quick tunnel (trycloudflare.com)".to_string(),
-            "custom domain…".to_string(),
-            "manual url…".to_string(),
+            "custom domainâ€¦".to_string(),
+            "manual urlâ€¦".to_string(),
             "copy url".to_string(),
         ]
     }
@@ -1514,8 +1527,8 @@ impl App {
                     "off".to_string()
                 }
             }
-            TunnelStatus::Downloading => "downloading cloudflared…".to_string(),
-            TunnelStatus::Starting => format!("{short} · starting…"),
+            TunnelStatus::Downloading => "downloading cloudflaredâ€¦".to_string(),
+            TunnelStatus::Starting => format!("{short} · startingâ€¦"),
             TunnelStatus::Login { url } => format!("login cloudflare · {url}"),
             TunnelStatus::Running { url } => format!("{short} · {url}"),
             TunnelStatus::Error { message } => format!("error · {message}"),
@@ -1767,11 +1780,11 @@ impl App {
                     return;
                 }
                 state.tunnel.start_domain(port, hostname.clone());
-                self.set_flash(format!("custom domain mulai… ({hostname})"));
+                self.set_flash(format!("custom domain mulaiâ€¦ ({hostname})"));
             }
             _ => {
                 state.tunnel.start_quick(port);
-                self.set_flash("quick tunnel mulai…".to_string());
+                self.set_flash("quick tunnel mulaiâ€¦".to_string());
             }
         }
     }
@@ -1868,8 +1881,8 @@ impl App {
 
     pub fn approval_move(&mut self, delta: i16) {
         if let Some(approval) = &mut self.approval {
-            approval.selected =
-                (approval.selected as i16 + delta).rem_euclid(APPROVAL_OPTIONS.len() as i16) as usize;
+            approval.selected = (approval.selected as i16 + delta)
+                .rem_euclid(APPROVAL_OPTIONS.len() as i16) as usize;
         }
     }
 
@@ -1980,8 +1993,9 @@ impl App {
             Some((n, a)) => (n, a.trim()),
             None => (rest, ""),
         };
-        let Some((_, _, command)) =
-            slash_options().into_iter().find(|(entry, _, _)| *entry == name)
+        let Some((_, _, command)) = slash_options()
+            .into_iter()
+            .find(|(entry, _, _)| *entry == name)
         else {
             self.set_flash(format!("unknown command: /{name}"));
             return;
@@ -2150,7 +2164,7 @@ impl App {
                     name: name.clone(),
                     summary,
                     status: ToolStatus::Running,
-                    detail: "running…".to_string(),
+                    detail: "runningâ€¦".to_string(),
                 }));
                 if let Some(turn) = &remote_turn {
                     self.emit_remote(evrax_remote::RemoteEvent::Tool {
@@ -2286,7 +2300,9 @@ impl App {
             return;
         }
         let requested = {
-            let Some(server) = &self.remote_server else { return };
+            let Some(server) = &self.remote_server else {
+                return;
+            };
             let Some(session_id) = self.remote.as_ref().map(|s| s.session_id.clone()) else {
                 return;
             };
@@ -2299,7 +2315,9 @@ impl App {
                 _ => self.mode,
             };
         }
-        let Some(server) = &self.remote_server else { return };
+        let Some(server) = &self.remote_server else {
+            return;
+        };
         let Some(session_id) = self.remote.as_ref().map(|s| s.session_id.clone()) else {
             return;
         };
@@ -2461,7 +2479,11 @@ mod tests {
         ed.end();
         assert_eq!(ed.cursor_line_col(), (0, 6));
         ed.move_down();
-        assert_eq!(ed.cursor_line_col(), (1, 2), "column clamps to shorter line");
+        assert_eq!(
+            ed.cursor_line_col(),
+            (1, 2),
+            "column clamps to shorter line"
+        );
     }
 
     #[test]
@@ -2540,7 +2562,10 @@ mod tests {
         let dir = std::env::temp_dir();
         let p1 = dir.join("evrax-id-a.png");
         let p2 = dir.join("evrax-id-b.png");
-        let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1];
+        let png = [
+            0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+            0, 0, 0, 1, 0, 0, 0, 1,
+        ];
         std::fs::write(&p1, png).unwrap();
         std::fs::write(&p2, png).unwrap();
         let a = Attachment::from_path(p1.to_str().unwrap()).unwrap();
@@ -2578,7 +2603,9 @@ mod tests {
     fn last_assistant_text_returns_latest_reply() {
         let mut app = app();
         type_and_submit(&mut app, "fix it").unwrap();
-        app.apply_event(AgentEvent::TextDelta { text: "done".into() });
+        app.apply_event(AgentEvent::TextDelta {
+            text: "done".into(),
+        });
         assert_eq!(app.last_assistant_text().as_deref(), Some("done"));
     }
 
@@ -2587,12 +2614,8 @@ mod tests {
         let mut app = app();
         type_and_submit(&mut app, "fix the layout").unwrap();
         let before = app.messages.len();
-        app.apply_event(AgentEvent::TextDelta {
-            text: "Hel".into(),
-        });
-        app.apply_event(AgentEvent::TextDelta {
-            text: "lo".into(),
-        });
+        app.apply_event(AgentEvent::TextDelta { text: "Hel".into() });
+        app.apply_event(AgentEvent::TextDelta { text: "lo".into() });
         assert_eq!(app.messages.len(), before + 1);
         assert!(matches!(
             app.messages.last(),
@@ -2767,7 +2790,11 @@ mod tests {
             app.palette_type(c);
         }
         let filtered = app.filtered_commands();
-        assert_eq!(filtered.len(), 1, "'sw' should fuzzy-match only Switch mode");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "'sw' should fuzzy-match only Switch mode"
+        );
         assert_eq!(filtered[0].0, "Switch to plan mode");
     }
 
@@ -2833,7 +2860,10 @@ mod tests {
         app.slash_dismiss();
         assert!(app.slash.is_none());
         app.slash_sync();
-        assert!(app.slash.is_none(), "menu stays closed while text is unchanged");
+        assert!(
+            app.slash.is_none(),
+            "menu stays closed while text is unchanged"
+        );
         app.input.insert_char('n');
         app.slash_sync();
         assert!(app.slash.is_some(), "typing should reopen the menu");
@@ -2979,7 +3009,10 @@ mod tests {
             key: "shell".into(),
         });
         assert_eq!(app.settle_remote_approval("bogus"), None, "unknown ignored");
-        assert!(app.approval.is_some(), "unknown must not consume the dialog");
+        assert!(
+            app.approval.is_some(),
+            "unknown must not consume the dialog"
+        );
         assert_eq!(app.settle_remote_approval("reject"), Some(false));
         assert!(app.approval.is_none(), "decision consumed the dialog");
 
@@ -3069,7 +3102,10 @@ mod tests {
             Some("Refactor ui.rs sekarang juga sebelum kepecah")
         );
         assert_eq!(title_from_prompt("/new halo").as_deref(), None);
-        assert_eq!(title_from_prompt("   \n\nfix test").as_deref(), Some("fix test"));
+        assert_eq!(
+            title_from_prompt("   \n\nfix test").as_deref(),
+            Some("fix test")
+        );
         assert_eq!(title_from_prompt("a").as_deref(), None);
     }
 
@@ -3079,13 +3115,19 @@ mod tests {
         type_and_submit(&mut app, "perbaiki bug");
         app.rename_session_title("Pekerjaan Rilis v2");
         let id = app.session_id.clone();
-        assert_eq!(app.titles.get(&id).map(String::as_str), Some("Pekerjaan Rilis v2"));
+        assert_eq!(
+            app.titles.get(&id).map(String::as_str),
+            Some("Pekerjaan Rilis v2")
+        );
         assert!(app.manual_titles.contains(&id));
         app.apply_event(AgentEvent::TitleSuggested {
             session: id.clone(),
             title: "Perbaiki Bug Kecil".to_string(),
         });
-        assert_eq!(app.titles.get(&id).map(String::as_str), Some("Pekerjaan Rilis v2"));
+        assert_eq!(
+            app.titles.get(&id).map(String::as_str),
+            Some("Pekerjaan Rilis v2")
+        );
         assert_eq!(app.session_rows()[1], "Pekerjaan Rilis v2 (current)");
     }
 
@@ -3098,7 +3140,10 @@ mod tests {
             session: id.clone(),
             title: "Perbaiki Bug Streaming".to_string(),
         });
-        assert_eq!(app.titles.get(&id).map(String::as_str), Some("Perbaiki Bug Streaming"));
+        assert_eq!(
+            app.titles.get(&id).map(String::as_str),
+            Some("Perbaiki Bug Streaming")
+        );
         app.apply_event(AgentEvent::TitleSuggested {
             session: "session-hantu".to_string(),
             title: "Tidak Relevan".to_string(),
@@ -3110,8 +3155,13 @@ mod tests {
     fn turn_finished_queues_one_title_job() {
         let mut app = app();
         type_and_submit(&mut app, "perbaiki bug");
-        app.apply_event(AgentEvent::TextDelta { text: "selesai".to_string() });
-        assert!(app.take_title_job().is_none(), "belum TurnFinished, belum ada job");
+        app.apply_event(AgentEvent::TextDelta {
+            text: "selesai".to_string(),
+        });
+        assert!(
+            app.take_title_job().is_none(),
+            "belum TurnFinished, belum ada job"
+        );
         app.apply_event(AgentEvent::TurnFinished);
         let job = app.take_title_job().expect("job should be queued");
         assert_eq!(job.0, app.session_id.clone());
@@ -3125,7 +3175,9 @@ mod tests {
     fn transcript_entries_are_capped() {
         let mut app = app();
         for i in 0..600 {
-            app.apply_event(AgentEvent::TextDelta { text: format!("m{i}") });
+            app.apply_event(AgentEvent::TextDelta {
+                text: format!("m{i}"),
+            });
             app.asst_open = false;
         }
         assert!(
@@ -3153,7 +3205,8 @@ mod tests {
     }
 
     #[test]
-    fn double_escape_cancels_within_window() {        let mut app = app();
+    fn double_escape_cancels_within_window() {
+        let mut app = app();
         assert!(!app.request_cancel(), "first esc only warns");
         assert!(app.flash.is_some());
         app.tick();
@@ -3183,7 +3236,10 @@ mod tests {
         assert_eq!(p.as_deref(), Some("hai"));
         assert!(app.busy);
         assert!(matches!(app.messages.last(), Some(ChatEntry::User(t)) if t == "hai"));
-        assert!(app.submit_external_prompt("next".into()).is_none(), "busy rejects");
+        assert!(
+            app.submit_external_prompt("next".into()).is_none(),
+            "busy rejects"
+        );
     }
 
     #[test]
@@ -3197,10 +3253,10 @@ mod tests {
     fn palette_page_clamps_to_bounds() {
         let mut app = app();
         app.toggle_palette();
-        // 7 commands; page size 8 → down stays on the last row.
+        // 7 commands; page size 8 â†’ down stays on the last row.
         app.palette_page(1, 8);
         assert_eq!(app.palette.as_ref().unwrap().selected, 6);
-        // Up two pages of 8 → still on the first row.
+        // Up two pages of 8 â†’ still on the first row.
         app.palette_page(-1, 8);
         app.palette_page(-1, 8);
         assert_eq!(app.palette.as_ref().unwrap().selected, 0);
@@ -3216,7 +3272,10 @@ mod tests {
 
         app.remote_dialog.as_mut().unwrap().editing = Some("short".into());
         assert!(app.remote_edit_commit().is_err(), "min length enforced");
-        assert!(app.remote_dialog.as_ref().unwrap().editing.is_some(), "kept on error");
+        assert!(
+            app.remote_dialog.as_ref().unwrap().editing.is_some(),
+            "kept on error"
+        );
 
         app.remote_dialog.as_mut().unwrap().editing = Some("longenough".into());
         let cfg = app.remote_edit_commit().unwrap();

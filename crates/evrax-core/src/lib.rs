@@ -8,18 +8,43 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
-    ThinkingDelta { text: String },
-    ThinkingFinished { seconds: f32 },
-    TextDelta { text: String },
-    ToolStarted { name: String, summary: String },
-    ToolFinished { name: String, ok: bool, detail: String },
-    ApprovalRequested { name: String, summary: String, key: String },
-    Diff { path: String, lines: Vec<DiffLine> },
+    ThinkingDelta {
+        text: String,
+    },
+    ThinkingFinished {
+        seconds: f32,
+    },
+    TextDelta {
+        text: String,
+    },
+    ToolStarted {
+        name: String,
+        summary: String,
+    },
+    ToolFinished {
+        name: String,
+        ok: bool,
+        detail: String,
+    },
+    ApprovalRequested {
+        name: String,
+        summary: String,
+        key: String,
+    },
+    Diff {
+        path: String,
+        lines: Vec<DiffLine>,
+    },
     TurnFinished,
     /// Model-generated session title, delivered after the first turn.
-    TitleSuggested { session: String, title: String },
+    TitleSuggested {
+        session: String,
+        title: String,
+    },
     /// Informational status (iteration budget, guardrails, degraded summary).
-    Notice { message: String },
+    Notice {
+        message: String,
+    },
     /// A provider retry was scheduled before the next attempt.
     Retrying {
         attempt: u32,
@@ -28,8 +53,13 @@ pub enum AgentEvent {
         reason: String,
     },
     /// Current tool-calling iteration inside the running turn.
-    Iteration { n: usize, max: usize },
-    Failed { message: String },
+    Iteration {
+        n: usize,
+        max: usize,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -63,11 +93,7 @@ pub trait AgentBackend: Send + Sync {
 
     /// Asks the model for a short session title. Backends without a real
     /// model return `None`; the caller keeps its heuristic title.
-    fn suggest_title(
-        &self,
-        _prompt: String,
-        _reply: String,
-    ) -> BoxFuture<'static, Option<String>> {
+    fn suggest_title(&self, _prompt: String, _reply: String) -> BoxFuture<'static, Option<String>> {
         Box::pin(async { None })
     }
 }
@@ -113,35 +139,38 @@ impl AgentBackend for MockBackend {
         let pace = self.pace;
         let steps = mock_script(request.prompt);
         let state = (steps, decisions, None::<(Vec<Step>, Vec<Step>)>);
-        stream::unfold(state, move |(mut steps, mut decisions, mut branches)| async move {
-            loop {
-                if let Some((allow_steps, reject_steps)) = branches.take() {
-                    let allow = decisions.recv().await.unwrap_or(false);
-                    let chosen = if allow { allow_steps } else { reject_steps };
-                    for step in chosen.into_iter().rev() {
-                        steps.push_front(step);
+        stream::unfold(
+            state,
+            move |(mut steps, mut decisions, mut branches)| async move {
+                loop {
+                    if let Some((allow_steps, reject_steps)) = branches.take() {
+                        let allow = decisions.recv().await.unwrap_or(false);
+                        let chosen = if allow { allow_steps } else { reject_steps };
+                        for step in chosen.into_iter().rev() {
+                            steps.push_front(step);
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                let step = steps.pop_front()?;
-                if !pace.is_zero() {
-                    tokio::time::sleep(pace).await;
-                }
-                match step {
-                    Step::Event(event) => return Some((event, (steps, decisions, branches))),
-                    Step::Approval {
-                        name,
-                        summary,
-                        allow,
-                        reject,
-                    } => {
-                        let key = name.clone();
-                        let event = AgentEvent::ApprovalRequested { name, summary, key };
-                        return Some((event, (steps, decisions, Some((allow, reject)))));
+                    let step = steps.pop_front()?;
+                    if !pace.is_zero() {
+                        tokio::time::sleep(pace).await;
+                    }
+                    match step {
+                        Step::Event(event) => return Some((event, (steps, decisions, branches))),
+                        Step::Approval {
+                            name,
+                            summary,
+                            allow,
+                            reject,
+                        } => {
+                            let key = name.clone();
+                            let event = AgentEvent::ApprovalRequested { name, summary, key };
+                            return Some((event, (steps, decisions, Some((allow, reject)))));
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .boxed()
     }
 }
@@ -300,20 +329,17 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ThinkingDelta { .. }))
         );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::Diff { .. }))
-        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Diff { .. })));
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ApprovalRequested { .. }))
         );
-        assert!(!events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolFinished { ok: false, .. }
-        )));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolFinished { ok: false, .. }))
+        );
     }
 
     #[tokio::test]

@@ -31,8 +31,16 @@ mod tests {
     #[test]
     fn marks_added_and_removed_lines() {
         let lines = diff_lines("a\nb\nc\n", "a\nx\nc\n");
-        assert!(lines.iter().any(|l| l.kind == DiffKind::Add && l.text == "x"));
-        assert!(lines.iter().any(|l| l.kind == DiffKind::Rem && l.text == "b"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.kind == DiffKind::Add && l.text == "x")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.kind == DiffKind::Rem && l.text == "b")
+        );
     }
 
     #[test]

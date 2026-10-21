@@ -44,7 +44,13 @@ impl Guard {
 
     /// Records one executed call. Returns a stub when the result is a
     /// byte-identical repeat of a large earlier result for the same call.
-    pub fn observe(&mut self, name: &str, raw_args: &str, ok: bool, result: &str) -> Option<String> {
+    pub fn observe(
+        &mut self,
+        name: &str,
+        raw_args: &str,
+        ok: bool,
+        result: &str,
+    ) -> Option<String> {
         self.calls += 1;
         let signature = signature(name, raw_args);
         let hash = fnv1a(result.as_bytes());
@@ -147,9 +153,11 @@ mod tests {
     fn large_identical_results_collapse_to_stub() {
         let mut guard = Guard::default();
         let result = "x".repeat(600);
-        assert!(guard
-            .observe("read", r#"{"path":"a.txt"}"#, true, &result)
-            .is_none());
+        assert!(
+            guard
+                .observe("read", r#"{"path":"a.txt"}"#, true, &result)
+                .is_none()
+        );
         let stub = guard
             .observe("read", r#"{ "path": "a.txt" }"#, true, &result)
             .expect("second identical result should be stubbed");
@@ -160,7 +168,11 @@ mod tests {
     fn repeated_identical_results_raise_one_notice() {
         let mut guard = Guard::default();
         for _ in 0..IDENTICAL_NOTICE_STREAK {
-            assert!(guard.observe("list", r#"{"pattern":"."}"#, true, "same").is_none());
+            assert!(
+                guard
+                    .observe("list", r#"{"pattern":"."}"#, true, "same")
+                    .is_none()
+            );
         }
         let notice = guard.take_notice().expect("streak notice");
         assert!(notice.contains("hasil identik"), "{notice}");
@@ -174,7 +186,9 @@ mod tests {
         for _ in 0..FAILURE_BLOCK_THRESHOLD {
             guard.observe("read", args, false, "error: not found");
         }
-        let block = guard.blocked("read", args).expect("blocked after 3 failures");
+        let block = guard
+            .blocked("read", args)
+            .expect("blocked after 3 failures");
         assert!(block.contains("ubah strategi"), "{block}");
         assert!(guard.blocked("read", r#"{"path":"other.txt"}"#).is_none());
     }

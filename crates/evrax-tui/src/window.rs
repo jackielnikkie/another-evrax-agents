@@ -113,8 +113,7 @@ fn class_name(window: win::Handle) -> Option<String> {
 fn rect_covers_area(rect: win::Rect, work: win::Rect, monitor: win::Rect) -> bool {
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
-    let work_matches =
-        width + 8 >= work.right - work.left && height + 8 >= work.bottom - work.top;
+    let work_matches = width + 8 >= work.right - work.left && height + 8 >= work.bottom - work.top;
     let monitor_matches =
         width + 8 >= monitor.right - monitor.left && height + 8 >= monitor.bottom - monitor.top;
     work_matches || monitor_matches

@@ -208,7 +208,11 @@ pub fn inline(text: &str) -> Vec<Seg> {
             continue;
         }
         if rest.starts_with('_')
-            && (i == 0 || !text[..i].chars().next_back().is_some_and(|c| c.is_alphanumeric()))
+            && (i == 0
+                || !text[..i]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric()))
             && let Some(rest) = rest.strip_prefix('_')
             && let Some(end) = italic_close(rest, b'_')
         {
@@ -265,15 +269,95 @@ fn italic_close(text: &str, marker: u8) -> Option<usize> {
 }
 
 const KEYWORDS: &[&str] = &[
-    "fn", "function", "let", "const", "var", "mut", "pub", "use", "struct", "enum", "impl",
-    "trait", "for", "while", "loop", "if", "else", "match", "return", "break", "continue", "in",
-    "as", "async", "await", "move", "self", "Self", "crate", "super", "mod", "static", "ref",
-    "where", "dyn", "unsafe", "type", "def", "class", "import", "from", "export", "default",
-    "new", "try", "except", "catch", "finally", "raise", "throw", "with", "lambda", "pass",
-    "elif", "then", "fi", "do", "done", "esac", "case", "local", "echo", "yield", "global",
-    "nonlocal", "del", "not", "and", "or", "is", "interface", "extends", "implements", "package",
-    "void", "go", "defer", "chan", "select", "range", "nil", "None", "True", "False",
-    "true", "false", "null", "undefined", "this",
+    "fn",
+    "function",
+    "let",
+    "const",
+    "var",
+    "mut",
+    "pub",
+    "use",
+    "struct",
+    "enum",
+    "impl",
+    "trait",
+    "for",
+    "while",
+    "loop",
+    "if",
+    "else",
+    "match",
+    "return",
+    "break",
+    "continue",
+    "in",
+    "as",
+    "async",
+    "await",
+    "move",
+    "self",
+    "Self",
+    "crate",
+    "super",
+    "mod",
+    "static",
+    "ref",
+    "where",
+    "dyn",
+    "unsafe",
+    "type",
+    "def",
+    "class",
+    "import",
+    "from",
+    "export",
+    "default",
+    "new",
+    "try",
+    "except",
+    "catch",
+    "finally",
+    "raise",
+    "throw",
+    "with",
+    "lambda",
+    "pass",
+    "elif",
+    "then",
+    "fi",
+    "do",
+    "done",
+    "esac",
+    "case",
+    "local",
+    "echo",
+    "yield",
+    "global",
+    "nonlocal",
+    "del",
+    "not",
+    "and",
+    "or",
+    "is",
+    "interface",
+    "extends",
+    "implements",
+    "package",
+    "void",
+    "go",
+    "defer",
+    "chan",
+    "select",
+    "range",
+    "nil",
+    "None",
+    "True",
+    "False",
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "this",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -427,15 +511,25 @@ pub fn style_of(style: SegStyle) -> Style {
             .fg(current().md_heading)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         SegStyle::Bold => base.fg(current().md_strong).add_modifier(Modifier::BOLD),
-        SegStyle::Italic => base.fg(current().md_emphasis).add_modifier(Modifier::ITALIC),
+        SegStyle::Italic => base
+            .fg(current().md_emphasis)
+            .add_modifier(Modifier::ITALIC),
         SegStyle::Quote => base.fg(current().md_quote).add_modifier(Modifier::ITALIC),
         SegStyle::Code => base.fg(current().md_code),
-        SegStyle::Link => base.fg(current().md_link).add_modifier(Modifier::UNDERLINED),
-        SegStyle::LinkLabel => base.fg(current().md_link_label).add_modifier(Modifier::UNDERLINED),
-        SegStyle::SynComment => base.fg(current().syn_comment).add_modifier(Modifier::ITALIC),
+        SegStyle::Link => base
+            .fg(current().md_link)
+            .add_modifier(Modifier::UNDERLINED),
+        SegStyle::LinkLabel => base
+            .fg(current().md_link_label)
+            .add_modifier(Modifier::UNDERLINED),
+        SegStyle::SynComment => base
+            .fg(current().syn_comment)
+            .add_modifier(Modifier::ITALIC),
         SegStyle::SynString => base.fg(current().syn_string),
         SegStyle::SynNumber => base.fg(current().syn_number),
-        SegStyle::SynKeyword => base.fg(current().syn_keyword).add_modifier(Modifier::ITALIC),
+        SegStyle::SynKeyword => base
+            .fg(current().syn_keyword)
+            .add_modifier(Modifier::ITALIC),
         SegStyle::SynFunction => base.fg(current().syn_function),
         SegStyle::SynType => base.fg(current().syn_type),
         SegStyle::SynVariable => base.fg(current().syn_variable),
@@ -485,7 +579,10 @@ pub fn wrap_segs(
                 let ch_width = ch.width().unwrap_or(0);
                 if chunk_width + ch_width > width && chunk_width > 0 {
                     finish(
-                        vec![Span::styled(std::mem::take(&mut chunk), style_of(word.style))],
+                        vec![Span::styled(
+                            std::mem::take(&mut chunk),
+                            style_of(word.style),
+                        )],
                         &mut out,
                     );
                     chunk_width = 0;

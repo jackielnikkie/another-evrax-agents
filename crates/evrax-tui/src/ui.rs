@@ -22,7 +22,10 @@ const APPROVAL_PANEL_HEIGHT: u16 = 4;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    frame.render_widget(WidgetBlock::default().style(Style::default().bg(current().base)), area);
+    frame.render_widget(
+        WidgetBlock::default().style(Style::default().bg(current().base)),
+        area,
+    );
 
     let rows = Layout::vertical([
         Constraint::Length(1),
@@ -45,7 +48,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn sidebar_visible(app: &App, width: u16) -> bool {
-    width >= SIDEBAR_MIN_TOTAL_WIDTH && app.maximized.unwrap_or(true)
+    !app.messages.is_empty() && width >= SIDEBAR_MIN_TOTAL_WIDTH && app.maximized.unwrap_or(true)
 }
 
 fn apply_selection(frame: &mut Frame, app: &mut App) {
@@ -122,14 +125,19 @@ fn header(frame: &mut Frame, area: Rect) {
     let line = Line::from(vec![
         Span::styled(
             " evrax",
-            Style::default().fg(current().accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(current().accent)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("  v{}", env!("CARGO_PKG_VERSION")),
             Style::default().fg(current().muted),
         ),
     ]);
-    frame.render_widget(Paragraph::new(line).style(Style::default().bg(current().base)), area);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(current().base)),
+        area,
+    );
 }
 
 fn body(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
@@ -177,12 +185,21 @@ fn chat(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
 }
 
 fn messages(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.messages.is_empty() {
+        crate::welcome::render(frame, area, app);
+        app.frame_max_scroll = 0;
+        return;
+    }
     // Per-entry line cache: only the tail entry (streaming text, running tool)
     // is rebuilt per frame, so render cost stays flat as the transcript grows.
     let (content_height, offset, visible) = {
-        let lines = app
-            .transcript
-            .sync(&app.messages, app.tick, app.content_rev, area.width, crate::theme::index());
+        let lines = app.transcript.sync(
+            &app.messages,
+            app.tick,
+            app.content_rev,
+            area.width,
+            crate::theme::index(),
+        );
         let max_scroll = lines.len().saturating_sub(area.height as usize) as u16;
         let offset = max_scroll.saturating_sub(app.scroll_from_bottom);
         let end = (offset as usize + area.height as usize + 1).min(lines.len());
@@ -334,11 +351,15 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
                     let mut spans = vec![
                         Span::styled(
                             head,
-                            Style::default().fg(current().muted).add_modifier(Modifier::ITALIC),
+                            Style::default()
+                                .fg(current().muted)
+                                .add_modifier(Modifier::ITALIC),
                         ),
                         Span::styled(
                             raw,
-                            Style::default().fg(current().muted).add_modifier(Modifier::ITALIC),
+                            Style::default()
+                                .fg(current().muted)
+                                .add_modifier(Modifier::ITALIC),
                         ),
                     ];
                     if i == last {
@@ -360,7 +381,9 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
                     Span::styled(format!("   {glyph} "), Style::default().fg(color)),
                     Span::styled(
                         format!("{}  ", tool.name),
-                        Style::default().fg(current().text).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(current().text)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(tool.summary.clone(), Style::default().fg(current().muted)),
                 ]));
@@ -386,11 +409,15 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
                     Span::styled("   ", Style::default()),
                     Span::styled(
                         "│ ",
-                        Style::default().fg(current().border).bg(current().diff_ctx_gutter),
+                        Style::default()
+                            .fg(current().border)
+                            .bg(current().diff_ctx_gutter),
                     ),
                     Span::styled(
                         shown.clone(),
-                        Style::default().fg(current().muted).bg(current().diff_ctx_gutter),
+                        Style::default()
+                            .fg(current().muted)
+                            .bg(current().diff_ctx_gutter),
                     ),
                 ];
                 let header_used = 5 + shown.width();
@@ -403,8 +430,18 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
                 lines.push(Line::from(header));
                 for line in diff {
                     let (sign, sign_color, content_bg, gutter_bg) = match line.kind {
-                        DiffKind::Add => ("+", current().diff_add, current().diff_add_bg, current().diff_add_gutter),
-                        DiffKind::Rem => ("-", current().diff_rem, current().diff_rem_bg, current().diff_rem_gutter),
+                        DiffKind::Add => (
+                            "+",
+                            current().diff_add,
+                            current().diff_add_bg,
+                            current().diff_add_gutter,
+                        ),
+                        DiffKind::Rem => (
+                            "-",
+                            current().diff_rem,
+                            current().diff_rem_bg,
+                            current().diff_rem_gutter,
+                        ),
                         DiffKind::Ctx => {
                             for raw in wrap_text(&line.text, width.saturating_sub(7).max(1)) {
                                 lines.push(Line::from(vec![
@@ -416,10 +453,7 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
                                             .bg(current().diff_ctx_gutter),
                                     ),
                                     Span::styled("  ", Style::default().fg(current().muted)),
-                                    Span::styled(
-                                        raw,
-                                        Style::default().fg(current().diff_ctx_text),
-                                    ),
+                                    Span::styled(raw, Style::default().fg(current().diff_ctx_text)),
                                 ]));
                             }
                             continue;
@@ -428,10 +462,7 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
                     for raw in wrap_text(&line.text, width.saturating_sub(7).max(1)) {
                         let mut spans = vec![
                             Span::styled("   ", Style::default()),
-                            Span::styled(
-                                "┊ ",
-                                Style::default().fg(current().border).bg(gutter_bg),
-                            ),
+                            Span::styled("┊ ", Style::default().fg(current().border).bg(gutter_bg)),
                             Span::styled(
                                 format!("{sign} "),
                                 Style::default().fg(sign_color).bg(content_bg),
@@ -484,7 +515,11 @@ fn needs_gap(prev: BlockKind, current: BlockKind) -> bool {
         BlockKind::List => prev != BlockKind::List,
         BlockKind::Paragraph => matches!(
             prev,
-            BlockKind::Heading | BlockKind::List | BlockKind::Quote | BlockKind::Code | BlockKind::Rule
+            BlockKind::Heading
+                | BlockKind::List
+                | BlockKind::Quote
+                | BlockKind::Code
+                | BlockKind::Rule
         ),
     }
 }
@@ -550,11 +585,7 @@ fn markdown_lines(text: &str, width: usize) -> Vec<Line<'static>> {
                         markdown::Block::Bullet(segs) => ("-".to_string(), segs),
                         _ => unreachable!(),
                     };
-                    let lead = format!(
-                        "   {:>width$} ",
-                        marker,
-                        width = marker_width
-                    );
+                    let lead = format!("   {:>width$} ", marker, width = marker_width);
                     let cont = " ".repeat(3 + marker_width + 1);
                     out.extend(markdown::wrap_segs(
                         segs,
@@ -590,11 +621,9 @@ fn markdown_lines(text: &str, width: usize) -> Vec<Line<'static>> {
                     }
                     for chunk in chunk_segs(&markdown::highlight(lang, code_line), inner) {
                         let mut spans = vec![Span::styled("   ", Style::default())];
-                        spans.extend(
-                            chunk
-                                .iter()
-                                .map(|seg| Span::styled(seg.text.clone(), markdown::style_of(seg.style))),
-                        );
+                        spans.extend(chunk.iter().map(|seg| {
+                            Span::styled(seg.text.clone(), markdown::style_of(seg.style))
+                        }));
                         out.push(Line::from(spans));
                     }
                 }
@@ -742,7 +771,10 @@ fn input(frame: &mut Frame, area: Rect, app: &mut App) {
                 format!("{} ", spinner(app.tick)),
                 Style::default().fg(current().interactive),
             ),
-            Span::styled("streaming…  esc to cancel", Style::default().fg(current().muted)),
+            Span::styled(
+                "streaming…  esc to cancel",
+                Style::default().fg(current().muted),
+            ),
         ]);
         frame.render_widget(Paragraph::new(line), inner);
         return;
@@ -863,7 +895,9 @@ fn render_attachment_chips(frame: &mut Frame, inner: Rect, app: &mut App) -> u16
         };
         frame.render_widget(Clear, row);
         let label = attachment.label();
-        let style = Style::default().fg(current().interactive).bg(current().raised);
+        let style = Style::default()
+            .fg(current().interactive)
+            .bg(current().raised);
         let pad = (inner.width as usize)
             .saturating_sub(label.width() + 2)
             .saturating_sub(1);
@@ -913,7 +947,10 @@ fn sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let block = WidgetBlock::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(current().border))
-        .title(Span::styled(" sessions ", Style::default().fg(current().muted)))
+        .title(Span::styled(
+            " sessions ",
+            Style::default().fg(current().muted),
+        ))
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -940,11 +977,16 @@ fn sidebar(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(" ctrl+o", Style::default().fg(current().muted)),
         ]),
         Line::from(""),
-        Line::from(Span::styled(separator, Style::default().fg(current().border))),
+        Line::from(Span::styled(
+            separator,
+            Style::default().fg(current().border),
+        )),
         Line::from(""),
         Line::from(Span::styled(
             "shortcuts",
-            Style::default().fg(current().text).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(current().text)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             "  esc      cancel turn",
@@ -1001,18 +1043,25 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
     };
     if let Some((text, _)) = &app.flash {
         spans.push(Span::styled("  ·  ", Style::default().fg(current().border)));
-        spans.push(Span::styled(text.clone(), Style::default().fg(current().success)));
+        spans.push(Span::styled(
+            text.clone(),
+            Style::default().fg(current().success),
+        ));
     }
     let hint = Line::from(spans);
 
     let cwd = format!(" {} ", shorten_path(&app.cwd, 40));
     let cwd_width = (cwd.chars().count() as u16).min(area.width);
-    let columns = Layout::horizontal([Constraint::Min(0), Constraint::Length(cwd_width)]).split(area);
+    let columns =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(cwd_width)]).split(area);
 
     frame.render_widget(Paragraph::new(hint), columns[0]);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(cwd, Style::default().fg(current().muted))))
-            .alignment(Alignment::Right),
+        Paragraph::new(Line::from(Span::styled(
+            cwd,
+            Style::default().fg(current().muted),
+        )))
+        .alignment(Alignment::Right),
         columns[1],
     );
 }
@@ -1034,7 +1083,10 @@ fn modal(frame: &mut Frame, title: &str, width: u16, height: u16) -> Option<Rect
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(current().border))
         .style(Style::default().bg(current().raised))
-        .title(Span::styled(format!(" {title} "), Style::default().fg(current().muted)));
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(current().muted),
+        ));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     (inner.width >= 4 && inner.height >= 1).then_some(inner)
@@ -1080,8 +1132,16 @@ fn theme_row(inner: Rect, idx: usize, selected: bool) -> Line<'static> {
     let theme = &crate::theme::THEMES[idx];
     let label = format!(" {}", theme.label);
     let pad = (inner.width as usize).saturating_sub(label.width() + 2);
-    let bg = if selected { current().selection } else { current().raised };
-    let fg = if selected { current().text } else { current().muted };
+    let bg = if selected {
+        current().selection
+    } else {
+        current().raised
+    };
+    let fg = if selected {
+        current().text
+    } else {
+        current().muted
+    };
     Line::from(vec![
         Span::styled("●", Style::default().fg(theme.accent).bg(bg)),
         Span::styled("●", Style::default().fg(theme.interactive).bg(bg)),
@@ -1112,8 +1172,14 @@ fn palette(frame: &mut Frame, app: &App) {
     let (offset, visible) = dialog_window(entries.len(), selected, list_capacity);
 
     let query_line = Line::from(vec![
-        Span::styled("› ", Style::default().fg(current().accent).bg(current().raised)),
-        Span::styled(state.query.clone(), Style::default().fg(current().text).bg(current().raised)),
+        Span::styled(
+            "› ",
+            Style::default().fg(current().accent).bg(current().raised),
+        ),
+        Span::styled(
+            state.query.clone(),
+            Style::default().fg(current().text).bg(current().raised),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(query_line),
@@ -1147,9 +1213,7 @@ fn palette(frame: &mut Frame, app: &App) {
         .skip(offset)
         .take(visible)
         .enumerate()
-        .map(|(i, (label, _))| {
-            modal_row(inner, label, (i + offset) == selected)
-        })
+        .map(|(i, (label, _))| modal_row(inner, label, (i + offset) == selected))
         .collect();
     let list_h = visible as u16;
     frame.render_widget(
@@ -1172,7 +1236,10 @@ fn slash_menu(frame: &mut Frame, area: Rect, composer_top: u16, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(current().border))
         .style(Style::default().bg(current().raised))
-        .title(Span::styled(" commands ", Style::default().fg(current().muted)));
+        .title(Span::styled(
+            " commands ",
+            Style::default().fg(current().muted),
+        ));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     if inner.width < 4 {
@@ -1203,7 +1270,11 @@ fn slash_menu(frame: &mut Frame, area: Rect, composer_top: u16, app: &App) {
 }
 
 fn slash_row(inner: Rect, name: &str, description: &str, selected: bool) -> Line<'static> {
-    let bg = if selected { current().selection } else { current().raised };
+    let bg = if selected {
+        current().selection
+    } else {
+        current().raised
+    };
     let label = format!(" /{name}");
     let label_pad = 18usize.saturating_sub(label.width());
     let used = label.width() + label_pad + 1 + description.width();
@@ -1212,11 +1283,18 @@ fn slash_row(inner: Rect, name: &str, description: &str, selected: bool) -> Line
         Span::styled(
             format!("{label}{}", " ".repeat(label_pad)),
             Style::default()
-                .fg(if selected { current().text } else { current().interactive })
+                .fg(if selected {
+                    current().text
+                } else {
+                    current().interactive
+                })
                 .bg(bg),
         ),
         Span::styled(" ", Style::default().bg(bg)),
-        Span::styled(description.to_string(), Style::default().fg(current().muted).bg(bg)),
+        Span::styled(
+            description.to_string(),
+            Style::default().fg(current().muted).bg(bg),
+        ),
         Span::styled(" ".repeat(pad), Style::default().bg(bg)),
     ])
 }
@@ -1242,8 +1320,16 @@ fn approval_panel(frame: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::from(vec![
             bar(current().raised),
-            Span::styled(" △ ", Style::default().fg(current().interactive).bg(current().raised)),
-            Span::styled("Permission required", Style::default().fg(current().text).bg(current().raised)),
+            Span::styled(
+                " △ ",
+                Style::default()
+                    .fg(current().interactive)
+                    .bg(current().raised),
+            ),
+            Span::styled(
+                "Permission required",
+                Style::default().fg(current().text).bg(current().raised),
+            ),
         ]),
         Line::from(vec![
             bar(current().raised),
@@ -1265,7 +1351,10 @@ fn approval_panel(frame: &mut Frame, area: Rect, app: &App) {
 
     let footer_rect = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
     let mut spans = vec![
-        Span::styled("▌", Style::default().fg(current().accent).bg(current().base)),
+        Span::styled(
+            "▌",
+            Style::default().fg(current().accent).bg(current().base),
+        ),
         Span::styled(" ", Style::default().bg(current().base)),
     ];
     for (i, label) in APPROVAL_OPTIONS.iter().enumerate() {
@@ -1273,20 +1362,34 @@ fn approval_panel(frame: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(" ", Style::default().bg(current().base)));
         }
         spans.push(if i == approval.selected {
-            Span::styled(format!(" {label} "), Style::default().fg(current().base).bg(current().accent))
+            Span::styled(
+                format!(" {label} "),
+                Style::default().fg(current().base).bg(current().accent),
+            )
         } else {
             Span::styled(
                 format!(" {label} "),
-                Style::default().fg(current().accent).bg(current().action_dim),
+                Style::default()
+                    .fg(current().accent)
+                    .bg(current().action_dim),
             )
         });
     }
     let hints = vec![
         Span::styled("⇆ ", Style::default().fg(current().text).bg(current().base)),
-        Span::styled("select", Style::default().fg(current().muted).bg(current().base)),
+        Span::styled(
+            "select",
+            Style::default().fg(current().muted).bg(current().base),
+        ),
         Span::styled("  ", Style::default().bg(current().base)),
-        Span::styled("enter ", Style::default().fg(current().text).bg(current().base)),
-        Span::styled("confirm", Style::default().fg(current().muted).bg(current().base)),
+        Span::styled(
+            "enter ",
+            Style::default().fg(current().text).bg(current().base),
+        ),
+        Span::styled(
+            "confirm",
+            Style::default().fg(current().muted).bg(current().base),
+        ),
     ];
     let used: usize = spans
         .iter()
@@ -1294,7 +1397,10 @@ fn approval_panel(frame: &mut Frame, area: Rect, app: &App) {
         .map(|span| span.content.width())
         .sum();
     let pad = (area.width as usize).saturating_sub(used);
-    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(current().base)));
+    spans.push(Span::styled(
+        " ".repeat(pad),
+        Style::default().bg(current().base),
+    ));
     spans.extend(hints);
     frame.render_widget(Paragraph::new(Line::from(spans)), footer_rect);
 }
@@ -1305,7 +1411,9 @@ fn session_modal(frame: &mut Frame, app: &App) {
     };
     let rows = app.session_rows();
     let total = rows.len().max(1) as u16;
-    let cap = total.min(crate::app::DIALOG_PAGE as u16).min(frame.area().height);
+    let cap = total
+        .min(crate::app::DIALOG_PAGE as u16)
+        .min(frame.area().height);
     let Some(inner) = modal(frame, "sessions", 52, cap + 2) else {
         return;
     };
@@ -1325,11 +1433,17 @@ fn theme_modal(frame: &mut Frame, app: &App) {
         return;
     };
     let total = crate::theme::count();
-    let cap = (total as u16).min(crate::app::DIALOG_PAGE as u16).min(frame.area().height);
+    let cap = (total as u16)
+        .min(crate::app::DIALOG_PAGE as u16)
+        .min(frame.area().height);
     let Some(inner) = modal(frame, "themes", 44, cap + 3) else {
         return;
     };
-    let (offset, visible) = dialog_window(total, dialog.selected, inner.height.saturating_sub(1) as usize);
+    let (offset, visible) = dialog_window(
+        total,
+        dialog.selected,
+        inner.height.saturating_sub(1) as usize,
+    );
     let mut list: Vec<Line> = (0..total)
         .skip(offset)
         .take(visible)
@@ -1459,7 +1573,9 @@ fn tunnel_modal(frame: &mut Frame, app: &mut App) {
         )),
     }
     let hint = match (editing.is_some(), kind) {
-        (true, TunnelEditKind::Hostname) => "paste hostname (domain di akun cloudflare) · enter run · esc cancel",
+        (true, TunnelEditKind::Hostname) => {
+            "paste hostname (domain di akun cloudflare) · enter run · esc cancel"
+        }
         (true, TunnelEditKind::ManualUrl) => "paste url · enter save · esc cancel · empty clears",
         (false, _) => "enter: start/stop · click url: copy · esc close",
     };
@@ -1631,11 +1747,29 @@ mod tests {
     }
 
     #[test]
+    fn empty_chat_shows_faust_banner() {
+        let text = render_text(100, 40);
+        assert!(
+            text.contains("E V R A X"),
+            "banner wordmark missing:\n{text}"
+        );
+        assert!(
+            text.contains("FAUST55"),
+            "banner signature missing:\n{text}"
+        );
+    }
+
+    #[test]
     fn renders_brand_sidebar_and_hints() {
-        let text = render_text(110, 28);
+        let mut app = App::new();
+        app.messages.push(ChatEntry::User("hi".to_string()));
+        let text = render_text_with(&mut app, 110, 28);
         assert!(text.contains("evrax"), "brand missing:\n{text}");
         assert!(text.contains("sessions"), "sidebar missing:\n{text}");
-        assert!(text.contains("new session"), "sidebar action missing:\n{text}");
+        assert!(
+            text.contains("new session"),
+            "sidebar action missing:\n{text}"
+        );
         assert!(text.contains("Ask anything"), "input missing:\n{text}");
         assert!(text.contains("quit"), "footer hint missing:\n{text}");
     }
@@ -1679,7 +1813,10 @@ mod tests {
         for _ in 0..6 {
             app.remote_move(1);
             let row = app.remote_dialog.as_ref().unwrap().selected;
-            assert!(!app.remote_row_is_info(row), "cursor landed on info row {row}");
+            assert!(
+                !app.remote_row_is_info(row),
+                "cursor landed on info row {row}"
+            );
         }
     }
 
@@ -1714,11 +1851,21 @@ mod tests {
 
     #[test]
     fn hides_sidebar_on_narrow_terminal() {
-        let text = render_text(100, 20);
-        assert!(!text.contains("sessions"), "sidebar should hide at 100 cols:\n{text}");
+        let mut app = App::new();
+        app.messages.push(ChatEntry::User("hi".to_string()));
+        let text = render_text_with(&mut app, 100, 20);
+        assert!(
+            !text.contains("sessions"),
+            "sidebar should hide at 100 cols:\n{text}"
+        );
         assert!(text.contains("Ask anything"), "input missing:\n{text}");
-        let wide = render_text(110, 20);
-        assert!(wide.contains("sessions"), "sidebar should show at 110 cols:\n{wide}");
+        let mut app = App::new();
+        app.messages.push(ChatEntry::User("hi".to_string()));
+        let wide = render_text_with(&mut app, 110, 20);
+        assert!(
+            wide.contains("sessions"),
+            "sidebar should show at 110 cols:\n{wide}"
+        );
     }
 
     #[test]
@@ -1743,9 +1890,15 @@ mod tests {
         }
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("fix the failing test"), "input missing:\n{text}");
+        assert!(
+            text.contains("fix the failing test"),
+            "input missing:\n{text}"
+        );
         let footer = text.lines().last().unwrap_or_default().to_string();
-        assert!(!footer.contains("enter"), "send hint should be gone:\n{footer}");
+        assert!(
+            !footer.contains("enter"),
+            "send hint should be gone:\n{footer}"
+        );
     }
 
     #[test]
@@ -1760,13 +1913,22 @@ mod tests {
             !footer.contains("ctrl+p"),
             "ctrl+p hint should be gone:\n{footer}"
         );
-        assert!(!footer.contains("send"), "send hint still present:\n{footer}");
-        assert!(!footer.contains("drag"), "drag hint still present:\n{footer}");
+        assert!(
+            !footer.contains("send"),
+            "send hint still present:\n{footer}"
+        );
+        assert!(
+            !footer.contains("drag"),
+            "drag hint still present:\n{footer}"
+        );
         assert!(
             !footer.contains("shift+tab"),
             "mode hint still present:\n{footer}"
         );
-        assert!(!footer.contains("quit"), "quit hint still present:\n{footer}");
+        assert!(
+            !footer.contains("quit"),
+            "quit hint still present:\n{footer}"
+        );
         assert!(
             !footer.contains("copy reply"),
             "copy hint still present:\n{footer}"
@@ -1788,7 +1950,10 @@ mod tests {
             app.palette_type(c);
         }
         let text = render_text_with(&mut app, 100, 30);
-        assert!(text.contains("Quit evrax"), "filtered list missing:\n{text}");
+        assert!(
+            text.contains("Quit evrax"),
+            "filtered list missing:\n{text}"
+        );
         assert!(
             !text.contains("New session"),
             "filter should hide other commands:\n{text}"
@@ -1814,7 +1979,10 @@ mod tests {
             text.contains("start a new session"),
             "description missing:\n{text}"
         );
-        assert!(text.contains("/sessions"), "session aliases missing:\n{text}");
+        assert!(
+            text.contains("/sessions"),
+            "session aliases missing:\n{text}"
+        );
         let rows: Vec<&str> = text.lines().collect();
         let menu_row = rows
             .iter()
@@ -1834,7 +2002,10 @@ mod tests {
         let text = render_text_with(&mut app, 100, 30);
         assert!(text.contains("themes"), "title missing:\n{text}");
         assert!(text.contains("evrax"), "evrax option missing:\n{text}");
-        assert!(text.contains("opencode"), "opencode option missing:\n{text}");
+        assert!(
+            text.contains("opencode"),
+            "opencode option missing:\n{text}"
+        );
         assert!(text.contains("dracula"), "dracula option missing:\n{text}");
         app.theme_close();
     }
@@ -1897,7 +2068,10 @@ mod tests {
             key: "edit".into(),
         });
         let text = render_text_with(&mut app, 100, 30);
-        assert!(text.contains("Permission required"), "header missing:\n{text}");
+        assert!(
+            text.contains("Permission required"),
+            "header missing:\n{text}"
+        );
         assert!(text.contains("edit"), "tool name missing:\n{text}");
         let rows: Vec<&str> = text.lines().collect();
         let option_row = rows
@@ -1942,7 +2116,10 @@ mod tests {
             text.contains("perbaiki streaming sse"),
             "titled session missing:\n{text}"
         );
-        assert!(text.contains("new session"), "new session row missing:\n{text}");
+        assert!(
+            text.contains("new session"),
+            "new session row missing:\n{text}"
+        );
     }
 
     #[test]
@@ -1954,7 +2131,10 @@ mod tests {
         let mut entries = vec![ChatEntry::User("hai bos".to_string())];
         let out = cache.sync(&entries, 0, 1, 80, theme).clone();
         assert_eq!(out, conversation_lines(&entries, 0, 80));
-        assert_eq!(cache.rebuilds, 1, "growth from empty must extend, not rebuild");
+        assert_eq!(
+            cache.rebuilds, 1,
+            "growth from empty must extend, not rebuild"
+        );
         assert_eq!(out.first().unwrap().width(), 0);
         entries.push(ChatEntry::Assistant("sip".to_string()));
         let out = cache.sync(&entries, 0, 2, 80, theme).clone();
@@ -1975,7 +2155,10 @@ mod tests {
         }
         cache.sync(&entries, 3, 0, 80, theme);
         assert_eq!(cache.rebuilds, 1, "same content must not rebuild");
-        assert_eq!(cache.tail_rebuilds, 1, "same tick+rev must not rebuild the tail");
+        assert_eq!(
+            cache.tail_rebuilds, 1,
+            "same tick+rev must not rebuild the tail"
+        );
         let mut grown = sample_conversation();
         grown.push(ChatEntry::Assistant("tambahan baru".to_string()));
         let out = cache.sync(&grown, 3, 1, 80, theme).clone();
@@ -2078,6 +2261,7 @@ mod tests {
     #[test]
     fn sidebar_requires_maximized_window() {
         let mut app = App::new();
+        app.messages.push(ChatEntry::User("hi".to_string()));
         app.maximized = Some(false);
         let windowed = render_text_with(&mut app, 140, 28);
         assert!(
@@ -2091,6 +2275,7 @@ mod tests {
             "maximized should show sidebar:\n{maximized}"
         );
         let mut narrow = App::new();
+        narrow.messages.push(ChatEntry::User("hi".to_string()));
         narrow.maximized = Some(true);
         let narrow_text = render_text_with(&mut narrow, 100, 28);
         assert!(
@@ -2132,7 +2317,10 @@ mod tests {
         app.selection.finish();
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let copied = app.copied_text.take().expect("copy request should fill text");
+        let copied = app
+            .copied_text
+            .take()
+            .expect("copy request should fill text");
         assert_eq!(copied, "hello");
         assert!(app.flash.is_some(), "flash should announce copy");
     }
@@ -2183,8 +2371,8 @@ mod tests {
         ));
         let text = render_text_with(&mut app, 40, 24);
         let words = [
-            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota",
-            "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi",
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+            "lambda", "mu", "nu", "xi", "omicron", "pi",
         ];
         let rows: Vec<&str> = text
             .lines()
@@ -2327,7 +2515,10 @@ mod tests {
         app.cycle_mode();
         let plan = render_text_with(&mut app, 100, 24);
         assert!(plan.contains("Plan"), "metadata missing plan:\n{plan}");
-        assert!(!plan.contains("Build"), "build label should be gone:\n{plan}");
+        assert!(
+            !plan.contains("Build"),
+            "build label should be gone:\n{plan}"
+        );
         app.maximized = Some(false);
         let windowed = render_text_with(&mut app, 100, 24);
         assert!(
@@ -2372,22 +2563,54 @@ mod tests {
             panic!("{needle} not rendered");
         };
         let (ax, ay) = find("let x = 1;");
-        assert_eq!(buffer[(ax, ay)].bg, current().diff_add_bg, "add line content bg");
-        assert_eq!(buffer[(3, ay)].bg, current().diff_add_gutter, "add line gutter bg");
+        assert_eq!(
+            buffer[(ax, ay)].bg,
+            current().diff_add_bg,
+            "add line content bg"
+        );
+        assert_eq!(
+            buffer[(3, ay)].bg,
+            current().diff_add_gutter,
+            "add line gutter bg"
+        );
         assert_eq!(
             buffer[(buffer.area.width - 1, ay)].bg,
             current().diff_add_bg,
             "add line band should span the full row"
         );
         let (rx, ry) = find("let y = 2;");
-        assert_eq!(buffer[(rx, ry)].bg, current().diff_rem_bg, "rem line content bg");
-        assert_eq!(buffer[(3, ry)].bg, current().diff_rem_gutter, "rem line gutter bg");
+        assert_eq!(
+            buffer[(rx, ry)].bg,
+            current().diff_rem_bg,
+            "rem line content bg"
+        );
+        assert_eq!(
+            buffer[(3, ry)].bg,
+            current().diff_rem_gutter,
+            "rem line gutter bg"
+        );
         let (cx, cy) = find("let z = 3;");
-        assert_eq!(buffer[(cx, cy)].fg, current().diff_ctx_text, "ctx text color");
-        assert_eq!(buffer[(cx, cy)].bg, current().base, "ctx content keeps base bg");
-        assert_eq!(buffer[(3, cy)].bg, current().diff_ctx_gutter, "ctx gutter bg");
+        assert_eq!(
+            buffer[(cx, cy)].fg,
+            current().diff_ctx_text,
+            "ctx text color"
+        );
+        assert_eq!(
+            buffer[(cx, cy)].bg,
+            current().base,
+            "ctx content keeps base bg"
+        );
+        assert_eq!(
+            buffer[(3, cy)].bg,
+            current().diff_ctx_gutter,
+            "ctx gutter bg"
+        );
         let (px, py) = find("src/ui.rs");
-        assert_eq!(buffer[(px, py)].bg, current().diff_ctx_gutter, "path header band");
+        assert_eq!(
+            buffer[(px, py)].bg,
+            current().diff_ctx_gutter,
+            "path header band"
+        );
     }
 
     #[test]

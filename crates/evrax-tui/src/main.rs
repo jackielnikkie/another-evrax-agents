@@ -1,8 +1,11 @@
 mod app;
+mod banner;
 mod image;
 mod markdown;
+mod subagent_link;
 mod theme;
 mod ui;
+mod welcome;
 mod window;
 
 use std::io::Stdout;
@@ -95,19 +98,19 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         if loaded.mock {
             (
                 Box::new(MockBackend::new()),
-                "backend Â· mock".to_string(),
+                "backend · mock".to_string(),
                 "mock".to_string(),
             )
         } else {
             match evrax_agent::ChatBackend::new(loaded.config.clone()) {
                 Ok(real) => {
                     let label = real.model().to_string();
-                    let note = format!("backend Â· {} Â· {}", label, real.base_url());
+                    let note = format!("backend · {} · {}", label, real.base_url());
                     (Box::new(real), note, label)
                 }
                 Err(e) => (
                     Box::new(MockBackend::new()),
-                    format!("backend gagal ({e}) Â· pakai mock"),
+                    format!("backend gagal ({e}) · pakai mock"),
                     "mock".to_string(),
                 ),
             }
@@ -115,10 +118,21 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let mut turn_task: Option<JoinHandle<()>> = None;
     let mut app = App::new();
+    app.catalog = evrax_agent::catalog::Catalog::load();
     app.set_backend_label(backend_label);
     if !backend_note.is_empty() {
         app.set_flash(backend_note);
     }
+    let mut subagent_link = arg_value("--subagent-id").and_then(|id| {
+        let mut link = subagent_link::Link::load(&id)?;
+        app.session_id = id.clone();
+        let name = link.name().to_string();
+        app.titles.insert(id.clone(), name.clone());
+        app.manual_titles.insert(id.clone());
+        link.publish_final(&app, "idle");
+        app.set_flash(format!("subagent {name}"));
+        Some(link)
+    });
     let mut decision_tx: Option<mpsc::Sender<bool>> = None;
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
@@ -250,6 +264,23 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                 app.sync_remote_mode();
                 drain_remote_prompts(&mut app, &*backend, &event_tx, &mut decision_tx, &mut turn_task);
                 drain_remote_approvals(&mut app, &mut decision_tx);
+                drain_subagent_prompt(
+                    &mut app,
+                    &mut subagent_link,
+                    &*backend,
+                    &event_tx,
+                    &mut decision_tx,
+                    &mut turn_task,
+                );
+                if subagent_link
+                    .as_ref()
+                    .is_some_and(subagent_link::Link::stop_requested)
+                {
+                    app.should_quit = true;
+                }
+                if let Some(link) = subagent_link.as_mut() {
+                    link.publish(&app);
+                }
                 if let Some(state) = window::window_state()
                     && app.maximized != Some(state)
                 {
@@ -273,11 +304,15 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                     || app.flash.is_some()
                     || app.approval.is_some()
                     || app.mode != mode_before
-                    || !app.pending_kitty.is_empty();
+                    || !app.pending_kitty.is_empty()
+                    || (app.messages.is_empty() && app.tick.is_multiple_of(2));
             }
         }
     }
 
+    if let Some(link) = subagent_link.as_mut() {
+        link.publish_final(&app, "stopped");
+    }
     if let Some(task) = turn_task.take() {
         task.abort();
     }
@@ -329,10 +364,7 @@ fn is_batchable(app: &App, key: &crossterm::event::KeyEvent) -> bool {
         && !app.busy
 }
 
-async fn drain_burst(
-    events: &mut EventStream,
-    first: char,
-) -> (String, Option<Event>) {
+async fn drain_burst(events: &mut EventStream, first: char) -> (String, Option<Event>) {
     let mut chars = String::from(first);
     let deadline = Duration::from_millis(3);
     loop {
@@ -341,7 +373,10 @@ async fn drain_burst(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+                {
                     return (chars, Some(Event::Key(key)));
                 }
                 match key.code {
@@ -475,7 +510,56 @@ fn drain_remote_prompts(
     let Some(text) = text else { return };
     if let Some(prompt) = app.submit_external_prompt(text) {
         let (session, plan_mode) = (app.session_id.clone(), app.mode == AgentMode::Plan);
-        start_turn(backend, event_tx, decision_tx, turn_task, prompt, session, plan_mode);
+        start_turn(
+            backend,
+            event_tx,
+            decision_tx,
+            turn_task,
+            prompt,
+            session,
+            plan_mode,
+        );
+    }
+}
+
+fn arg_value(name: &str) -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == name {
+            return args.next();
+        }
+    }
+    None
+}
+
+fn drain_subagent_prompt(
+    app: &mut App,
+    link: &mut Option<subagent_link::Link>,
+    backend: &dyn AgentBackend,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    decision_tx: &mut Option<mpsc::Sender<bool>>,
+    turn_task: &mut Option<JoinHandle<()>>,
+) {
+    if app.busy {
+        return;
+    }
+    let Some(link) = link.as_ref() else {
+        return;
+    };
+    let Some(text) = link.take_prompt() else {
+        return;
+    };
+    if let Some(prompt) = app.submit_external_prompt(text) {
+        let (session, plan_mode) = (app.session_id.clone(), app.mode == AgentMode::Plan);
+        start_turn(
+            backend,
+            event_tx,
+            decision_tx,
+            turn_task,
+            prompt,
+            session,
+            plan_mode,
+        );
     }
 }
 
@@ -522,7 +606,10 @@ fn handle_event(
                     // In the tunnel dialog, clicking the status/url line copies
                     // the tunnel URL to the clipboard.
                     if app.tunnel_dialog.is_some()
-                        && app.tunnel_url_rect.map(|r| r.contains(pos)).unwrap_or(false)
+                        && app
+                            .tunnel_url_rect
+                            .map(|r| r.contains(pos))
+                            .unwrap_or(false)
                     {
                         match app.tunnel_current_url() {
                             Some(url) => {
@@ -537,11 +624,7 @@ fn handle_event(
                         app.remove_attachment(idx);
                         return;
                     }
-                    if let Some(idx) = app
-                        .chip_rects
-                        .iter()
-                        .position(|r| r.contains(pos))
-                    {
+                    if let Some(idx) = app.chip_rects.iter().position(|r| r.contains(pos)) {
                         app.open_preview(idx);
                         return;
                     }
@@ -571,7 +654,15 @@ fn handle_event(
         }
         Event::Resize(_, _) => {}
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            handle_key(app, key, backend, event_tx, decision_tx, turn_task, max_scroll);
+            handle_key(
+                app,
+                key,
+                backend,
+                event_tx,
+                decision_tx,
+                turn_task,
+                max_scroll,
+            );
         }
         _ => {}
     }
@@ -652,7 +743,9 @@ fn handle_key(
             KeyCode::PageUp => app.palette_page(-1, app::DIALOG_PAGE),
             KeyCode::PageDown => app.palette_page(1, app::DIALOG_PAGE),
             KeyCode::Char(c)
-                if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
             {
                 app.palette_type(c);
             }
@@ -685,13 +778,20 @@ fn handle_key(
         return;
     }
     if app.tunnel_dialog.is_some() {
-        if app.tunnel_dialog.as_ref().and_then(|d| d.editing.as_ref()).is_some() {
+        if app
+            .tunnel_dialog
+            .as_ref()
+            .and_then(|d| d.editing.as_ref())
+            .is_some()
+        {
             match key.code {
                 KeyCode::Esc => app.tunnel_edit_cancel(),
                 KeyCode::Enter => commit_tunnel_url(app),
                 KeyCode::Backspace => app.tunnel_edit_backspace(),
                 KeyCode::Char(c)
-                    if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
                 {
                     app.tunnel_edit_input(c);
                 }
@@ -720,13 +820,20 @@ fn handle_key(
         return;
     }
     if app.remote_dialog.is_some() {
-        if app.remote_dialog.as_ref().and_then(|d| d.editing.as_ref()).is_some() {
+        if app
+            .remote_dialog
+            .as_ref()
+            .and_then(|d| d.editing.as_ref())
+            .is_some()
+        {
             match key.code {
                 KeyCode::Esc => app.remote_edit_cancel(),
                 KeyCode::Enter => commit_remote_password(app),
                 KeyCode::Backspace => app.remote_edit_backspace(),
                 KeyCode::Char(c)
-                    if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
                 {
                     app.remote_edit_input(c);
                 }
@@ -792,7 +899,10 @@ fn handle_key(
             app.input.insert_newline();
         }
         KeyCode::Char(c) => {
-            if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
+            {
                 app.input.insert_char(c);
             }
         }
@@ -818,7 +928,15 @@ fn handle_key(
                 app.input.insert_newline();
             } else if let Some(prompt) = app.submit_prompt() {
                 let (session, plan_mode) = (app.session_id.clone(), app.mode == AgentMode::Plan);
-                start_turn(backend, event_tx, decision_tx, turn_task, prompt, session, plan_mode);
+                start_turn(
+                    backend,
+                    event_tx,
+                    decision_tx,
+                    turn_task,
+                    prompt,
+                    session,
+                    plan_mode,
+                );
             }
         }
         KeyCode::Esc => {

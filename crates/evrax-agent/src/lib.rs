@@ -1,9 +1,11 @@
 //! Real evrax backend: OpenAI-compatible SSE chat (9router) + agent loop.
 
+pub mod catalog;
 pub mod diff;
 mod guardrails;
 mod retry;
 pub mod sse;
+pub mod subagent;
 pub mod tools;
 
 use std::collections::HashMap;
@@ -209,9 +211,7 @@ impl Inner {
         let mut conversations = self.conversations.lock().unwrap();
         let turns = conversations.entry(session.to_string()).or_default();
         turns.push(turn);
-        let size = |messages: &[Value]| -> usize {
-            messages.iter().map(message_chars).sum()
-        };
+        let size = |messages: &[Value]| -> usize { messages.iter().map(message_chars).sum() };
         let mut total: usize = turns.iter().map(|t| size(t)).sum();
         while total > MAX_HISTORY_CHARS && turns.len() > 1 {
             total = total.saturating_sub(size(&turns[0]));
@@ -319,7 +319,10 @@ impl AgentBackend for ChatBackend {
     fn suggest_title(&self, prompt: String, reply: String) -> BoxFuture<'static, Option<String>> {
         let inner = self.inner.clone();
         Box::pin(async move {
-            let url = format!("{}/chat/completions", inner.cfg.base_url.trim_end_matches('/'));
+            let url = format!(
+                "{}/chat/completions",
+                inner.cfg.base_url.trim_end_matches('/')
+            );
             let body = json!({
                 "model": inner.cfg.model,
                 "messages": [
@@ -347,7 +350,10 @@ impl AgentBackend for ChatBackend {
                 let text = value.pointer("/choices/0/message/content")?.as_str()?;
                 sanitize_title(text)
             };
-            tokio::time::timeout(Duration::from_secs(10), call).await.ok().flatten()
+            tokio::time::timeout(Duration::from_secs(10), call)
+                .await
+                .ok()
+                .flatten()
         })
     }
 }
@@ -369,7 +375,10 @@ pub fn sanitize_title(raw: &str) -> Option<String> {
     title = title
         .trim_matches(|c: char| {
             c.is_whitespace()
-                || matches!(c, '"' | '\'' | '`' | ':' | ';' | '.' | ',' | '!' | '?' | '*' | '#')
+                || matches!(
+                    c,
+                    '"' | '\'' | '`' | ':' | ';' | '.' | ',' | '!' | '?' | '*' | '#'
+                )
         })
         .to_string();
     if title.chars().count() > 60 {
@@ -394,7 +403,11 @@ struct Exec {
 
 impl Exec {
     fn error(detail: String) -> Self {
-        Self { ok: false, detail, diff: None }
+        Self {
+            ok: false,
+            detail,
+            diff: None,
+        }
     }
 
     fn result_text(&self) -> String {
@@ -407,7 +420,9 @@ impl Exec {
 }
 
 async fn emit(tx: &mpsc::Sender<AgentEvent>, event: AgentEvent) -> Result<(), String> {
-    tx.send(event).await.map_err(|_| "turn dibatalkan".to_string())
+    tx.send(event)
+        .await
+        .map_err(|_| "turn dibatalkan".to_string())
 }
 
 const SUMMARY_NUDGE: &str = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
@@ -418,7 +433,8 @@ async fn run_turn(
     mut decisions: mpsc::Receiver<bool>,
     tx: mpsc::Sender<AgentEvent>,
 ) -> Result<(), String> {
-    let system = json!({ "role": "system", "content": system_prompt(&inner.cfg, request.plan_mode) });
+    let system =
+        json!({ "role": "system", "content": system_prompt(&inner.cfg, request.plan_mode) });
     let history = inner.replay(&request.session);
     let specs = tool_specs(request.plan_mode);
     let ctx = tools::Context::new(inner.cfg.root.clone());
@@ -441,7 +457,14 @@ async fn run_turn(
             )
             .await;
         }
-        emit(&tx, AgentEvent::Iteration { n: tool_rounds + 1, max }).await?;
+        emit(
+            &tx,
+            AgentEvent::Iteration {
+                n: tool_rounds + 1,
+                max,
+            },
+        )
+        .await?;
 
         let mut messages = Vec::with_capacity(history.len() + committed.len() + 1);
         messages.push(system.clone());
@@ -480,15 +503,24 @@ async fn run_turn(
                 .map(|args| tools::summary(&call.name, args))
                 .unwrap_or_else(|_| call.arguments.chars().take(80).collect());
             let summary = trunc(&summary, 120);
-            emit(&tx, AgentEvent::ToolStarted { name: call.name.clone(), summary: summary.clone() })
-                .await?;
+            emit(
+                &tx,
+                AgentEvent::ToolStarted {
+                    name: call.name.clone(),
+                    summary: summary.clone(),
+                },
+            )
+            .await?;
 
             if let Some(reason) = guard.blocked(&call.name, &call.arguments) {
-                emit(&tx, AgentEvent::ToolFinished {
-                    name: call.name.clone(),
-                    ok: false,
-                    detail: reason.clone(),
-                })
+                emit(
+                    &tx,
+                    AgentEvent::ToolFinished {
+                        name: call.name.clone(),
+                        ok: false,
+                        detail: reason.clone(),
+                    },
+                )
                 .await?;
                 committed.push(json!({
                     "role": "tool",
@@ -516,13 +548,23 @@ async fn run_turn(
                 }
             };
             if let Some((path, lines)) = &outcome.diff {
-                emit(&tx, AgentEvent::Diff { path: path.clone(), lines: lines.clone() }).await?;
+                emit(
+                    &tx,
+                    AgentEvent::Diff {
+                        path: path.clone(),
+                        lines: lines.clone(),
+                    },
+                )
+                .await?;
             }
-            emit(&tx, AgentEvent::ToolFinished {
-                name: call.name.clone(),
-                ok: outcome.ok,
-                detail: trunc(&outcome.detail, 2000),
-            })
+            emit(
+                &tx,
+                AgentEvent::ToolFinished {
+                    name: call.name.clone(),
+                    ok: outcome.ok,
+                    detail: trunc(&outcome.detail, 2000),
+                },
+            )
             .await?;
 
             let mut result = outcome.result_text();
@@ -638,7 +680,7 @@ async fn authorize_and_run(
     decisions: &mut mpsc::Receiver<bool>,
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<Exec, String> {
-    let mutating = tools::risk(name) == tools::Risk::Mutate;
+    let mutating = tools::is_mutating(name, args.as_ref().ok());
     let outside = match args {
         Ok(value) => tools::outside_target(name, value, ctx),
         Err(_) => None,
@@ -648,19 +690,25 @@ async fn authorize_and_run(
             return Ok(Exec::error("blocked: plan mode is read-only".into()));
         }
         if outside.is_some() {
-            return Ok(Exec::error("blocked: plan mode is workspace read-only".into()));
+            return Ok(Exec::error(
+                "blocked: plan mode is workspace read-only".into(),
+            ));
         }
     }
-    // shell always needs approval (system-wide scope); write/edit inside the
-    // workspace run automatically; any external path needs approval.
-    let needs_approval = name == "shell" || outside.is_some();
+    // shell always needs approval (system-wide scope); mutating git actions
+    // need approval; write/edit/todo/ast-grep inside the workspace run
+    // automatically; any external path needs approval.
+    let needs_approval = tools::requires_approval(name, args.as_ref().ok()) || outside.is_some();
     if needs_approval {
-        let key = tools::approval_key(name, outside.as_deref());
-        emit(tx, AgentEvent::ApprovalRequested {
-            name: name.to_string(),
-            summary: summary.to_string(),
-            key,
-        })
+        let key = tools::approval_key_for(name, args.as_ref().ok(), outside.as_deref());
+        emit(
+            tx,
+            AgentEvent::ApprovalRequested {
+                name: name.to_string(),
+                summary: summary.to_string(),
+                key,
+            },
+        )
         .await?;
         if !decisions.recv().await.unwrap_or(false) {
             return Ok(Exec::error("rejected by user".into()));
@@ -671,7 +719,11 @@ async fn authorize_and_run(
         Err(message) => return Ok(Exec::error(message.clone())),
     };
     Ok(match tools::run(name, &args, ctx).await {
-        Ok(outcome) => Exec { ok: outcome.ok, detail: outcome.detail, diff: outcome.diff },
+        Ok(outcome) => Exec {
+            ok: outcome.ok,
+            detail: outcome.detail,
+            diff: outcome.diff,
+        },
         Err(message) => Exec::error(message),
     })
 }
@@ -687,9 +739,13 @@ fn trunc(text: &str, max: usize) -> String {
 fn provider_error(status: reqwest::StatusCode, body: &str, model: &str) -> String {
     let detail = trunc(body.trim(), 400);
     let hint = match status.as_u16() {
-        401 => "API key ditolak 9router (invalid/nonaktif) — cek `api_key` di agent.json dan status key di dashboard 9router",
+        401 => {
+            "API key ditolak 9router (invalid/nonaktif) — cek `api_key` di agent.json dan status key di dashboard 9router"
+        }
         402 => "kuota/kredit provider habis",
-        403 => "9router menolak key ini untuk model tersebut — buka dashboard 9router → API Keys, izinkan model itu atau matikan restrict access",
+        403 => {
+            "9router menolak key ini untuk model tersebut — buka dashboard 9router → API Keys, izinkan model itu atau matikan restrict access"
+        }
         _ => "",
     };
     if hint.is_empty() {
@@ -726,9 +782,17 @@ async fn handle_payload(
         Frame::Ignore => Ok(false),
         Frame::Delta(delta) => {
             if !delta.reasoning.is_empty() {
-                let entry = state.thinking.get_or_insert_with(|| (String::new(), Instant::now()));
+                let entry = state
+                    .thinking
+                    .get_or_insert_with(|| (String::new(), Instant::now()));
                 entry.0.push_str(&delta.reasoning);
-                emit(tx, AgentEvent::ThinkingDelta { text: delta.reasoning }).await?;
+                emit(
+                    tx,
+                    AgentEvent::ThinkingDelta {
+                        text: delta.reasoning,
+                    },
+                )
+                .await?;
             }
             if !delta.text.is_empty() {
                 state.text.push_str(&delta.text);
@@ -748,7 +812,10 @@ async fn stream_round(
     specs: &[Value],
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<Round, String> {
-    let url = format!("{}/chat/completions", inner.cfg.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/chat/completions",
+        inner.cfg.base_url.trim_end_matches('/')
+    );
     let mut body = json!({ "model": inner.cfg.model, "messages": messages, "stream": true });
     if !specs.is_empty() {
         body["tools"] = Value::Array(specs.to_vec());
@@ -841,21 +908,38 @@ async fn finish_round(
     tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<Round, String> {
     if let Some((_, started)) = &state.thinking {
-        emit(tx, AgentEvent::ThinkingFinished { seconds: started.elapsed().as_secs_f32() })
-            .await?;
+        emit(
+            tx,
+            AgentEvent::ThinkingFinished {
+                seconds: started.elapsed().as_secs_f32(),
+            },
+        )
+        .await?;
     }
     let calls = state.acc.take();
     if calls.is_empty() && state.text.trim().is_empty() {
         return Err("model mengembalikan respons kosong".into());
     }
-    Ok(Round { text: state.text, calls })
+    Ok(Round {
+        text: state.text,
+        calls,
+    })
 }
 
 fn tool_specs(plan_mode: bool) -> Vec<Value> {
     if !plan_mode {
         return tools::specs();
     }
-    let read_only = ["read", "list", "grep"];
+    let read_only = [
+        "read",
+        "list",
+        "grep",
+        "web_fetch",
+        "todo",
+        "git",
+        "ast_grep",
+        "evrax-graph",
+    ];
     tools::specs()
         .into_iter()
         .filter(|spec| {
@@ -871,6 +955,7 @@ fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
         "You are evrax, a coding agent running in a terminal TUI.\n\
          Workspace: {} · Platform: {} — the shell tool runs PowerShell.\n\
          Inspect code with read/list/grep before changing anything. Make minimal, precise edits.\n\
+         Use todo for multi-step work, evrax-graph for code-graph queries (index/search/callers/impact/outline), git for repo inspection/mutations, web_fetch for docs, ast_grep for structural code search, and subagent to launch/control another evrax terminal agent.\n\
          After code changes, verify with `cargo test` (and `cargo clippy` when asked).\n\
          File tools run automatically inside the workspace (read AND write/edit). Any path outside the workspace needs explicit user approval, so ask before touching files elsewhere. Never write outside the workspace unless the user asked for it.\n\
          Keep replies concise. When the task is done, answer with plain text and no tool calls.",
@@ -878,7 +963,7 @@ fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
         std::env::consts::OS
     );
     if plan_mode {
-        prompt.push_str("\nPLAN MODE: read-only and workspace-only. Never attempt write/edit/shell, and never read outside the workspace; investigate and present a plan.");
+        prompt.push_str("\nPLAN MODE: read-only and workspace-only. Read-only web_fetch, todo list, git status/diff/log/show, ast_grep search, and evrax-graph queries/index are allowed; never attempt write/edit/shell or mutating todo/git/ast-grep/subagent actions, and never read files outside the workspace; investigate and present a plan.");
     }
     prompt
 }
@@ -1014,8 +1099,16 @@ mod tests {
             e,
             AgentEvent::TextDelta { text } if text == "halo "
         )));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::ThinkingDelta { .. })));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::ThinkingFinished { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ThinkingDelta { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ThinkingFinished { .. }))
+        );
         assert_eq!(events.last(), Some(&AgentEvent::TurnFinished));
     }
 
@@ -1028,7 +1121,10 @@ mod tests {
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]}}]}"#,
             "[DONE]",
         ]);
-        let reply2 = sse(&[r#"{"choices":[{"delta":{"content":"isinya: rahasia"}}]}"#, "[DONE]"]);
+        let reply2 = sse(&[
+            r#"{"choices":[{"delta":{"content":"isinya: rahasia"}}]}"#,
+            "[DONE]",
+        ]);
         let server = Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap();
         let captured = bodies.clone();
@@ -1050,7 +1146,10 @@ mod tests {
         )));
         assert_eq!(events.last(), Some(&AgentEvent::TurnFinished));
         let second = bodies.lock().unwrap()[1].clone();
-        assert!(second.contains("\"role\":\"tool\""), "second request: {second}");
+        assert!(
+            second.contains("\"role\":\"tool\""),
+            "second request: {second}"
+        );
     }
 
     #[tokio::test]
@@ -1060,12 +1159,17 @@ mod tests {
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"write","arguments":"{\"path\":\"x.txt\",\"content\":\"boom\"}"}}]}}]}"#,
             "[DONE]",
         ]);
-        let final_text = sse(&[r#"{"choices":[{"delta":{"content":"sudah ditulis"}}]}"#, "[DONE]"]);
+        let final_text = sse(&[
+            r#"{"choices":[{"delta":{"content":"sudah ditulis"}}]}"#,
+            "[DONE]",
+        ]);
         let (bodies, url) = fake_server(vec![call, final_text]);
         let backend = backend(url, dir.path().to_path_buf());
         let events = collect(&backend, "tulis").await;
         assert!(
-            !events.iter().any(|e| matches!(e, AgentEvent::ApprovalRequested { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ApprovalRequested { .. })),
             "inside write must not ask for approval: {events:?}"
         );
         assert!(events.iter().any(|e| matches!(
@@ -1097,7 +1201,11 @@ mod tests {
         let backend = backend(format!("http://{addr}/v1"), workspace.path().to_path_buf());
         let (decide_tx, decide_rx) = mpsc::channel(4);
         let mut stream = backend.run_turn(
-            TurnRequest { prompt: "baca luar".into(), session: "o".into(), plan_mode: false },
+            TurnRequest {
+                prompt: "baca luar".into(),
+                session: "o".into(),
+                plan_mode: false,
+            },
             decide_rx,
         );
         let expected = tools::approval_key("read", Some(&target));
@@ -1110,9 +1218,11 @@ mod tests {
                     key_seen = Some(key);
                     decide_tx.send(true).await.unwrap();
                 }
-                AgentEvent::ToolFinished { name, ok: true, detail }
-                    if name == "read" && detail.contains("rahasia luar") =>
-                {
+                AgentEvent::ToolFinished {
+                    name,
+                    ok: true,
+                    detail,
+                } if name == "read" && detail.contains("rahasia luar") => {
                     read_ok = true;
                 }
                 _ => {}
@@ -1144,7 +1254,11 @@ mod tests {
         let backend = backend(format!("http://{addr}/v1"), workspace.path().to_path_buf());
         let (decide_tx, decide_rx) = mpsc::channel(2);
         let mut stream = backend.run_turn(
-            TurnRequest { prompt: "baca luar".into(), session: "po".into(), plan_mode: true },
+            TurnRequest {
+                prompt: "baca luar".into(),
+                session: "po".into(),
+                plan_mode: true,
+            },
             decide_rx,
         );
         let mut saw_approval = false;
@@ -1152,9 +1266,9 @@ mod tests {
         while let Some(event) = stream.next().await {
             match event {
                 AgentEvent::ApprovalRequested { .. } => saw_approval = true,
-                AgentEvent::ToolFinished { detail, ok: false, .. }
-                    if detail.contains("plan mode is workspace read-only") =>
-                {
+                AgentEvent::ToolFinished {
+                    detail, ok: false, ..
+                } if detail.contains("plan mode is workspace read-only") => {
                     saw_block = true;
                 }
                 _ => {}
@@ -1186,7 +1300,11 @@ mod tests {
         let backend = backend(format!("http://{addr}/v1"), dir.path().to_path_buf());
         let (decide_tx, decide_rx) = mpsc::channel(4);
         let mut stream = backend.run_turn(
-            TurnRequest { prompt: "jalankan".into(), session: "sh".into(), plan_mode: false },
+            TurnRequest {
+                prompt: "jalankan".into(),
+                session: "sh".into(),
+                plan_mode: false,
+            },
             decide_rx,
         );
         let mut key = None;
@@ -1205,8 +1323,14 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let target = outside.path().join("x.txt");
-        let call = tool_call_reply("write", json!({ "path": target.to_string_lossy(), "content": "boom" }));
-        let final_text = sse(&[r#"{"choices":[{"delta":{"content":"tidak jadi"}}]}"#, "[DONE]"]);
+        let call = tool_call_reply(
+            "write",
+            json!({ "path": target.to_string_lossy(), "content": "boom" }),
+        );
+        let final_text = sse(&[
+            r#"{"choices":[{"delta":{"content":"tidak jadi"}}]}"#,
+            "[DONE]",
+        ]);
         let server = Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap();
         std::thread::spawn(move || {
@@ -1220,7 +1344,11 @@ mod tests {
         let backend = backend(format!("http://{addr}/v1"), workspace.path().to_path_buf());
         let (decide_tx, decide_rx) = mpsc::channel(4);
         let mut stream = backend.run_turn(
-            TurnRequest { prompt: "tulis luar".into(), session: "ow".into(), plan_mode: false },
+            TurnRequest {
+                prompt: "tulis luar".into(),
+                session: "ow".into(),
+                plan_mode: false,
+            },
             decide_rx,
         );
         let mut rejected_seen = false;
@@ -1228,7 +1356,8 @@ mod tests {
             if matches!(event, AgentEvent::ApprovalRequested { .. }) {
                 decide_tx.send(false).await.unwrap();
             }
-            if matches!(event, AgentEvent::ToolFinished { ok: false, detail, .. } if detail == "rejected by user") {
+            if matches!(event, AgentEvent::ToolFinished { ok: false, detail, .. } if detail == "rejected by user")
+            {
                 rejected_seen = true;
             }
         }
@@ -1243,7 +1372,10 @@ mod tests {
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"shell","arguments":"{\"command\":\"echo hi\"}"}}]}}]}"#,
             "[DONE]",
         ]);
-        let final_text = sse(&[r#"{"choices":[{"delta":{"content":"encana matang"}}]}"#, "[DONE]"]);
+        let final_text = sse(&[
+            r#"{"choices":[{"delta":{"content":"encana matang"}}]}"#,
+            "[DONE]",
+        ]);
         let server = Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap();
         std::thread::spawn(move || {
@@ -1257,7 +1389,11 @@ mod tests {
         let backend = backend(format!("http://{addr}/v1"), dir.path().to_path_buf());
         let (decide_tx, decide_rx) = mpsc::channel(2);
         let mut stream = backend.run_turn(
-            TurnRequest { prompt: "jalankan".into(), session: "p".into(), plan_mode: true },
+            TurnRequest {
+                prompt: "jalankan".into(),
+                session: "p".into(),
+                plan_mode: true,
+            },
             decide_rx,
         );
         let mut saw_block = false;
@@ -1266,7 +1402,8 @@ mod tests {
             if matches!(event, AgentEvent::ApprovalRequested { .. }) {
                 saw_approval = true;
             }
-            if matches!(event, AgentEvent::ToolFinished { detail, ok: false, .. } if detail.contains("plan mode")) {
+            if matches!(event, AgentEvent::ToolFinished { detail, ok: false, .. } if detail.contains("plan mode"))
+            {
                 saw_block = true;
             }
         }
@@ -1327,7 +1464,11 @@ mod tests {
         )]);
         let backend = backend(url, std::env::temp_dir());
         let events = collect(&backend, "halo").await;
-        assert!(!events.iter().any(|event| matches!(event, AgentEvent::Retrying { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Retrying { .. }))
+        );
         let Some(AgentEvent::Failed { message }) = events.last() else {
             panic!("expected Failed, got {events:?}");
         };
@@ -1351,13 +1492,16 @@ mod tests {
         let backend = backend_with(url, dir.path().to_path_buf(), 2);
         let events = collect(&backend, "loop").await;
 
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::Iteration { n: 2, max: 2 }
-        )));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, AgentEvent::Notice { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Iteration { n: 2, max: 2 }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Notice { .. }))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::TextDelta { text } if text == "ringkasan"
@@ -1386,7 +1530,11 @@ mod tests {
         let backend = backend_with(url, dir.path().to_path_buf(), 2);
         let events = collect(&backend, "loop").await;
 
-        assert!(!events.iter().any(|event| matches!(event, AgentEvent::Failed { .. })));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Failed { .. }))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             AgentEvent::TextDelta { text } if text.contains("Batas langkah")
@@ -1409,7 +1557,9 @@ mod tests {
         let backend = backend(url, dir.path().to_path_buf());
 
         let first = collect(&backend, "baca").await;
-        assert!(matches!(first.last(), Some(AgentEvent::Failed { message }) if message.contains("boom")));
+        assert!(
+            matches!(first.last(), Some(AgentEvent::Failed { message }) if message.contains("boom"))
+        );
 
         let _second = collect(&backend, "lanjut").await;
         let bodies = bodies.lock().unwrap();
@@ -1440,19 +1590,30 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(tx);
         let mut stream = backend.run_turn(
-            TurnRequest { prompt: "pertanyaan pertama".into(), session: "same".into(), plan_mode: false },
+            TurnRequest {
+                prompt: "pertanyaan pertama".into(),
+                session: "same".into(),
+                plan_mode: false,
+            },
             rx,
         );
         while stream.next().await.is_some() {}
         let (tx, rx) = mpsc::channel(1);
         drop(tx);
         let mut stream = backend.run_turn(
-            TurnRequest { prompt: "lanjutan".into(), session: "same".into(), plan_mode: false },
+            TurnRequest {
+                prompt: "lanjutan".into(),
+                session: "same".into(),
+                plan_mode: false,
+            },
             rx,
         );
         while stream.next().await.is_some() {}
         let second = bodies.lock().unwrap()[1].clone();
-        assert!(second.contains("pertanyaan pertama"), "second body: {second}");
+        assert!(
+            second.contains("pertanyaan pertama"),
+            "second body: {second}"
+        );
         assert!(second.contains("oke"));
     }
 
@@ -1530,25 +1691,41 @@ mod tests {
     #[test]
     fn config_file_overrides_defaults_and_env_ignores_unknown() {
         let mut config = AgentConfig::default();
-        apply(&mut config, ConfigFile {
-            base_url: Some("http://x:1/v1".into()),
-            model: Some("m".into()),
-            api_key: None,
-            max_iterations: Some(3),
-            mock: None,
-        });
+        apply(
+            &mut config,
+            ConfigFile {
+                base_url: Some("http://x:1/v1".into()),
+                model: Some("m".into()),
+                api_key: None,
+                max_iterations: Some(3),
+                mock: None,
+            },
+        );
         assert_eq!(config.base_url, "http://x:1/v1");
         assert_eq!(config.max_iterations, 3);
     }
 
     #[test]
-    fn plan_mode_specs_are_read_only() {        let specs = tool_specs(true);
-        assert_eq!(specs.len(), 3);
+    fn plan_mode_specs_are_read_only() {
+        let specs = tool_specs(true);
+        assert_eq!(specs.len(), 8);
         let names: Vec<&str> = specs
             .iter()
             .map(|s| s.pointer("/function/name").and_then(Value::as_str).unwrap())
             .collect();
-        assert_eq!(names, ["read", "list", "grep"]);
+        assert_eq!(
+            names,
+            [
+                "read",
+                "list",
+                "grep",
+                "web_fetch",
+                "todo",
+                "git",
+                "ast_grep",
+                "evrax-graph"
+            ]
+        );
     }
 
     #[test]
@@ -1556,7 +1733,10 @@ mod tests {
         let inner = Inner::for_test();
         let big = "x".repeat(MAX_HISTORY_CHARS / 2 + 10);
         for i in 0..3 {
-            inner.commit("s", vec![json!({"role":"user","content":format!("q{i} {big}")})]);
+            inner.commit(
+                "s",
+                vec![json!({"role":"user","content":format!("q{i} {big}")})],
+            );
         }
         let replay = inner.replay("s");
         assert_eq!(replay.len(), 1, "only the newest turn survives");
@@ -1567,7 +1747,10 @@ mod tests {
     fn history_evicts_cold_sessions_beyond_cap() {
         let inner = Inner::for_test();
         for i in 0..=MAX_HISTORY_SESSIONS {
-            inner.commit(&format!("s{i}"), vec![json!({"role":"user","content":"hi"})]);
+            inner.commit(
+                &format!("s{i}"),
+                vec![json!({"role":"user","content":"hi"})],
+            );
         }
         let conversations = inner.conversations.lock().unwrap();
         assert_eq!(conversations.len(), MAX_HISTORY_SESSIONS);
@@ -1584,7 +1767,10 @@ mod tests {
             sanitize_title("\"Fix SSE heartbeat\"\n").as_deref(),
             Some("Fix SSE heartbeat")
         );
-        assert_eq!(sanitize_title("# Re: refactor??").as_deref(), Some("Re: refactor"));
+        assert_eq!(
+            sanitize_title("# Re: refactor??").as_deref(),
+            Some("Re: refactor")
+        );
         assert_eq!(
             sanitize_title("a".repeat(90).as_str()).as_deref(),
             Some("a".repeat(60).as_str())
@@ -1598,7 +1784,9 @@ mod tests {
         let good = json!({"choices":[{"message":{"content":"\"Fix SSE heartbeat\""}}]}).to_string();
         let (_bodies, url) = fake_server(vec![good]);
         let b1 = backend(url, std::env::temp_dir());
-        let title = b1.suggest_title("perbaiki sse".into(), "sudah".into()).await;
+        let title = b1
+            .suggest_title("perbaiki sse".into(), "sudah".into())
+            .await;
         assert_eq!(title.as_deref(), Some("Fix SSE heartbeat"));
 
         let (_bodies, url) = fake_server(vec!["not json".into()]);

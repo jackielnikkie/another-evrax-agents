@@ -1,0 +1,27 @@
+[package]
+name = "evrax-graph"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight multi-language code graph for Evrax — tree-sitter + SQLite, built-in (no MCP server)"
+license = "MIT"
+
+[dependencies]
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-c = "=0.23.4"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "=0.23.1"
+tree-sitter-php = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-bash = "0.23"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rayon = "1"
+sha2 = "0.10"
+walkdir = "2"
+
+[dev-dependencies]
