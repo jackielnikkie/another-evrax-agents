@@ -9,6 +9,8 @@ satu binary kecil, hemat memori, backend LLM asli, plus web UI yang bisa dibuka 
 
 - **Agent loop dengan tools** — `read`, `list`, `grep`, `write`, `edit`, `shell`,
   `web_fetch`, `todo`, `git`, `ast_grep`, `evrax-graph`, `subagent`.
+- **Multi-provider** — simpan banyak endpoint (openai-compatible atau Anthropic
+  native), daftar model diambil otomatis, ganti provider/model lewat `/model`.
 - **Mode Plan / Build** — Plan membuat semua tool jadi read-only.
 - **Approval** — tool yang mengubah file dan path di luar workspace minta izin
   dulu (Once / Always / Reject).
@@ -51,27 +53,51 @@ Semua flag (`-InstallDir`, `-System`, `-NoPath`, `-Purge`, ...) ada di
 
 ## Pertama kali jalan
 
-Jalankan `evrax`. Kalau API key belum ada, wizard setup akan terbuka:
+Jalankan `evrax`. Kalau API key belum ada, wizard setup akan terbuka. Wizard ini
+mendukung banyak provider sekaligus; provider bisa diganti kapan saja dengan
+`/model`.
 
-1. Pilih preset (9router, OpenRouter, DeepSeek, atau Custom).
-2. Isi base URL, model, dan API key.
-3. Tekan **Test connection** untuk mengecek koneksi.
-4. Tekan **Simpan** — backend baru langsung dipakai, tanpa restart.
+1. Pilih provider tersimpan, atau **tambah provider**.
+2. Pilih protokolnya: **openai-compatible** (`/chat/completions`) atau
+   **anthropic** (`/messages`).
+3. Beri nama (mis. `Nimbus Go`, `Muse Spark`), lalu isi base URL
+   (`◀/▶` mengisi preset: 9router, OpenRouter, DeepSeek, Custom).
+4. Tempel API key lalu tekan `Enter` — evrax mengecek key dengan mengambil
+   daftar model (`GET /models`). Belum perlu nama model.
+5. Pilih model dari daftar (ketik untuk filter). Kalau gateway tidak punya
+   `/models`, ketik nama model manual lalu `Enter`.
+6. Cek ringkasan lalu simpan — backend langsung aktif, tanpa restart.
 
 Konfigurasi ditulis ke `%APPDATA%\evrax\agent.json`:
 
 ```json
 {
-  "base_url": "http://127.0.0.1:20128/v1",
-  "model": "model-kamu",
-  "api_key": "key-kamu",
+  "active": "Nimbus Go",
+  "providers": [
+    {
+      "name": "Nimbus Go",
+      "kind": "openai",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "key-kamu",
+      "model": "some-model"
+    },
+    {
+      "name": "Muse Spark",
+      "kind": "anthropic",
+      "base_url": "https://api.example.com",
+      "api_key": "key-kamu",
+      "model": ""
+    }
+  ],
   "max_iterations": 500
 }
 ```
 
-Bisa juga lewat environment variable (`EVRAX_BASE_URL`, `EVRAX_MODEL`,
-`EVRAX_API_KEY`, `EVRAX_MAX_ITERATIONS`) atau flag CLI. Jalankan `evrax --setup`
-kalau mau membuka wizard lagi.
+File lama (satu provider) dimigrasi otomatis saat disimpan berikutnya. Bisa juga
+lewat environment variable (`EVRAX_PROVIDER`, `EVRAX_BASE_URL`, `EVRAX_MODEL`,
+`EVRAX_API_KEY`, `EVRAX_MAX_ITERATIONS`) atau flag CLI — nilainya hanya
+menimpa provider aktif untuk run itu. Jalankan `evrax --setup` untuk membuka
+wizard lagi, atau `/model` di dalam TUI untuk ganti provider/model.
 
 ## Pemakaian
 
@@ -81,6 +107,7 @@ evrax -c                     lanjutkan sesi terakhir
 evrax -s <id|prefix|judul>   lanjutkan sesi tertentu
 evrax -l                     daftar sesi tersimpan
 evrax --setup                buka wizard setup
+evrax --provider <nama>      mulai dengan provider tersimpan
 evrax --mock                 backend mock bawaan (tanpa API)
 evrax --model <id>           override model
 evrax --base-url <url>       override endpoint
@@ -102,8 +129,10 @@ Keyboard:
 | `Ctrl+Y` | copy balasan terakhir |
 | `Ctrl+C` | keluar |
 
-Slash command: `/new`, `/sessions`, `/mode`, `/copy`, `/theme`, `/remote`,
-`/rename <judul>`, `/exit`.
+Slash command: `/new`, `/sessions`, `/mode`, `/copy`, `/theme`, `/model`,
+`/remote`, `/rename <judul>`, `/exit`. `/model` menampilkan provider tersimpan,
+mengambil daftar model saat dibutuhkan, dan mengganti provider/model aktif tanpa
+restart.
 
 ## Sesi
 

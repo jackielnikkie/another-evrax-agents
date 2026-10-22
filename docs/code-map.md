@@ -13,7 +13,8 @@ Di-refresh 2026-10-21. **Jangan pakai nomor baris** — kode sering geser; cari 
 | `evrax-graph/evrax-graph` | Indexer graph kode (SQLite) + CLI, dipakai tool `evrax-graph` |
 
 ### evrax-agent
-- `lib.rs` — `ChatBackend`: config (`%APPDATA%\evrax\agent.json` → env `EVRAX_*` → CLI), `stream_round`, loop agent (default 500 iterasi tool-round, `commit_partial`, `finish_budget`/summary toolless), `suggest_title`, `provider_error`, `authorize_and_run`.
+- `lib.rs` — `ChatBackend`: config multi-provider (`agent.json` `{active, providers[]}` → `EVRAX_*` → CLI, migrasi file flat lama di `file_state()`), `resolve`/`ConfigSettings::resolved()`, `list_models` (cek key via `GET /models`), `test_provider`, `stream_round` (cabang `ProviderKind`), loop agent (default 500 iterasi tool-round, `commit_partial`, `finish_budget`/summary toolless), `suggest_title`, `provider_error` (hint 9router hanya untuk URL 20128), `authorize_and_run`.
+- `anthropic.rs` — konversi [OI]→Messages API (`convert_messages` system/tool_use/tool_result, `convert_tools` `input_schema`, `request_body` `max_tokens=8192`), `StreamAcc`+`apply_event` (SSE `content_block_*`, `input_json_delta`, `message_stop`, `error`), `reply_text`/`error_message`. History di disk tetap format [OI].
 - `sse.rs` — `SseDecoder` + `ToolCallAccumulator` (menangani frame dengan `"id":""`).
 - `retry.rs` — retry 429/5xx/408/transport/`x-should-retry`, tanpa retry 4xx lain.
 - `guardrails.rs` — deteksi streak/siklus tool-call identik.
@@ -29,7 +30,7 @@ Di-refresh 2026-10-21. **Jangan pakai nomor baris** — kode sering geser; cari 
 
 ### evrax-tui
 - `main.rs` — event loop, pilih backend real/mock, polling remote + subagent, drain prompt/approval web, spawn job judul LLM, arg parsing.
-- `app.rs` — `App`: transcript per sesi, composer/`LineEditor`, slash command + palette, dialog (session/theme/remote/tunnel/approval/preview), `TranscriptCache`, retensi sesi, `titles`/`manual_titles`, `backend_label`, iteration footer.
+- `app.rs` — `App`: transcript per sesi, composer/`LineEditor`, slash command + palette, dialog (session/theme/remote/tunnel/approval/preview/model), wizard `WizardStep` + `ModelDialog` (fetch `/models` async via `FetchResult`), `TranscriptCache`, retensi sesi, `titles`/`manual_titles`, `backend_label`, iteration footer, `providers`/`active_provider` + `apply_settings`.
 - `ui.rs` — render: header/transcript/composer/footer, modal (`dialog_window` + PgUp/PgDn), diff wrap, click target sebagian (tunnel URL copy).
 - `banner.rs` + `banner_wide.txt`/`banner_compact.txt` — sprite half-block truecolor, glow, bob, blink, wordmark `E V R A X`, signature `FAUST55`.
 - `welcome.rs` — empty state 3 kolom: skills | banner | MCP + tools.

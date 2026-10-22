@@ -12,6 +12,17 @@ use crate::theme;
 pub const ESC_CANCEL_TICKS: u64 = 20;
 pub const APPROVAL_OPTIONS: [&str; 3] = ["Allow once", "Always allow", "Reject"];
 
+/// A background `GET /models` job (wizard or `/model` dialog).
+pub struct FetchRequest {
+    pub request_id: u64,
+    pub kind: evrax_agent::ProviderKind,
+    pub base_url: String,
+    pub api_key: Option<String>,
+}
+
+/// Reply channel payload for a finished fetch: `(request_id, models)`.
+pub type FetchResult = (u64, Result<Vec<String>, String>);
+
 pub struct App {
     pub should_quit: bool,
     pub tick: u64,
@@ -58,6 +69,14 @@ pub struct App {
     pub wizard: Option<Wizard>,
     /// Config saved by the setup wizard; the run loop swaps the backend once.
     pub reload_config: Option<evrax_agent::AgentConfig>,
+    /// Saved providers + the active one (loaded from `agent.json`).
+    pub providers: Vec<evrax_agent::Provider>,
+    pub active_provider: Option<String>,
+    pub max_iterations: usize,
+    pub config_mock: bool,
+    /// Runtime provider/model picker (`/model`).
+    pub model_dialog: Option<ModelDialog>,
+    fetch_seq: u64,
     pub session_id: String,
     pub sessions: Vec<String>,
     /// Project store for on-disk persistence (None with `--no-save`/`--mock`).
@@ -110,21 +129,98 @@ pub const WIZARD_PRESETS: [(&str, &str, &str); 4] = [
     ("Custom", "", ""),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WizardStep {
+    Providers,
+    Kind,
+    Name,
+    BaseUrl,
+    ApiKey,
+    Checking,
+    Models,
+    Review,
+}
+
 pub struct Wizard {
-    pub row: usize,
+    pub step: WizardStep,
+    /// Provider chooser row: `0..providers.len()` = existing, last = new.
+    pub cursor: usize,
     pub editing: bool,
-    pub provider: usize,
+    pub kind: evrax_agent::ProviderKind,
+    pub name: String,
     pub base_url: String,
-    pub model: String,
     pub api_key: String,
+    pub model: String,
+    pub models: Vec<String>,
+    pub filtered: Vec<usize>,
+    pub model_cursor: usize,
+    pub filter: String,
+    pub existing: bool,
+    pub preset: usize,
+    pub request_id: u64,
     pub status: Option<String>,
-    pub testing: bool,
+}
+
+impl Wizard {
+    pub(crate) fn refilter(&mut self) {
+        let needle = self.filter.trim().to_lowercase();
+        self.filtered = self
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| needle.is_empty() || model.to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+            .collect();
+        if self.model_cursor >= self.filtered.len() {
+            self.model_cursor = 0;
+        }
+    }
 }
 
 pub enum WizardAction {
     None,
-    Test(evrax_agent::AgentConfig),
-    Save(evrax_agent::AgentConfig),
+    FetchModels(FetchRequest),
+    Save(evrax_agent::ConfigSettings),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModelLevel {
+    Providers,
+    Models,
+}
+
+pub struct ModelDialog {
+    pub level: ModelLevel,
+    pub provider_cursor: usize,
+    pub model_cursor: usize,
+    pub models: Vec<String>,
+    pub filtered: Vec<usize>,
+    pub filter: String,
+    pub request_id: u64,
+    pub loading: bool,
+    pub status: Option<String>,
+}
+
+impl ModelDialog {
+    fn refilter(&mut self) {
+        let needle = self.filter.trim().to_lowercase();
+        self.filtered = self
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| needle.is_empty() || model.to_lowercase().contains(&needle))
+            .map(|(index, _)| index)
+            .collect();
+        if self.model_cursor >= self.filtered.len() {
+            self.model_cursor = 0;
+        }
+    }
+}
+
+pub enum ModelAction {
+    None,
+    FetchModels(FetchRequest),
+    Apply(evrax_agent::ConfigSettings),
 }
 
 pub struct SessionDialog {
@@ -201,6 +297,7 @@ pub enum Command {
     CopyReply,
     NewSession,
     Theme,
+    Model,
     Remote,
     Rename,
     Quit,
@@ -247,6 +344,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         aliases: &[],
         description: "change the color theme",
         command: Command::Theme,
+    },
+    SlashCommand {
+        name: "model",
+        aliases: &["provider"],
+        description: "switch provider or model",
+        command: Command::Model,
     },
     SlashCommand {
         name: "remote",
@@ -805,6 +908,12 @@ impl App {
             chip_x_rects: Vec::new(),
             wizard: None,
             reload_config: None,
+            providers: Vec::new(),
+            active_provider: None,
+            max_iterations: evrax_agent::DEFAULT_MAX_ITERATIONS,
+            config_mock: false,
+            model_dialog: None,
+            fetch_seq: 0,
             session_id: unique_session_id(),
             sessions: Vec::new(),
             store: None,
@@ -820,56 +929,141 @@ impl App {
         }
     }
 
-    pub fn open_wizard(&mut self, cfg: &evrax_agent::AgentConfig) {
+    /// Loads saved providers + active selection into the app.
+    pub fn attach_config(&mut self, loaded: &evrax_agent::LoadedConfig) {
+        self.providers = loaded.providers.clone();
+        self.active_provider = loaded.active.clone();
+        self.max_iterations = loaded.max_iterations;
+        self.config_mock = loaded.mock;
+    }
+
+    fn next_fetch_id(&mut self) -> u64 {
+        self.fetch_seq += 1;
+        self.fetch_seq
+    }
+
+    pub fn open_wizard(&mut self) {
+        let existing = !self.providers.is_empty();
+        let cursor = self
+            .active_provider
+            .as_deref()
+            .and_then(|name| evrax_agent::provider_index(&self.providers, name))
+            .unwrap_or(0);
         self.wizard = Some(Wizard {
-            row: 0,
+            step: if existing {
+                WizardStep::Providers
+            } else {
+                WizardStep::Kind
+            },
+            cursor,
             editing: false,
-            provider: 0,
-            base_url: cfg.base_url.clone(),
-            model: cfg.model.clone(),
-            api_key: cfg.api_key.clone().unwrap_or_default(),
+            kind: evrax_agent::ProviderKind::Openai,
+            name: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            models: Vec::new(),
+            filtered: Vec::new(),
+            model_cursor: 0,
+            filter: String::new(),
+            existing: false,
+            preset: 0,
+            request_id: 0,
             status: None,
-            testing: false,
         });
     }
 
-    pub fn wizard_row(&self) -> usize {
-        self.wizard.as_ref().map(|w| w.row).unwrap_or(0)
-    }
-
-    pub fn wizard_config(&self) -> Option<evrax_agent::AgentConfig> {
-        let wizard = self.wizard.as_ref()?;
-        Some(evrax_agent::AgentConfig {
-            base_url: wizard.base_url.trim().to_string(),
-            model: wizard.model.trim().to_string(),
-            api_key: Some(wizard.api_key.trim().to_string()).filter(|key| !key.is_empty()),
-            ..evrax_agent::AgentConfig::default()
-        })
+    pub fn wizard_step(&self) -> Option<WizardStep> {
+        self.wizard.as_ref().map(|wizard| wizard.step)
     }
 
     pub fn wizard_move(&mut self, delta: i32) {
-        if let Some(wizard) = self.wizard.as_mut() {
-            wizard.editing = false;
-            wizard.row = ((wizard.row as i32 + delta).rem_euclid(6)) as usize;
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        match wizard.step {
+            WizardStep::Providers => {
+                let rows = self.providers.len() + 1;
+                wizard.cursor = (wizard.cursor as i32 + delta).rem_euclid(rows as i32) as usize;
+            }
+            WizardStep::Models => {
+                if wizard.filtered.is_empty() {
+                    wizard.model_cursor = 0;
+                } else {
+                    let count = wizard.filtered.len() as i32;
+                    wizard.model_cursor =
+                        (wizard.model_cursor as i32 + delta).rem_euclid(count) as usize;
+                }
+            }
+            _ => {}
         }
     }
 
+    /// Switches the protocol (kind step).
+    pub fn wizard_kind(&mut self, delta: i32) {
+        if let Some(wizard) = self.wizard.as_mut()
+            && wizard.step == WizardStep::Kind
+        {
+            let count = evrax_agent::ProviderKind::ALL.len() as i32;
+            let index = (wizard.kind as i32 + delta).rem_euclid(count) as usize;
+            wizard.kind = evrax_agent::ProviderKind::ALL[index];
+        }
+    }
+
+    /// Fills base URL / name from the built-in presets (base URL step).
     pub fn wizard_preset(&mut self, delta: i32) {
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        if wizard.step != WizardStep::BaseUrl {
+            return;
+        }
+        let count = WIZARD_PRESETS.len() as i32;
+        wizard.preset = (wizard.preset as i32 + delta).rem_euclid(count) as usize;
+        let (name, url, _) = WIZARD_PRESETS[wizard.preset];
+        wizard.base_url = url.to_string();
+        if wizard.name.trim().is_empty() {
+            wizard.name = name.to_string();
+        }
+    }
+
+    fn wizard_load_provider(&mut self, index: usize) {
+        let Some(provider) = self.providers.get(index).cloned() else {
+            return;
+        };
         if let Some(wizard) = self.wizard.as_mut() {
-            let count = WIZARD_PRESETS.len() as i32;
-            wizard.provider = ((wizard.provider as i32 + delta).rem_euclid(count)) as usize;
-            let (_, url, model) = WIZARD_PRESETS[wizard.provider];
-            if !url.is_empty() {
-                wizard.base_url = url.to_string();
-            }
-            if !model.is_empty() {
-                wizard.model = model.to_string();
-            }
+            wizard.kind = provider.kind;
+            wizard.name = provider.name;
+            wizard.base_url = provider.base_url;
+            wizard.api_key = provider.api_key.unwrap_or_default();
+            wizard.model = provider.model;
+            wizard.models.clear();
+            wizard.filtered.clear();
+            wizard.filter.clear();
+            wizard.existing = true;
+            wizard.step = WizardStep::Kind;
+            wizard.status = None;
+        }
+    }
+
+    fn wizard_new_provider(&mut self) {
+        if let Some(wizard) = self.wizard.as_mut() {
+            wizard.kind = evrax_agent::ProviderKind::Openai;
+            wizard.name.clear();
+            wizard.base_url.clear();
+            wizard.api_key.clear();
+            wizard.model.clear();
+            wizard.models.clear();
+            wizard.filtered.clear();
+            wizard.filter.clear();
+            wizard.existing = false;
+            wizard.step = WizardStep::Kind;
+            wizard.status = None;
         }
     }
 
     pub fn wizard_enter(&mut self) -> WizardAction {
-        let Some(row) = self.wizard.as_ref().map(|wizard| wizard.row) else {
+        let Some(step) = self.wizard.as_ref().map(|wizard| wizard.step) else {
             return WizardAction::None;
         };
         if self.wizard.as_ref().is_some_and(|wizard| wizard.editing) {
@@ -878,28 +1072,163 @@ impl App {
             }
             return WizardAction::None;
         }
-        match row {
-            0 => {
-                self.wizard_preset(1);
+        match step {
+            WizardStep::Providers => {
+                let cursor = self.wizard.as_ref().map(|w| w.cursor).unwrap_or(0);
+                if cursor < self.providers.len() {
+                    self.wizard_load_provider(cursor);
+                } else {
+                    self.wizard_new_provider();
+                }
                 WizardAction::None
             }
-            1..=3 => {
+            WizardStep::Kind => {
                 if let Some(wizard) = self.wizard.as_mut() {
+                    wizard.step = WizardStep::Name;
+                    wizard.editing = true;
+                    wizard.status = None;
+                }
+                WizardAction::None
+            }
+            WizardStep::Name => {
+                if self
+                    .wizard
+                    .as_ref()
+                    .is_some_and(|wizard| wizard.name.trim().is_empty())
+                {
+                    self.wizard_status("nama provider wajib diisi", false);
+                    return WizardAction::None;
+                }
+                if let Some(wizard) = self.wizard.as_mut() {
+                    wizard.step = WizardStep::BaseUrl;
                     wizard.editing = true;
                 }
                 WizardAction::None
             }
-            4 => {
-                let cfg = self.wizard_config();
-                if let Some(wizard) = self.wizard.as_mut() {
-                    wizard.testing = true;
-                    wizard.status = Some("testing...".to_string());
+            WizardStep::BaseUrl => {
+                let valid = self.wizard.as_ref().is_some_and(|wizard| {
+                    let url = wizard.base_url.trim().to_lowercase();
+                    url.starts_with("http://") || url.starts_with("https://")
+                });
+                if !valid {
+                    self.wizard_status("base URL harus diawali http:// atau https://", false);
+                    return WizardAction::None;
                 }
-                cfg.map(WizardAction::Test).unwrap_or(WizardAction::None)
+                if let Some(wizard) = self.wizard.as_mut() {
+                    wizard.step = WizardStep::ApiKey;
+                    wizard.editing = true;
+                }
+                WizardAction::None
             }
-            _ => {
-                let cfg = self.wizard_config();
-                cfg.map(WizardAction::Save).unwrap_or(WizardAction::None)
+            WizardStep::ApiKey => {
+                let request_id = self.next_fetch_id();
+                let Some(wizard) = self.wizard.as_mut() else {
+                    return WizardAction::None;
+                };
+                wizard.request_id = request_id;
+                wizard.step = WizardStep::Checking;
+                wizard.editing = false;
+                wizard.models.clear();
+                wizard.filtered.clear();
+                wizard.filter.clear();
+                wizard.status = Some("cek API key & ambil model...".to_string());
+                WizardAction::FetchModels(FetchRequest {
+                    request_id,
+                    kind: wizard.kind,
+                    base_url: wizard.base_url.trim().to_string(),
+                    api_key: Some(wizard.api_key.trim().to_string()).filter(|key| !key.is_empty()),
+                })
+            }
+            WizardStep::Checking => WizardAction::None,
+            WizardStep::Models => {
+                let Some(wizard) = self.wizard.as_mut() else {
+                    return WizardAction::None;
+                };
+                if let Some(index) = wizard.filtered.get(wizard.model_cursor) {
+                    wizard.model = wizard.models[*index].clone();
+                    wizard.step = WizardStep::Review;
+                } else if !wizard.filter.trim().is_empty() {
+                    wizard.model = wizard.filter.trim().to_string();
+                    wizard.step = WizardStep::Review;
+                } else {
+                    wizard.status = Some("ketik nama model dulu".to_string());
+                }
+                WizardAction::None
+            }
+            WizardStep::Review => match self.wizard_settings() {
+                Some(settings) => WizardAction::Save(settings),
+                None => {
+                    self.wizard_status("lengkapi nama, base URL, dan model", false);
+                    WizardAction::None
+                }
+            },
+        }
+    }
+
+    /// Settings snapshot for the current wizard form (None when incomplete).
+    pub fn wizard_settings(&self) -> Option<evrax_agent::ConfigSettings> {
+        let wizard = self.wizard.as_ref()?;
+        let name = wizard.name.trim();
+        let base_url = wizard.base_url.trim();
+        let model = wizard.model.trim();
+        if name.is_empty() || base_url.is_empty() || model.is_empty() {
+            return None;
+        }
+        let provider = evrax_agent::Provider {
+            name: name.to_string(),
+            kind: wizard.kind,
+            base_url: base_url.to_string(),
+            api_key: Some(wizard.api_key.trim().to_string()).filter(|key| !key.is_empty()),
+            model: model.to_string(),
+        };
+        let mut providers = self.providers.clone();
+        match evrax_agent::provider_index(&providers, name) {
+            Some(index) => providers[index] = provider,
+            None => providers.push(provider),
+        }
+        Some(evrax_agent::ConfigSettings {
+            providers,
+            active: name.to_string(),
+            max_iterations: self.max_iterations,
+            mock: self.config_mock,
+        })
+    }
+
+    /// Applies a saved settings snapshot and queues a backend swap.
+    pub fn apply_settings(&mut self, settings: evrax_agent::ConfigSettings) {
+        self.active_provider = Some(settings.active.clone());
+        self.providers = settings.providers.clone();
+        self.max_iterations = settings.max_iterations;
+        self.queue_backend_reload(settings.resolved());
+    }
+
+    pub fn wizard_models_ready(&mut self, request_id: u64, result: Result<Vec<String>, String>) {
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        if wizard.request_id != request_id {
+            return;
+        }
+        match result {
+            Ok(models) => {
+                wizard.models = models;
+                wizard.filter.clear();
+                wizard.model_cursor = 0;
+                wizard.refilter();
+                wizard.step = WizardStep::Models;
+                wizard.status = if wizard.models.is_empty() {
+                    Some("tidak ada model; ketik nama model manual lalu Enter".to_string())
+                } else {
+                    None
+                };
+            }
+            Err(error) => {
+                wizard.models.clear();
+                wizard.filtered.clear();
+                wizard.filter.clear();
+                wizard.model_cursor = 0;
+                wizard.step = WizardStep::Models;
+                wizard.status = Some(format!("{error} - ketik model manual lalu Enter"));
             }
         }
     }
@@ -912,53 +1241,270 @@ impl App {
         self.reload_config.take()
     }
 
+    /// Esc inside the wizard: closes it (true) or moves one step back (false).
     pub fn wizard_escape(&mut self) -> bool {
-        if let Some(wizard) = self.wizard.as_mut()
-            && wizard.editing
-        {
+        let Some(wizard) = self.wizard.as_mut() else {
+            return false;
+        };
+        if wizard.editing {
             wizard.editing = false;
-            return true;
+            return false;
         }
-        false
+        match wizard.step {
+            WizardStep::Providers => true,
+            WizardStep::Kind => {
+                wizard.step = WizardStep::Providers;
+                false
+            }
+            WizardStep::Name => {
+                wizard.step = WizardStep::Kind;
+                false
+            }
+            WizardStep::BaseUrl => {
+                wizard.step = WizardStep::Name;
+                false
+            }
+            WizardStep::ApiKey => {
+                wizard.step = WizardStep::BaseUrl;
+                false
+            }
+            WizardStep::Models => {
+                wizard.step = WizardStep::ApiKey;
+                false
+            }
+            WizardStep::Review => {
+                wizard.step = WizardStep::Models;
+                false
+            }
+            WizardStep::Checking => false,
+        }
     }
 
     pub fn wizard_type(&mut self, c: char) {
-        if let Some(wizard) = self.wizard.as_mut() {
-            match wizard.row {
-                1 => wizard.base_url.push(c),
-                2 => wizard.model.push(c),
-                3 => wizard.api_key.push(c),
-                _ => {}
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        match wizard.step {
+            WizardStep::Name => wizard.name.push(c),
+            WizardStep::BaseUrl => wizard.base_url.push(c),
+            WizardStep::ApiKey => wizard.api_key.push(c),
+            WizardStep::Models => {
+                wizard.filter.push(c);
+                wizard.refilter();
             }
+            _ => {}
         }
     }
 
     pub fn wizard_backspace(&mut self) {
-        if let Some(wizard) = self.wizard.as_mut() {
-            match wizard.row {
-                1 => {
-                    wizard.base_url.pop();
-                }
-                2 => {
-                    wizard.model.pop();
-                }
-                3 => {
-                    wizard.api_key.pop();
-                }
-                _ => {}
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        match wizard.step {
+            WizardStep::Name => {
+                wizard.name.pop();
             }
+            WizardStep::BaseUrl => {
+                wizard.base_url.pop();
+            }
+            WizardStep::ApiKey => {
+                wizard.api_key.pop();
+            }
+            WizardStep::Models => {
+                wizard.filter.pop();
+                wizard.refilter();
+            }
+            _ => {}
         }
     }
 
-    pub fn wizard_status(&mut self, status: impl Into<String>, testing: bool) {
+    pub fn wizard_status(&mut self, status: impl Into<String>, _busy: bool) {
         if let Some(wizard) = self.wizard.as_mut() {
             wizard.status = Some(status.into());
-            wizard.testing = testing;
         }
     }
 
     pub fn wizard_close(&mut self) {
         self.wizard = None;
+    }
+
+    pub fn open_model_dialog(&mut self) {
+        if self.providers.is_empty() {
+            self.set_flash("belum ada provider - jalankan evrax --setup".to_string());
+            return;
+        }
+        let cursor = self
+            .active_provider
+            .as_deref()
+            .and_then(|name| evrax_agent::provider_index(&self.providers, name))
+            .unwrap_or(0);
+        self.model_dialog = Some(ModelDialog {
+            level: ModelLevel::Providers,
+            provider_cursor: cursor,
+            model_cursor: 0,
+            models: Vec::new(),
+            filtered: Vec::new(),
+            filter: String::new(),
+            request_id: 0,
+            loading: false,
+            status: None,
+        });
+    }
+
+    pub fn model_dialog_open(&self) -> bool {
+        self.model_dialog.is_some()
+    }
+
+    pub fn model_move(&mut self, delta: i32) {
+        let Some(dialog) = self.model_dialog.as_mut() else {
+            return;
+        };
+        match dialog.level {
+            ModelLevel::Providers => {
+                let count = self.providers.len() as i32;
+                dialog.provider_cursor =
+                    (dialog.provider_cursor as i32 + delta).rem_euclid(count) as usize;
+            }
+            ModelLevel::Models => {
+                if !dialog.filtered.is_empty() {
+                    let count = dialog.filtered.len() as i32;
+                    dialog.model_cursor =
+                        (dialog.model_cursor as i32 + delta).rem_euclid(count) as usize;
+                }
+            }
+        }
+    }
+
+    pub fn model_type(&mut self, c: char) {
+        if let Some(dialog) = self.model_dialog.as_mut()
+            && dialog.level == ModelLevel::Models
+        {
+            dialog.filter.push(c);
+            dialog.refilter();
+        }
+    }
+
+    pub fn model_backspace(&mut self) {
+        if let Some(dialog) = self.model_dialog.as_mut()
+            && dialog.level == ModelLevel::Models
+        {
+            dialog.filter.pop();
+            dialog.refilter();
+        }
+    }
+
+    pub fn model_enter(&mut self) -> ModelAction {
+        let Some(dialog) = self.model_dialog.as_ref() else {
+            return ModelAction::None;
+        };
+        match dialog.level {
+            ModelLevel::Providers => {
+                let Some(provider) = self.providers.get(dialog.provider_cursor).cloned() else {
+                    return ModelAction::None;
+                };
+                let request_id = self.next_fetch_id();
+                if let Some(dialog) = self.model_dialog.as_mut() {
+                    dialog.level = ModelLevel::Models;
+                    dialog.loading = true;
+                    dialog.request_id = request_id;
+                    dialog.models.clear();
+                    dialog.filtered.clear();
+                    dialog.filter.clear();
+                    dialog.model_cursor = 0;
+                    dialog.status = Some("memuat model...".to_string());
+                }
+                ModelAction::FetchModels(FetchRequest {
+                    request_id,
+                    kind: provider.kind,
+                    base_url: provider.base_url.clone(),
+                    api_key: provider.clean_key().map(str::to_string),
+                })
+            }
+            ModelLevel::Models => {
+                if dialog.loading {
+                    return ModelAction::None;
+                }
+                let chosen = dialog
+                    .filtered
+                    .get(dialog.model_cursor)
+                    .and_then(|index| dialog.models.get(*index))
+                    .cloned()
+                    .or_else(|| {
+                        (!dialog.filter.trim().is_empty()).then(|| dialog.filter.trim().to_string())
+                    });
+                let index = dialog.provider_cursor;
+                let Some(model) = chosen else {
+                    if let Some(dialog) = self.model_dialog.as_mut() {
+                        dialog.status = Some("ketik nama model atau pilih dari daftar".to_string());
+                    }
+                    return ModelAction::None;
+                };
+                let mut providers = self.providers.clone();
+                let Some(provider) = providers.get_mut(index) else {
+                    return ModelAction::None;
+                };
+                provider.model = model;
+                let active = provider.name.clone();
+                let settings = evrax_agent::ConfigSettings {
+                    providers,
+                    active,
+                    max_iterations: self.max_iterations,
+                    mock: self.config_mock,
+                };
+                ModelAction::Apply(settings)
+            }
+        }
+    }
+
+    pub fn model_ready(&mut self, request_id: u64, result: Result<Vec<String>, String>) {
+        let Some(dialog) = self.model_dialog.as_mut() else {
+            return;
+        };
+        if dialog.request_id != request_id {
+            return;
+        }
+        dialog.loading = false;
+        match result {
+            Ok(models) => {
+                dialog.models = models;
+                dialog.filter.clear();
+                dialog.model_cursor = 0;
+                dialog.refilter();
+                dialog.status = if dialog.models.is_empty() {
+                    Some("tidak ada model; ketik nama model manual lalu Enter".to_string())
+                } else {
+                    None
+                };
+            }
+            Err(error) => {
+                dialog.models.clear();
+                dialog.filtered.clear();
+                dialog.filter.clear();
+                dialog.status = Some(format!("{error} - ketik model manual lalu Enter"));
+            }
+        }
+    }
+
+    pub fn model_escape(&mut self) -> bool {
+        let Some(dialog) = self.model_dialog.as_mut() else {
+            return true;
+        };
+        match dialog.level {
+            ModelLevel::Providers => true,
+            ModelLevel::Models => {
+                dialog.level = ModelLevel::Providers;
+                dialog.models.clear();
+                dialog.filtered.clear();
+                dialog.filter.clear();
+                dialog.status = None;
+                dialog.loading = false;
+                false
+            }
+        }
+    }
+
+    pub fn model_close(&mut self) {
+        self.model_dialog = None;
     }
 
     /// Wires a project store: loads the session list + titles from disk.
@@ -1320,6 +1866,7 @@ impl App {
             ("Copy last reply".to_string(), Command::CopyReply),
             ("New session".to_string(), Command::NewSession),
             ("Change theme".to_string(), Command::Theme),
+            ("Provider and model".to_string(), Command::Model),
             ("Remote web".to_string(), Command::Remote),
             ("Quit evrax".to_string(), Command::Quit),
         ]
@@ -1351,6 +1898,7 @@ impl App {
             },
             Command::NewSession => self.new_session(),
             Command::Theme => self.open_theme_dialog(),
+            Command::Model => self.open_model_dialog(),
             Command::Remote => self.open_remote_dialog(),
             Command::Rename => self.rename_session_title(""),
             Command::Quit => self.quit(),
@@ -3079,7 +3627,7 @@ mod tests {
         let mut app = app();
         app.toggle_palette();
         assert!(app.palette.is_some());
-        assert_eq!(app.filtered_commands().len(), 7);
+        assert_eq!(app.filtered_commands().len(), 8);
         for c in "plan".chars() {
             app.palette_type(c);
         }
@@ -3111,13 +3659,13 @@ mod tests {
         let mut app = app();
         app.toggle_palette();
         app.palette_move(-1);
-        assert_eq!(app.palette.as_ref().unwrap().selected, 6);
+        assert_eq!(app.palette.as_ref().unwrap().selected, 7);
         app.palette_move(1);
         assert_eq!(app.palette.as_ref().unwrap().selected, 0);
         app.palette_type('z');
         assert_eq!(app.filtered_commands().len(), 0);
         app.palette_backspace();
-        assert_eq!(app.filtered_commands().len(), 7);
+        assert_eq!(app.filtered_commands().len(), 8);
     }
 
     #[test]
@@ -3561,9 +4109,9 @@ mod tests {
     fn palette_page_clamps_to_bounds() {
         let mut app = app();
         app.toggle_palette();
-        // 7 commands; page size 8 â†’ down stays on the last row.
+        // 8 commands; page size 8 → down stays on the last row.
         app.palette_page(1, 8);
-        assert_eq!(app.palette.as_ref().unwrap().selected, 6);
+        assert_eq!(app.palette.as_ref().unwrap().selected, 7);
         // Up two pages of 8 â†’ still on the first row.
         app.palette_page(-1, 8);
         app.palette_page(-1, 8);
@@ -3882,40 +4430,186 @@ mod tests {
         app.save_current();
         assert!(store.list().unwrap().is_empty());
     }
-    #[test]
-    fn wizard_presets_fill_provider_defaults() {
+    fn wizard_at(step: WizardStep) -> App {
         let mut app = App::new();
-        app.open_wizard(&evrax_agent::AgentConfig::default());
+        app.open_wizard();
+        if let Some(wizard) = app.wizard.as_mut() {
+            wizard.step = step;
+            wizard.editing = false;
+        }
+        app
+    }
+
+    #[test]
+    fn wizard_startswith_providers_when_any_saved() {
+        let mut app = App::new();
+        app.providers = vec![evrax_agent::Provider::new(
+            "9router",
+            "http://127.0.0.1:20128/v1",
+        )];
+        app.open_wizard();
+        assert_eq!(app.wizard_step(), Some(WizardStep::Providers));
+        let mut fresh = App::new();
+        fresh.open_wizard();
+        assert_eq!(fresh.wizard_step(), Some(WizardStep::Kind));
+    }
+
+    #[test]
+    fn wizard_presets_fill_base_url() {
+        let mut app = wizard_at(WizardStep::BaseUrl);
         app.wizard_preset(1);
         let wizard = app.wizard.as_ref().unwrap();
         assert_eq!(wizard.base_url, "https://openrouter.ai/api/v1");
-        assert!(!wizard.model.is_empty());
+        assert_eq!(wizard.name, "OpenRouter");
     }
 
     #[test]
-    fn wizard_config_trims_and_drops_empty_key() {
-        let mut app = App::new();
-        app.open_wizard(&evrax_agent::AgentConfig::default());
+    fn wizard_settings_trims_and_drops_empty_key() {
+        let mut app = wizard_at(WizardStep::Review);
         if let Some(wizard) = app.wizard.as_mut() {
-            wizard.base_url = "  http://x/v1  ".into();
+            wizard.name = "  http://x/v1  ".into();
+            wizard.base_url = " http://x/v1 ".into();
             wizard.model = " m ".into();
             wizard.api_key = "   ".into();
         }
-        let cfg = app.wizard_config().unwrap();
-        assert_eq!(cfg.base_url, "http://x/v1");
-        assert_eq!(cfg.model, "m");
-        assert!(cfg.api_key.is_none());
+        let settings = app.wizard_settings().unwrap();
+        assert_eq!(settings.active, "http://x/v1");
+        assert_eq!(settings.providers[0].base_url, "http://x/v1");
+        assert_eq!(settings.providers[0].model, "m");
+        assert!(settings.providers[0].api_key.is_none());
     }
 
     #[test]
-    fn wizard_save_keeps_modal_open_until_saved() {
-        let mut app = App::new();
-        app.open_wizard(&evrax_agent::AgentConfig::default());
+    fn wizard_api_key_step_requests_model_list() {
+        let mut app = wizard_at(WizardStep::ApiKey);
         if let Some(wizard) = app.wizard.as_mut() {
-            wizard.row = 5;
+            wizard.name = "Nimbus Go".into();
+            wizard.base_url = "https://api.example.com/v1".into();
+            wizard.api_key = " secret ".into();
+        }
+        let WizardAction::FetchModels(request) = app.wizard_enter() else {
+            panic!("expected FetchModels");
+        };
+        assert_eq!(request.base_url, "https://api.example.com/v1");
+        assert_eq!(request.api_key.as_deref(), Some("secret"));
+        assert_eq!(app.wizard_step(), Some(WizardStep::Checking));
+    }
+
+    #[test]
+    fn wizard_fetched_models_are_filterable_and_saved() {
+        let mut app = wizard_at(WizardStep::Checking);
+        if let Some(wizard) = app.wizard.as_mut() {
+            wizard.name = "Nimbus Go".into();
+            wizard.base_url = "http://x/v1".into();
+            wizard.api_key = "k".into();
+            wizard.request_id = 1;
+        }
+        app.wizard_models_ready(
+            1,
+            Ok(vec![
+                "deepseek-chat".into(),
+                "gpt-5-mini".into(),
+                "bebas".into(),
+            ]),
+        );
+        assert_eq!(app.wizard_step(), Some(WizardStep::Models));
+        assert_eq!(app.wizard.as_ref().unwrap().filtered.len(), 3);
+        for c in "gpt".chars() {
+            app.wizard_type(c);
+        }
+        assert_eq!(app.wizard.as_ref().unwrap().filtered.len(), 1);
+        app.wizard_enter();
+        assert_eq!(app.wizard_step(), Some(WizardStep::Review));
+        let WizardAction::Save(settings) = app.wizard_enter() else {
+            panic!("expected Save");
+        };
+        assert_eq!(settings.providers[0].model, "gpt-5-mini");
+        assert_eq!(settings.active, "Nimbus Go");
+    }
+
+    #[test]
+    fn wizard_keeps_modal_open_until_saved_and_upserts_existing() {
+        let mut app = wizard_at(WizardStep::Review);
+        app.providers = vec![evrax_agent::Provider {
+            name: "Muse Spark".into(),
+            kind: evrax_agent::ProviderKind::Anthropic,
+            base_url: "http://b/v1".into(),
+            api_key: Some("old".into()),
+            model: "old-model".into(),
+        }];
+        if let Some(wizard) = app.wizard.as_mut() {
+            wizard.name = "Muse Spark".into();
+            wizard.kind = evrax_agent::ProviderKind::Anthropic;
+            wizard.base_url = "http://b/v1".into();
+            wizard.api_key = "new".into();
+            wizard.model = "claude-x".into();
         }
         assert!(matches!(app.wizard_enter(), WizardAction::Save(_)));
         assert!(app.wizard.is_some());
+        let settings = app.wizard_settings().unwrap();
+        assert_eq!(settings.providers.len(), 1, "same name updates in place");
+        assert_eq!(settings.providers[0].api_key.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn wizard_escape_steps_back_then_closes() {
+        let mut app = wizard_at(WizardStep::Models);
+        assert!(!app.wizard_escape());
+        assert_eq!(app.wizard_step(), Some(WizardStep::ApiKey));
+        let mut app = wizard_at(WizardStep::Providers);
+        assert!(app.wizard_escape());
+    }
+
+    #[test]
+    fn model_dialog_fetches_then_applies_settings() {
+        let mut app = App::new();
+        app.providers = vec![
+            evrax_agent::Provider::new("Nimbus Go", "http://a/v1"),
+            evrax_agent::Provider {
+                name: "Muse Spark".into(),
+                kind: evrax_agent::ProviderKind::Anthropic,
+                base_url: "http://b/v1".into(),
+                api_key: Some("k".into()),
+                model: "old".into(),
+            },
+        ];
+        app.active_provider = Some("Nimbus Go".into());
+        app.open_model_dialog();
+        app.model_move(1);
+        let ModelAction::FetchModels(request) = app.model_enter() else {
+            panic!("expected FetchModels");
+        };
+        assert_eq!(request.kind, evrax_agent::ProviderKind::Anthropic);
+        assert_eq!(request.api_key.as_deref(), Some("k"));
+        app.model_ready(
+            request.request_id,
+            Ok(vec!["claude-x".into(), "claude-y".into()]),
+        );
+        assert!(!app.model_dialog.as_ref().unwrap().loading);
+        let ModelAction::Apply(settings) = app.model_enter() else {
+            panic!("expected Apply");
+        };
+        assert_eq!(settings.active, "Muse Spark");
+        assert_eq!(settings.providers[1].model, "claude-x");
+    }
+
+    #[test]
+    fn model_dialog_falls_back_to_typed_model() {
+        let mut app = App::new();
+        app.providers = vec![evrax_agent::Provider::new("Nimbus Go", "http://a/v1")];
+        app.open_model_dialog();
+        let ModelAction::FetchModels(request) = app.model_enter() else {
+            panic!("expected FetchModels");
+        };
+        app.model_ready(request.request_id, Err("404 no /models".into()));
+        for c in "custom-model".chars() {
+            app.model_type(c);
+        }
+        let ModelAction::Apply(settings) = app.model_enter() else {
+            panic!("expected Apply");
+        };
+        assert_eq!(settings.providers[0].model, "custom-model");
+        assert_eq!(settings.active, "Nimbus Go");
     }
 
     #[test]

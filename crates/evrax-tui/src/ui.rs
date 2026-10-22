@@ -12,7 +12,8 @@ use evrax_core::DiffKind;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    APPROVAL_OPTIONS, AgentMode, App, ChatEntry, ToolStatus, TunnelEditKind, WIZARD_PRESETS,
+    APPROVAL_OPTIONS, AgentMode, App, ChatEntry, ModelLevel, ToolStatus, TunnelEditKind,
+    WIZARD_PRESETS, WizardStep,
 };
 use crate::markdown;
 use crate::theme::current;
@@ -51,6 +52,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     theme_modal(frame, app);
     remote_modal(frame, app);
     tunnel_modal(frame, app);
+    model_modal(frame, app);
     preview_modal(frame, app);
 }
 
@@ -58,7 +60,15 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
     let Some(wizard) = app.wizard.as_ref() else {
         return;
     };
-    let Some(inner) = modal(frame, "setup", 68, 16) else {
+    let title = match wizard.step {
+        WizardStep::Providers => "setup - provider",
+        WizardStep::Kind | WizardStep::Name | WizardStep::BaseUrl | WizardStep::ApiKey => {
+            "setup - provider baru"
+        }
+        WizardStep::Checking | WizardStep::Models => "setup - model",
+        WizardStep::Review => "setup - ringkasan",
+    };
+    let Some(inner) = modal(frame, title, 72, 22) else {
         return;
     };
     let muted = Style::default().fg(current().muted);
@@ -71,9 +81,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
             Style::default().fg(current().text)
         }
     };
-    let field = |label: &str, value: String, row: usize| {
-        let selected = wizard.row == row;
-        let editing = selected && wizard.editing;
+    let field = |label: &str, value: String, selected: bool, editing: bool| {
         let shown = if editing {
             format!("{value}\u{2588}")
         } else if value.is_empty() {
@@ -82,44 +90,175 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
             value
         };
         Line::from(vec![
-            Span::styled(format!(" {label:<10} "), muted),
+            Span::styled(format!(" {label:<11} "), muted),
             Span::styled(shown, row_style(selected)),
         ])
     };
-    let key_display = if wizard.row == 3 && wizard.editing {
+    let key_display = if wizard.editing {
         wizard.api_key.clone()
     } else {
-        "*".repeat(wizard.api_key.chars().count().min(28))
+        "*".repeat(wizard.api_key.chars().count().min(32))
     };
-    let mut lines = vec![
-        Line::from(" evrax butuh konfigurasi provider"),
-        Line::from(""),
-        field(
-            "provider",
-            format!("{}  (\u{25c0}/\u{25b6})", WIZARD_PRESETS[wizard.provider].0),
-            0,
-        ),
-        field("base url", wizard.base_url.clone(), 1),
-        field("model", wizard.model.clone(), 2),
-        field("api key", key_display, 3),
-        Line::from(Span::styled(
-            if wizard.row == 4 {
-                " [ test connection ]"
-            } else {
-                " test connection"
-            },
-            row_style(wizard.row == 4),
-        )),
-        Line::from(Span::styled(
-            if wizard.row == 5 {
-                " [ simpan & tutup ]"
-            } else {
-                " simpan & tutup"
-            },
-            row_style(wizard.row == 5),
-        )),
-        Line::from(""),
-    ];
+    let mut lines: Vec<Line> = Vec::new();
+    match wizard.step {
+        WizardStep::Providers => {
+            lines.push(Line::from(" pilih provider tersimpan atau tambah baru"));
+            lines.push(Line::from(""));
+            let total = app.providers.len() + 1;
+            let (offset, visible) = dialog_window(total, wizard.cursor, 8);
+            for index in offset..offset + visible {
+                let selected = index == wizard.cursor;
+                let label = match app.providers.get(index) {
+                    Some(provider) => {
+                        let active = app
+                            .active_provider
+                            .as_deref()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&provider.name));
+                        format!(
+                            "{} {:<18} {:<18} {}",
+                            if active { "\u{25cf}" } else { " " },
+                            provider.name,
+                            provider.kind.label(),
+                            provider.model
+                        )
+                    }
+                    None => "+ tambah provider baru".to_string(),
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(" {label}"),
+                    if selected {
+                        Style::default().fg(current().text).bg(current().selection)
+                    } else {
+                        Style::default().fg(current().text)
+                    },
+                )));
+            }
+        }
+        WizardStep::Kind => {
+            lines.push(Line::from(" tipe provider"));
+            lines.push(Line::from(""));
+            for kind in evrax_agent::ProviderKind::ALL {
+                let selected = wizard.kind == kind;
+                let marker = if selected { "\u{25b8}" } else { " " };
+                let label = match kind {
+                    evrax_agent::ProviderKind::Openai => "openai-compatible",
+                    evrax_agent::ProviderKind::Anthropic => "anthropic",
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(" {marker} {label}"),
+                    if selected {
+                        Style::default().fg(current().text).bg(current().selection)
+                    } else {
+                        Style::default().fg(current().text)
+                    },
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " openai-compatible: /chat/completions - anthropic: /messages",
+                muted,
+            )));
+        }
+        WizardStep::Name => {
+            lines.push(Line::from(" nama provider (bebas, mis. Nimbus Go)"));
+            lines.push(Line::from(""));
+            lines.push(field("nama", wizard.name.clone(), true, wizard.editing));
+        }
+        WizardStep::BaseUrl => {
+            lines.push(Line::from(" base URL provider"));
+            lines.push(Line::from(""));
+            lines.push(field(
+                "base url",
+                wizard.base_url.clone(),
+                true,
+                wizard.editing,
+            ));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " \u{25c0}/\u{25b6} preset: {}",
+                    WIZARD_PRESETS[wizard.preset].0
+                ),
+                muted,
+            )));
+        }
+        WizardStep::ApiKey => {
+            lines.push(Line::from(" API key (disimpan di agent.json)"));
+            lines.push(Line::from(""));
+            lines.push(field("api key", key_display, true, wizard.editing));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " enter: cek key & ambil daftar model",
+                muted,
+            )));
+        }
+        WizardStep::Checking => {
+            lines.push(Line::from(" menghubungi provider..."));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {} {}",
+                    wizard.base_url,
+                    wizard.status.clone().unwrap_or_default()
+                ),
+                muted,
+            )));
+        }
+        WizardStep::Models => {
+            lines.push(Line::from(format!(" pilih model - {}", wizard.name)));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(" cari ", muted),
+                Span::styled(
+                    format!("{}\u{2588}", wizard.filter),
+                    Style::default().fg(current().text),
+                ),
+            ]));
+            let (offset, visible) = dialog_window(wizard.filtered.len(), wizard.model_cursor, 9);
+            for row in offset..offset + visible {
+                let Some(model) = wizard
+                    .filtered
+                    .get(row)
+                    .and_then(|index| wizard.models.get(*index))
+                else {
+                    continue;
+                };
+                let selected = row == wizard.model_cursor;
+                lines.push(Line::from(Span::styled(
+                    format!(" {model}"),
+                    if selected {
+                        Style::default().fg(current().text).bg(current().selection)
+                    } else {
+                        Style::default().fg(current().text)
+                    },
+                )));
+            }
+            if wizard.filtered.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        " (tidak ada model; enter memakai \"{}\")",
+                        wizard.filter.trim()
+                    ),
+                    muted,
+                )));
+            }
+        }
+        WizardStep::Review => {
+            lines.push(Line::from(" ringkasan provider"));
+            lines.push(Line::from(""));
+            lines.push(field("nama", wizard.name.clone(), false, false));
+            lines.push(field("tipe", wizard.kind.label().to_string(), false, false));
+            lines.push(field("base url", wizard.base_url.clone(), false, false));
+            lines.push(field("model", wizard.model.clone(), false, false));
+            lines.push(field("api key", key_display, false, false));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " [ simpan & aktifkan ]",
+                row_style(true),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
     if let Some(status) = &wizard.status {
         lines.push(Line::from(Span::styled(
             format!(" {status}"),
@@ -128,10 +267,117 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
     } else {
         lines.push(Line::from(""));
     }
-    lines.push(Line::from(Span::styled(
-        " enter: edit/pilih \u{b7} esc: tutup",
-        muted,
-    )));
+    let hint = match wizard.step {
+        WizardStep::Providers => " enter: pilih \u{b7} esc: tutup",
+        WizardStep::Models => " enter: pilih/ketik model \u{b7} esc: kembali",
+        WizardStep::Review => " enter: simpan \u{b7} esc: kembali",
+        WizardStep::Checking => " menunggu provider...",
+        _ => " enter: lanjut/edit \u{b7} esc: kembali",
+    };
+    lines.push(Line::from(Span::styled(hint, muted)));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn model_modal(frame: &mut Frame, app: &App) {
+    let Some(dialog) = app.model_dialog.as_ref() else {
+        return;
+    };
+    let title = match dialog.level {
+        ModelLevel::Providers => "model - provider",
+        ModelLevel::Models => "model - pilih model",
+    };
+    let Some(inner) = modal(frame, title, 72, 20) else {
+        return;
+    };
+    let muted = Style::default().fg(current().muted);
+    let mut lines: Vec<Line> = Vec::new();
+    match dialog.level {
+        ModelLevel::Providers => {
+            lines.push(Line::from(" pilih provider"));
+            lines.push(Line::from(""));
+            let (offset, visible) = dialog_window(app.providers.len(), dialog.provider_cursor, 10);
+            for index in offset..offset + visible {
+                let Some(provider) = app.providers.get(index) else {
+                    continue;
+                };
+                let selected = index == dialog.provider_cursor;
+                let active = app
+                    .active_provider
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&provider.name));
+                let label = format!(
+                    "{} {:<18} {:<18} {}",
+                    if active { "\u{25cf}" } else { " " },
+                    provider.name,
+                    provider.kind.label(),
+                    provider.model
+                );
+                lines.push(Line::from(Span::styled(
+                    format!(" {label}"),
+                    if selected {
+                        Style::default().fg(current().text).bg(current().selection)
+                    } else {
+                        Style::default().fg(current().text)
+                    },
+                )));
+            }
+        }
+        ModelLevel::Models => {
+            let provider = app
+                .providers
+                .get(dialog.provider_cursor)
+                .map(|provider| provider.name.clone())
+                .unwrap_or_default();
+            lines.push(Line::from(format!(" {provider}")));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(" cari ", muted),
+                Span::styled(
+                    format!("{}\u{2588}", dialog.filter),
+                    Style::default().fg(current().text),
+                ),
+            ]));
+            let (offset, visible) = dialog_window(dialog.filtered.len(), dialog.model_cursor, 10);
+            for row in offset..offset + visible {
+                let Some(model) = dialog
+                    .filtered
+                    .get(row)
+                    .and_then(|index| dialog.models.get(*index))
+                else {
+                    continue;
+                };
+                let selected = row == dialog.model_cursor;
+                lines.push(Line::from(Span::styled(
+                    format!(" {model}"),
+                    if selected {
+                        Style::default().fg(current().text).bg(current().selection)
+                    } else {
+                        Style::default().fg(current().text)
+                    },
+                )));
+            }
+            if dialog.filtered.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!(" (kosong; enter memakai \"{}\")", dialog.filter.trim()),
+                    muted,
+                )));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+    if let Some(status) = &dialog.status {
+        lines.push(Line::from(Span::styled(
+            format!(" {status}"),
+            Style::default().fg(current().muted),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    let hint = match dialog.level {
+        ModelLevel::Providers => " enter: lihat model \u{b7} esc: tutup",
+        ModelLevel::Models => " enter: pakai model \u{b7} esc: kembali \u{b7} ketik: cari",
+    };
+    lines.push(Line::from(Span::styled(hint, muted)));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -2710,18 +2956,47 @@ mod tests {
         assert!(shortened.starts_with('…'));
     }
     #[test]
-    fn wizard_modal_renders_setup_fields() {
+    fn wizard_modal_renders_provider_and_model_steps() {
         let mut app = App::new();
-        app.open_wizard(&evrax_agent::AgentConfig::default());
+        app.providers = vec![evrax_agent::Provider {
+            name: "9router".into(),
+            kind: evrax_agent::ProviderKind::Openai,
+            base_url: "http://127.0.0.1:20128/v1".into(),
+            api_key: Some("k".into()),
+            model: "bebas".into(),
+        }];
+        app.active_provider = Some("9router".into());
+        app.open_wizard();
         let text = render_text_with(&mut app, 100, 30);
-        for needle in [
-            "provider",
-            "base url",
-            "api key",
-            "test connection",
-            "simpan",
-        ] {
+        for needle in ["9router", "openai-compatible", "tambah provider baru"] {
             assert!(text.contains(needle), "missing {needle}:\n{text}");
         }
+        if let Some(wizard) = app.wizard.as_mut() {
+            wizard.step = WizardStep::Kind;
+        }
+        let text = render_text_with(&mut app, 100, 30);
+        assert!(text.contains("anthropic"), "{text}");
+        if let Some(wizard) = app.wizard.as_mut() {
+            wizard.step = WizardStep::Models;
+            wizard.name = "Nimbus Go".into();
+            wizard.models = vec!["gpt-5-mini".into(), "bebas".into()];
+            wizard.refilter();
+        }
+        let text = render_text_with(&mut app, 100, 30);
+        assert!(text.contains("gpt-5-mini"), "{text}");
+        assert!(text.contains("cari"), "{text}");
+    }
+
+    #[test]
+    fn model_dialog_renders_provider_list() {
+        let mut app = App::new();
+        app.providers = vec![
+            evrax_agent::Provider::new("Nimbus Go", "http://a/v1"),
+            evrax_agent::Provider::new("Muse Spark", "http://b/v1"),
+        ];
+        app.open_model_dialog();
+        let text = render_text_with(&mut app, 100, 30);
+        assert!(text.contains("Nimbus Go"), "{text}");
+        assert!(text.contains("Muse Spark"), "{text}");
     }
 }

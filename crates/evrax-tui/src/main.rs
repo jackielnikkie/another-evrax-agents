@@ -29,7 +29,10 @@ use ratatui::layout::Position;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::app::{AgentMode, App, ApprovalDecision, TunnelEditResult, TunnelEffect, WizardAction};
+use crate::app::{
+    AgentMode, App, ApprovalDecision, FetchRequest, FetchResult, ModelAction, TunnelEditResult,
+    TunnelEffect, WizardAction,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -203,7 +206,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn cli_info_flag() -> bool {
-    const HELP: &str = "USAGE:\n    evrax [OPTIONS]\n\nOPTIONS:\n    -c, --continue         resume the most recent session\n    -s, --session <spec>   resume by id, unique prefix, or title\n    -l, --list             list saved sessions and exit\n        --setup            open the provider setup wizard\n        --no-save          do not persist sessions\n        --mock             run with the built-in mock backend\n        --model <name>     model id\n        --base-url <url>   [OI]-compatible base URL\n        --api-key <key>    API key (else agent.json / EVRAX_API_KEY)\n        --max-iterations <n>  tool rounds per turn (default 500)\n        --root <path>      workspace root\n    -V, --version          print version and exit\n    -h, --help             print this help and exit";
+    const HELP: &str = "USAGE:\n    evrax [OPTIONS]\n\nOPTIONS:\n    -c, --continue         resume the most recent session\n    -s, --session <spec>   resume by id, unique prefix, or title\n    -l, --list             list saved sessions and exit\n        --setup            open the provider setup wizard\n        --no-save          do not persist sessions\n        --mock             run with the built-in mock backend\n        --provider <name>  use a saved provider for this run\n        --model <name>     model id\n        --base-url <url>   openai-compatible base URL\n        --api-key <key>    API key (else agent.json / EVRAX_API_KEY)\n        --max-iterations <n>  tool rounds per turn (default 500)\n        --root <path>      workspace root\n    -V, --version          print version and exit\n    -h, --help             print this help and exit\n\nIn the TUI: /model switches provider or model.";
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -283,10 +286,14 @@ fn chat_backend(
             Some("backend · mock".to_string()),
         );
     }
-    match evrax_agent::ChatBackend::new_with_project(cfg, store) {
+    match evrax_agent::ChatBackend::new_with_project(cfg.clone(), store) {
         Ok(real) => {
             let label = real.model().to_string();
-            let note = format!("backend · {label} · {}", real.base_url());
+            let note = if cfg.provider.is_empty() {
+                format!("backend · {label} · {}", real.base_url())
+            } else {
+                format!("backend · {} · {label} · {}", cfg.provider, real.base_url())
+            };
             (Box::new(real), label, Some(note))
         }
         Err(e) => (
@@ -307,9 +314,10 @@ async fn run(
     let (mut backend, backend_label, backend_note) =
         chat_backend(loaded.config.clone(), store.clone(), loaded.mock);
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
-    let (wizard_tx, mut wizard_rx) = mpsc::channel::<Result<String, String>>(4);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel::<FetchResult>(8);
     let mut turn_task: Option<JoinHandle<()>> = None;
     let mut app = App::new();
+    app.attach_config(&loaded);
     let subagent_id = arg_value("--subagent-id");
     if subagent_id.is_none()
         && let Some(store) = store.clone()
@@ -320,7 +328,7 @@ async fn run(
         }
     }
     if need_wizard {
-        app.open_wizard(&loaded.config);
+        app.open_wizard();
     }
     app.catalog = evrax_agent::catalog::Catalog::load();
     app.set_backend_label(backend_label);
@@ -351,11 +359,9 @@ async fn run(
     let mut input_open = true;
 
     while !app.should_quit {
-        while let Ok(result) = wizard_rx.try_recv() {
-            match result {
-                Ok(text) => app.wizard_status(format!("OK \u{b7} {text}"), false),
-                Err(err) => app.wizard_status(format!("gagal \u{b7} {err}"), false),
-            }
+        while let Ok((request_id, result)) = fetch_rx.try_recv() {
+            app.wizard_models_ready(request_id, result.clone());
+            app.model_ready(request_id, result);
             needs_draw = true;
         }
         if let Some(cfg) = app.take_reload_config() {
@@ -393,7 +399,9 @@ async fn run(
                 if event.is_none() {
                     input_open = false;
                 }
-                if let Some(Ok(Event::Key(key))) = event {
+                if let Some(Ok(Event::Key(key))) = event
+                    && key.kind == KeyEventKind::Press
+                {
                     if is_batchable(&app, &key)
                         && let KeyCode::Char(c) = key.code
                         && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL)
@@ -426,7 +434,9 @@ async fn run(
                             );
                         }
                     } else if app.wizard.is_some() {
-                        handle_wizard_key(&mut app, key, &wizard_tx);
+                        handle_wizard_key(&mut app, key, &fetch_tx);
+                    } else if app.model_dialog_open() {
+                        handle_model_key(&mut app, key, &fetch_tx);
                     } else {
                         handle_event(
                             &mut app,
@@ -588,6 +598,8 @@ fn is_batchable(app: &App, key: &crossterm::event::KeyEvent) -> bool {
         && app.theme_dialog.is_none()
         && app.remote_dialog.is_none()
         && app.preview.is_none()
+        && app.wizard.is_none()
+        && !app.model_dialog_open()
         && !app.busy
 }
 
@@ -813,33 +825,36 @@ fn drain_remote_approvals(app: &mut App, decision_tx: &mut Option<mpsc::Sender<b
     }
 }
 
-fn handle_wizard_key(
-    app: &mut App,
-    key: KeyEvent,
-    wizard_tx: &mpsc::Sender<Result<String, String>>,
-) {
+fn handle_wizard_key(app: &mut App, key: KeyEvent, fetch_tx: &mpsc::Sender<FetchResult>) {
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
     match key.code {
         KeyCode::Esc => {
-            if !app.wizard_escape() {
+            if app.wizard_escape() {
                 app.wizard_close();
                 app.set_flash("setup dilewati".to_string());
             }
         }
         KeyCode::Up => app.wizard_move(-1),
         KeyCode::Down => app.wizard_move(1),
-        KeyCode::Left if app.wizard_row() == 0 => app.wizard_preset(-1),
-        KeyCode::Right if app.wizard_row() == 0 => app.wizard_preset(1),
+        KeyCode::Left if app.wizard_step() == Some(crate::app::WizardStep::BaseUrl) => {
+            app.wizard_preset(-1)
+        }
+        KeyCode::Right if app.wizard_step() == Some(crate::app::WizardStep::BaseUrl) => {
+            app.wizard_preset(1)
+        }
+        KeyCode::Left if app.wizard_step() == Some(crate::app::WizardStep::Kind) => {
+            app.wizard_kind(-1)
+        }
+        KeyCode::Right if app.wizard_step() == Some(crate::app::WizardStep::Kind) => {
+            app.wizard_kind(1)
+        }
         KeyCode::Enter => match app.wizard_enter() {
-            WizardAction::Test(cfg) => {
-                let tx = wizard_tx.clone();
-                tokio::spawn(async move {
-                    let result = evrax_agent::test_provider(&cfg).await;
-                    let _ = tx.send(result).await;
-                });
-            }
-            WizardAction::Save(cfg) => match evrax_agent::save_config(&cfg, false) {
+            WizardAction::FetchModels(request) => spawn_fetch(request, fetch_tx),
+            WizardAction::Save(settings) => match evrax_agent::save_config(&settings) {
                 Ok(path) => {
-                    app.queue_backend_reload(cfg);
+                    app.apply_settings(settings);
                     app.wizard_close();
                     app.set_flash(format!("config tersimpan · {}", path.display()));
                 }
@@ -857,6 +872,52 @@ fn handle_wizard_key(
         }
         _ => {}
     }
+}
+
+fn handle_model_key(app: &mut App, key: KeyEvent, fetch_tx: &mpsc::Sender<FetchResult>) {
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            if app.model_escape() {
+                app.model_close();
+            }
+        }
+        KeyCode::Up => app.model_move(-1),
+        KeyCode::Down => app.model_move(1),
+        KeyCode::Enter => match app.model_enter() {
+            ModelAction::FetchModels(request) => spawn_fetch(request, fetch_tx),
+            ModelAction::Apply(settings) => match evrax_agent::save_config(&settings) {
+                Ok(path) => {
+                    app.apply_settings(settings);
+                    app.model_close();
+                    app.set_flash(format!("model disimpan · {}", path.display()));
+                }
+                Err(e) => app.set_flash(format!("simpan gagal: {e}")),
+            },
+            ModelAction::None => {}
+        },
+        KeyCode::Backspace => app.model_backspace(),
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            app.model_type(c);
+        }
+        _ => {}
+    }
+}
+
+fn spawn_fetch(request: FetchRequest, fetch_tx: &mpsc::Sender<FetchResult>) {
+    let tx = fetch_tx.clone();
+    tokio::spawn(async move {
+        let result =
+            evrax_agent::list_models(request.kind, &request.base_url, request.api_key.as_deref())
+                .await;
+        let _ = tx.send((request.request_id, result)).await;
+    });
 }
 
 fn handle_event(
@@ -1302,6 +1363,49 @@ mod cli_tests {
             .save_meta(&evrax_store::SessionMeta::new("session-1-2", "b", "build"))
             .unwrap();
         assert!(resolve_session(&store, "session-1").is_err());
+    }
+
+    #[test]
+    fn wizard_ignores_key_release_events() {
+        let mut app = App::new();
+        app.open_wizard();
+        app.wizard.as_mut().unwrap().step = crate::app::WizardStep::Name;
+        let (tx, _rx) = mpsc::channel(4);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('o'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        handle_wizard_key(&mut app, release, &tx);
+        assert_eq!(app.wizard.as_ref().unwrap().name, "");
+        handle_wizard_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(app.wizard.as_ref().unwrap().name, "o");
+    }
+
+    #[test]
+    fn model_dialog_ignores_key_release_events() {
+        let mut app = App::new();
+        app.providers = vec![evrax_agent::Provider::new("Nimbus Go", "http://a/v1")];
+        app.open_model_dialog();
+        app.model_dialog.as_mut().unwrap().level = crate::app::ModelLevel::Models;
+        let (tx, _rx) = mpsc::channel(4);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        handle_model_key(&mut app, release, &tx);
+        assert_eq!(app.model_dialog.as_ref().unwrap().filter, "");
+        handle_model_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(app.model_dialog.as_ref().unwrap().filter, "x");
     }
 
     #[test]

@@ -12,6 +12,8 @@ Indonesian: [README-IND.md](README-IND.md)
 
 - **Agent loop with tools** — `read`, `list`, `grep`, `write`, `edit`, `shell`,
   `web_fetch`, `todo`, `git`, `ast_grep`, `evrax-graph`, `subagent`.
+- **Multi-provider** — save many endpoints (openai-compatible or native
+  Anthropic), fetch their models automatically, and switch with `/model`.
 - **Plan / Build modes** — Plan mode makes every tool read-only.
 - **Approvals** — mutating tools and paths outside the workspace ask first
   (Once / Always / Reject).
@@ -54,27 +56,51 @@ See [`docs/install.md`](docs/install.md) for every flag (`-InstallDir`,
 
 ## First run
 
-Start `evrax`. If no API key is configured yet, a setup wizard opens:
+Start `evrax`. If no API key is configured yet, a setup wizard opens. It is a
+multi-provider setup: you can save as many providers as you like and switch
+between them later with `/model`.
 
-1. Pick a preset (9router, OpenRouter, DeepSeek, or Custom).
-2. Fill in base URL, model, and API key.
-3. Press **Test connection** to check it.
-4. Press **Save** — the new backend is used immediately, no restart.
+1. Pick a saved provider, or **add provider**.
+2. Choose the protocol: **openai-compatible** (`/chat/completions`) or
+   **anthropic** (`/messages`).
+3. Give it a name (e.g. `Nimbus Go`, `Muse Spark`), then the base URL
+   (`◀/▶` fills a preset: 9router, OpenRouter, DeepSeek, Custom).
+4. Paste the API key and press `Enter` - evrax checks the key by fetching the
+   model list (`GET /models`). No model name needed yet.
+5. Pick a model from the list (type to filter). If the gateway has no `/models`,
+   just type the model name and press `Enter`.
+6. Review and save - the backend switches immediately, no restart.
 
 Settings are written to `%APPDATA%\evrax\agent.json`:
 
 ```json
 {
-  "base_url": "http://127.0.0.1:20128/v1",
-  "model": "your-model",
-  "api_key": "your-key",
+  "active": "Nimbus Go",
+  "providers": [
+    {
+      "name": "Nimbus Go",
+      "kind": "openai",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "your-key",
+      "model": "some-model"
+    },
+    {
+      "name": "Muse Spark",
+      "kind": "anthropic",
+      "base_url": "https://api.example.com",
+      "api_key": "your-key",
+      "model": "claude-sonnet-4-5"
+    }
+  ],
   "max_iterations": 500
 }
 ```
 
-You can also use environment variables (`EVRAX_BASE_URL`, `EVRAX_MODEL`,
-`EVRAX_API_KEY`, `EVRAX_MAX_ITERATIONS`) or CLI flags. Run `evrax --setup` to
-open the wizard again at any time.
+Old single-provider files are migrated automatically on the next save. You can
+also use environment variables (`EVRAX_PROVIDER`, `EVRAX_BASE_URL`,
+`EVRAX_MODEL`, `EVRAX_API_KEY`, `EVRAX_MAX_ITERATIONS`) or CLI flags - they
+override the active provider for that run only. Run `evrax --setup` to open the
+wizard again at any time, or `/model` inside the TUI to switch provider/model.
 
 ## Usage
 
@@ -84,6 +110,7 @@ evrax -c                     continue the most recent session
 evrax -s <id|prefix|title>   resume a specific session
 evrax -l                     list saved sessions
 evrax --setup                open the setup wizard
+evrax --provider <name>      start with a saved provider
 evrax --mock                 built-in mock backend (no API needed)
 evrax --model <id>           override the model
 evrax --base-url <url>       override the endpoint
@@ -105,8 +132,10 @@ Keyboard:
 | `Ctrl+Y` | copy last reply |
 | `Ctrl+C` | quit |
 
-Slash commands: `/new`, `/sessions`, `/mode`, `/copy`, `/theme`, `/remote`,
-`/rename <title>`, `/exit`.
+Slash commands: `/new`, `/sessions`, `/mode`, `/copy`, `/theme`, `/model`,
+`/remote`, `/rename <title>`, `/exit`. `/model` lists saved providers, fetches
+their models on demand, and switches the active provider/model without a
+restart.
 
 ## Sessions
 
