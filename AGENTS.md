@@ -6,7 +6,7 @@ Detail besar dipindah ke `docs/` (tidak di-inject tiap turn): lihat **Detail ref
 
 ## Objective
 - Bangun **"evrax"**: agent coding TUI di **Rust + ratatui** (`D:\another-evrax-agent`) — ringan (satu binary), backend LLM asli ([OI]-compatible + SSE), tools lengkap, web remote.
-- **Batch aktif: installer + rilis publik.** Urutan: (0) bersih-bersih ✅, (1) scrub + installer/CI → tag `v0.1.0` ✅, (2) `evrax-store` + persist + wizard → `v0.1.1` ✅ (rilis live, asset terverifikasi), (2b) fix first-run wizard reload backend → `v0.1.2`, (3) clean-install Sandbox, (4) batch skills → `v0.1.3`. Detail: `docs/handoff-2026-10-21.md`.
+- **Batch aktif: installer + rilis publik.** Urutan: (0) bersih-bersih ✅, (1) scrub + installer/CI → tag `v0.1.0` ✅, (2) `evrax-store` + persist + wizard → `v0.1.1` ✅ (rilis live, asset terverifikasi), (2b) fix first-run wizard reload backend → `v0.1.2` ✅, (2c) multi-provider + Anthropic native + English UI → `v0.1.3` ✅, (3) clean-install Sandbox, (4) batch skills → `v0.1.4`. Detail: `docs/handoff-2026-10-21.md`.
 - **Repo rilis `another-evrax-agents`**: `https://github.com/jackielnikkie/another-evrax-agents` (public, MIT; main awal hanya LICENSE). Backup: `evrax-ui` (`main` @ `4fb1804` sebelum batch ini). `target/`, `dist/`, `agent-reference/`, `.serena/` di-ignore; AGENTS.md **ikut** (keputusan user).
 
 ## Aturan kerja (user)

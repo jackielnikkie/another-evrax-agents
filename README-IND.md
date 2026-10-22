@@ -43,7 +43,7 @@ ke PATH user. Tidak perlu admin.
 Opsi lain:
 
 ```powershell
-.\install.ps1 -Version v0.1.2        # pakai rilis tertentu
+.\install.ps1 -Version v0.1.3        # pakai rilis tertentu
 .\install.ps1 -LocalZip .\evrax.zip  # install dari zip lokal
 .\install.ps1 -Uninstall             # hapus binary dan entri PATH
 ```

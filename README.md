@@ -46,7 +46,7 @@ PATH. No admin rights needed.
 Other options:
 
 ```powershell
-.\install.ps1 -Version v0.1.2        # pin a release
+.\install.ps1 -Version v0.1.3        # pin a release
 .\install.ps1 -LocalZip .\evrax.zip  # install from a local zip
 .\install.ps1 -Uninstall             # remove the binary and PATH entry
 ```
