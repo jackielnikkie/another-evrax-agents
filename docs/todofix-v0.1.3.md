@@ -1,6 +1,6 @@
 # Todofix v0.1.3 — batch perbaikan (2026-10-22)
 
-Batch fix post-`v0.1.3`. Tujuh fix + seed config. **Tidak tag/release** — hanya commit lokal + push `origin` + `another`.
+Batch fix post-`v0.1.3`. Tujuh fix + MCP default tanpa seed. **Tidak tag/release** — hanya commit lokal + push `origin` + `another`.
 
 Status akhir: **SELESAI**, gate hijau (lihat bagian Gate).
 
@@ -64,9 +64,10 @@ Status akhir: **SELESAI**, gate hijau (lihat bagian Gate).
 - `ui.rs` baris password: `not set` / `default · set a password` / bullets kuat (bukan 8 titik palsu); baris tunnel quick/domain diberi `· password required` selama password lemah.
 - Test baru: remote `weak_password_covers_empty_blank_short_and_default`, `weak_password_is_loopback_only_like_the_default`, `weak_password_blocks_remote_clients_and_empty_login`; app `tunnel_hostname_commit_refused_with_weak_password`, `remote_toggle_enable_refused_with_weak_password`, `tunnel_follow_remote_waits_for_weak_password`, `tunnel_rows_mark_password_requirement`, `remote_edit_commit_rejects_default_and_blank_passwords`; ui `remote_modal_hides_fake_password_bullets`.
 
-## Seed config
+## MCP default
 
-- `%APPDATA%\evrax\mcp.json` ditulis (tanpa key): `serena` + `codebase-memory-mcp`, keduanya `enabled: true`.
+- **Tidak ada `mcp.json` bawaan/seed.** Fresh install hanya embedded skills + tools; `%APPDATA%\evrax\mcp.json` hanya dibaca bila user menyediakannya sendiri.
+- File seed manual di mesin dev (`serena` + `codebase-memory-mcp`) sudah dihapus setelah batch ini.
 
 ## Gate
 
@@ -85,6 +86,6 @@ Baseline sebelum batch: 279 passed / 3 ignored. Test tambahan: +29.
 | FIX-005 | subagent (worker A) |
 | FIX-004 | subagent (worker B), di-unblock + `welcome.rs` literal oleh orchestrator |
 | FIX-007 | subagent (worker C) |
-| FIX-001, FIX-006 (core+agent), FIX-002, FIX-003, FIX-006 (TUI), seed, gate, docs | orchestrator |
+| FIX-001, FIX-006 (core+agent), FIX-002, FIX-003, FIX-006 (TUI), MCP default (tanpa seed), gate, docs | orchestrator |
 
 Riset pendahuluan (peta call-site `AgentEvent`/`ChatEntry`/render + inventaris test) dari 2 subagent explore.
