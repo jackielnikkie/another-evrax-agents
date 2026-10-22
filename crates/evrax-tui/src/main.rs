@@ -838,6 +838,8 @@ fn handle_wizard_key(app: &mut App, key: KeyEvent, fetch_tx: &mpsc::Sender<Fetch
         }
         KeyCode::Up => app.wizard_move(-1),
         KeyCode::Down => app.wizard_move(1),
+        KeyCode::PageUp => app.wizard_page(-1),
+        KeyCode::PageDown => app.wizard_page(1),
         KeyCode::Left if app.wizard_step() == Some(crate::app::WizardStep::BaseUrl) => {
             app.wizard_preset(-1)
         }
@@ -886,6 +888,8 @@ fn handle_model_key(app: &mut App, key: KeyEvent, fetch_tx: &mpsc::Sender<FetchR
         }
         KeyCode::Up => app.model_move(-1),
         KeyCode::Down => app.model_move(1),
+        KeyCode::PageUp => app.model_page(-1),
+        KeyCode::PageDown => app.model_page(1),
         KeyCode::Enter => match app.model_enter() {
             ModelAction::FetchModels(request) => spawn_fetch(request, fetch_tx),
             ModelAction::Apply(settings) => match evrax_agent::save_config(&settings) {

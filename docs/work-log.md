@@ -78,3 +78,8 @@ Verbatim dari blok Completed AGENTS.md (2026-10-20). AGENTS.md cuma nyimpen ring
 - Sebab: Windows crossterm mengirim Press + Release untuk tiap tombol. Loop di `main.rs` mendispatch `Event::Key` tanpa cek kind; composer aman karena `is_batchable()` mensyaratkan `Press` dan dialog lain aman karena `handle_event()` memfilter `Press`, tapi cabang wizard/model memanggil handler langsung.
 - Fix: guard `key.kind == KeyEventKind::Press` di pattern dispatch + early return di `handle_wizard_key`/`handle_model_key`.
 - Test: `wizard_ignores_key_release_events`, `model_dialog_ignores_key_release_events` → **272 test hijau**, clippy clean, name guard clean.
+## Polish modal wizard + paging (2026-10-21)
+- UI: `wizard_modal`/`model_modal` tidak lagi 72x22 fixed. Panel content-sized (form 64, list 76, review 68; tinggi = jumlah baris + border, clamp layar) dan diisi header `langkah n/8 · label` + progress bar, field label/rule/value dengan kursor blok, helper per step, preview endpoint live (`/chat/completions` vs `/messages`), radio kind, review rata + action bar `simpan & aktifkan`, hint keycap berwarna.
+- List: highlight full-width (padding ke lebar panel), header kolom nama/tipe/model, counter `1-8/N`; model list pakai window 10 baris.
+- Paging: `App::wizard_page`/`model_page` (`DIALOG_PAGE` = 8, clamp tanpa wrap) + mapping `PageUp/PageDown` di `handle_wizard_key`/`handle_model_key`; sebelumnya PgUp/PgDn tidak terdaftar di wizard sehingga tidak bisa scroll.
+- Test: perluas test render (langkah 3/8, review, pgup/pgdn), + `wizard_and_model_page_by_window` → **278 test hijau**, clippy clean, name guard clean, release 0.1.2 rebuild. Belum dirilis/tag.

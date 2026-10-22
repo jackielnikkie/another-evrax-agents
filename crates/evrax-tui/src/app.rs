@@ -999,6 +999,47 @@ impl App {
         }
     }
 
+    /// Jumps a page in the wizard list steps (clamped, no wrap).
+    pub fn wizard_page(&mut self, delta: i32) {
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        let page = DIALOG_PAGE as i32 * delta;
+        match wizard.step {
+            WizardStep::Providers => {
+                let rows = (self.providers.len() + 1) as i32;
+                wizard.cursor = (wizard.cursor as i32 + page).clamp(0, rows - 1) as usize;
+            }
+            WizardStep::Models if !wizard.filtered.is_empty() => {
+                let rows = wizard.filtered.len() as i32;
+                wizard.model_cursor =
+                    (wizard.model_cursor as i32 + page).clamp(0, rows - 1) as usize;
+            }
+            _ => {}
+        }
+    }
+
+    /// Jumps a page in the provider/model picker (clamped, no wrap).
+    pub fn model_page(&mut self, delta: i32) {
+        let Some(dialog) = self.model_dialog.as_mut() else {
+            return;
+        };
+        let page = DIALOG_PAGE as i32 * delta;
+        match dialog.level {
+            ModelLevel::Providers if !self.providers.is_empty() => {
+                let rows = self.providers.len() as i32;
+                dialog.provider_cursor =
+                    (dialog.provider_cursor as i32 + page).clamp(0, rows - 1) as usize;
+            }
+            ModelLevel::Models if !dialog.filtered.is_empty() => {
+                let rows = dialog.filtered.len() as i32;
+                dialog.model_cursor =
+                    (dialog.model_cursor as i32 + page).clamp(0, rows - 1) as usize;
+            }
+            _ => {}
+        }
+    }
+
     /// Switches the protocol (kind step).
     pub fn wizard_kind(&mut self, delta: i32) {
         if let Some(wizard) = self.wizard.as_mut()
