@@ -661,15 +661,99 @@ fn walk(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// The file's dominant line ending: `\r\n` when the first terminator is CRLF,
+/// otherwise `\n`. Empty or newline-free text counts as `\n`.
+fn eol_of(text: &str) -> &'static str {
+    let bytes = text.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            return if i > 0 && bytes[i - 1] == b'\r' {
+                "\r\n"
+            } else {
+                "\n"
+            };
+        }
+    }
+    "\n"
+}
+
+/// Normalize CRLF to LF. Lone `\r` bytes are left alone.
+fn to_lf(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+/// Expand an LF-only string to `eol`. Any other `eol` is returned unchanged.
+fn from_lf(text: &str, eol: &str) -> String {
+    if eol == "\r\n" {
+        text.replace('\n', "\r\n")
+    } else {
+        text.to_string()
+    }
+}
+
+/// True when the text mixes CRLF with lone LF terminators.
+fn has_mixed_eol(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut crlf = false;
+    let mut lone = false;
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            if i > 0 && bytes[i - 1] == b'\r' {
+                crlf = true;
+            } else {
+                lone = true;
+            }
+        }
+    }
+    crlf && lone
+}
+
+/// Best-effort line numbers for a failed `edit` match: exact hits on the first
+/// non-empty needle line, then trimmed hits, then first/last line.
+fn nearest_lines(hay: &str, needle: &str) -> Vec<usize> {
+    let lines: Vec<&str> = hay.lines().collect();
+    let target = needle.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let trimmed = target.trim();
+    let mut hits: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l == target)
+        .map(|(i, _)| i + 1)
+        .take(2)
+        .collect();
+    if hits.is_empty() && !trimmed.is_empty() {
+        hits = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim() == trimmed)
+            .map(|(i, _)| i + 1)
+            .take(2)
+            .collect();
+    }
+    if hits.is_empty() {
+        hits.push(1);
+        if lines.len() > 1 {
+            hits.push(lines.len());
+        }
+    }
+    hits
+}
+
 fn write(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
     let path = ctx.classify(&arg_str(args, "path")?)?.path;
     let content = arg_str(args, "content")?;
-    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = std::fs::read_to_string(&path);
+    let payload = match &existing {
+        Ok(raw) => from_lf(&to_lf(&content), eol_of(raw)),
+        Err(_) => content.clone(),
+    };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&path, &content).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
-    let lines = diff_lines(&old, &content);
+    std::fs::write(&path, &payload).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
+    let old = to_lf(existing.as_deref().unwrap_or(""));
+    let new = to_lf(&payload);
+    let lines = diff_lines(&old, &new);
     let added = lines.iter().filter(|l| l.kind == DiffKind::Add).count();
     let removed = lines.iter().filter(|l| l.kind == DiffKind::Rem).count();
     Ok(ToolOutcome {
@@ -690,12 +774,28 @@ fn edit(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
     if old.is_empty() {
         return Err("`old` must not be empty".into());
     }
-    let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
-    let occurrences = text.matches(&old).count();
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
+    let eol = eol_of(&raw);
+    let hay = to_lf(&raw);
+    let old_lf = to_lf(&old);
+    let new_lf = to_lf(&new);
+    let occurrences = hay.matches(&old_lf).count();
     if occurrences == 0 {
+        let near = nearest_lines(&hay, &old_lf);
+        let near = near
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut hint = String::new();
+        if eol == "\r\n" {
+            hint.push_str(" (file uses CRLF)");
+        }
+        if has_mixed_eol(&raw) {
+            hint.push_str(" (file has mixed line endings; normalized)");
+        }
         return Err(format!(
-            "{}: text not found; read the file and retry with an exact snippet",
+            "{}: text not found; nearest line(s) {near} — read the file and retry with an exact snippet{hint}",
             ctx.display(&path)
         ));
     }
@@ -705,13 +805,14 @@ fn edit(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
             ctx.display(&path)
         ));
     }
-    let updated = if replace_all {
-        text.replace(&old, &new)
+    let updated_lf = if replace_all {
+        hay.replace(&old_lf, &new_lf)
     } else {
-        text.replacen(&old, &new, 1)
+        hay.replacen(&old_lf, &new_lf, 1)
     };
+    let updated = from_lf(&updated_lf, eol);
     std::fs::write(&path, &updated).map_err(|e| format!("{}: {e}", ctx.display(&path)))?;
-    let lines = diff_lines(&text, &updated);
+    let lines = diff_lines(&hay, &updated_lf);
     let added = lines.iter().filter(|l| l.kind == DiffKind::Add).count();
     let removed = lines.iter().filter(|l| l.kind == DiffKind::Rem).count();
     let label = if occurrences > 1 {
@@ -953,6 +1054,55 @@ mod tests {
         write(&json!({"path":"a.txt","content":"abc"}), &c).unwrap();
         let err = edit(&json!({"path":"a.txt","old":"zzz","new":"y"}), &c).unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    fn read_bytes(c: &Context, rel: &str) -> Vec<u8> {
+        std::fs::read(c.root.join(rel)).unwrap()
+    }
+
+    fn seed(c: &Context, rel: &str, bytes: &[u8]) {
+        std::fs::write(c.root.join(rel), bytes).unwrap();
+    }
+
+    #[test]
+    fn edit_matches_lf_needle_in_crlf_file() {
+        let (_d, c) = ctx();
+        seed(&c, "a.txt", b"a\r\nb\r\nc\r\n");
+        let out = edit(&json!({"path":"a.txt","old":"a\nb","new":"a\nX"}), &c).unwrap();
+        assert!(out.ok);
+        assert_eq!(read_bytes(&c, "a.txt"), b"a\r\nX\r\nc\r\n");
+    }
+
+    #[test]
+    fn edit_keeps_lf_file_lf() {
+        let (_d, c) = ctx();
+        seed(&c, "a.txt", b"a\nb\n");
+        edit(&json!({"path":"a.txt","old":"a\nb","new":"a\nZ"}), &c).unwrap();
+        assert_eq!(read_bytes(&c, "a.txt"), b"a\nZ\n");
+    }
+
+    #[test]
+    fn edit_preserves_missing_trailing_newline() {
+        let (_d, c) = ctx();
+        seed(&c, "a.txt", b"a\r\nb");
+        edit(&json!({"path":"a.txt","old":"a\nb","new":"a\nb2"}), &c).unwrap();
+        assert_eq!(read_bytes(&c, "a.txt"), b"a\r\nb2");
+    }
+
+    #[test]
+    fn write_keeps_existing_crlf() {
+        let (_d, c) = ctx();
+        seed(&c, "a.txt", b"x\r\ny\r\n");
+        write(&json!({"path":"a.txt","content":"x\nz\n"}), &c).unwrap();
+        assert_eq!(read_bytes(&c, "a.txt"), b"x\r\nz\r\n");
+    }
+
+    #[test]
+    fn edit_reports_crlf_hint() {
+        let (_d, c) = ctx();
+        seed(&c, "a.txt", b"a\r\nb\r\n");
+        let err = edit(&json!({"path":"a.txt","old":"zzz","new":"y"}), &c).unwrap_err();
+        assert!(err.contains("CRLF"), "{err}");
     }
 
     #[test]

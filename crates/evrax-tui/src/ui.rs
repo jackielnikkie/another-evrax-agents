@@ -12,8 +12,8 @@ use evrax_core::DiffKind;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    APPROVAL_OPTIONS, AgentMode, App, ChatEntry, ModelLevel, ToolStatus, TunnelEditKind,
-    WIZARD_PRESETS, WizardStep,
+    APPROVAL_OPTIONS, AgentMode, App, ChatEntry, DIFF_PREVIEW_LINES, ModelLevel, QUIET_ERROR_LINES,
+    ToolStatus, TunnelEditKind, WIZARD_PRESETS, WizardStep,
 };
 use crate::markdown;
 use crate::theme::current;
@@ -674,6 +674,7 @@ fn messages(frame: &mut Frame, area: Rect, app: &mut App) {
     // Per-entry line cache: only the tail entry (streaming text, running tool)
     // is rebuilt per frame, so render cost stays flat as the transcript grows.
     let (content_height, offset, visible) = {
+        app.transcript.set_expanded(app.expanded);
         let lines = app.transcript.sync(
             &app.messages,
             app.tick,
@@ -706,6 +707,7 @@ fn messages(frame: &mut Frame, area: Rect, app: &mut App) {
 pub struct TranscriptCache {
     width: usize,
     theme: usize,
+    expanded: bool,
     /// Entry count at the last sync; `usize::MAX` marks "force full rebuild".
     prev_n: usize,
     /// Number of frozen (non-tail) entry blocks in `lines`.
@@ -729,6 +731,15 @@ impl TranscriptCache {
         self.prev_n = usize::MAX;
     }
 
+    /// Switch between quiet and expanded rendering; the whole cache is stale
+    /// afterwards because every entry block can change shape.
+    pub fn set_expanded(&mut self, expanded: bool) {
+        if self.expanded != expanded {
+            self.expanded = expanded;
+            self.prev_n = usize::MAX;
+        }
+    }
+
     pub fn sync(
         &mut self,
         entries: &[ChatEntry],
@@ -748,7 +759,8 @@ impl TranscriptCache {
         if n > self.prev_n {
             self.lines.truncate(self.tail_start);
             for entry in &entries[self.frozen..n.saturating_sub(1)] {
-                self.lines.extend(entry_lines(entry, tick, width));
+                self.lines
+                    .extend(entry_lines(entry, tick, width, self.expanded));
                 self.lines.push(Line::from(""));
             }
             self.frozen = n.saturating_sub(1);
@@ -758,7 +770,8 @@ impl TranscriptCache {
         }
         if n > 0 && tail_dirty {
             self.lines.truncate(self.tail_start);
-            self.lines.extend(entry_lines(&entries[n - 1], tick, width));
+            self.lines
+                .extend(entry_lines(&entries[n - 1], tick, width, self.expanded));
             self.lines.push(Line::from(""));
             self.last_tick = tick;
             self.last_rev = rev;
@@ -787,29 +800,36 @@ impl TranscriptCache {
             return;
         };
         for entry in head {
-            self.lines.extend(entry_lines(entry, tick, width));
+            self.lines
+                .extend(entry_lines(entry, tick, width, self.expanded));
             self.lines.push(Line::from(""));
         }
         self.frozen = head.len();
         self.tail_start = self.lines.len();
-        self.lines.extend(entry_lines(last, tick, width));
+        self.lines
+            .extend(entry_lines(last, tick, width, self.expanded));
         self.lines.push(Line::from(""));
     }
 }
 
 /// Reference implementation used to verify the incremental cache.
 #[cfg(test)]
-fn conversation_lines(entries: &[ChatEntry], tick: u64, width: u16) -> Vec<Line<'static>> {
+fn conversation_lines(
+    entries: &[ChatEntry],
+    tick: u64,
+    width: u16,
+    expanded: bool,
+) -> Vec<Line<'static>> {
     let width = width.max(1) as usize;
     let mut lines: Vec<Line<'static>> = vec![Line::from("")];
     for entry in entries {
-        lines.extend(entry_lines(entry, tick, width));
+        lines.extend(entry_lines(entry, tick, width, expanded));
         lines.push(Line::from(""));
     }
     lines
 }
 
-fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>> {
+fn entry_lines(entry: &ChatEntry, tick: u64, width: usize, expanded: bool) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     {
         match entry {
@@ -826,6 +846,12 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
             }
             ChatEntry::Thinking { summary, seconds } => {
                 let segments = wrap_text(summary, width.saturating_sub(14));
+                let cut = !expanded && segments.len() > 1;
+                let segments: Vec<String> = if cut {
+                    vec![format!("{}…", segments[0])]
+                } else {
+                    segments
+                };
                 let last = segments.len().saturating_sub(1);
                 for (i, raw) in segments.into_iter().enumerate() {
                     let head = if i == 0 { "   ▸ Thought: " } else { "     " };
@@ -854,6 +880,7 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
             }
             ChatEntry::Tool(tool) => {
                 let (glyph, color) = match tool.status {
+                    ToolStatus::Preparing => (spinner(tick), current().interactive),
                     ToolStatus::Running => (spinner(tick), current().interactive),
                     ToolStatus::Done => ("✓", current().success),
                     ToolStatus::Error => ("✗", current().error),
@@ -868,13 +895,39 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
                     ),
                     Span::styled(tool.summary.clone(), Style::default().fg(current().muted)),
                 ]));
-                if !tool.detail.is_empty() {
-                    for raw in wrap_text(&tool.detail, width.saturating_sub(5)) {
-                        lines.push(Line::from(Span::styled(
-                            format!("     {raw}"),
-                            Style::default().fg(current().muted),
-                        )));
+                // Quiet mode keeps one row per call: no body for a finished
+                // tool, one status line while it runs, and only the head of an
+                // error (the full output stays one `ctrl+t` away).
+                let body = if expanded {
+                    tool.detail.as_str()
+                } else {
+                    match tool.status {
+                        ToolStatus::Done => "",
+                        ToolStatus::Preparing | ToolStatus::Running => {
+                            tool.detail.lines().next().unwrap_or("")
+                        }
+                        ToolStatus::Error => tool.detail.as_str(),
                     }
+                };
+                let wrapped = wrap_text(body, width.saturating_sub(5));
+                let cap = if !expanded && matches!(tool.status, ToolStatus::Error) {
+                    QUIET_ERROR_LINES
+                } else {
+                    wrapped.len()
+                };
+                let shown = cap.min(wrapped.len());
+                for raw in wrapped.iter().take(shown) {
+                    lines.push(Line::from(Span::styled(
+                        format!("     {raw}"),
+                        Style::default().fg(current().muted),
+                    )));
+                }
+                let hidden = wrapped.len().saturating_sub(shown);
+                if hidden > 0 {
+                    lines.push(Line::from(Span::styled(
+                        format!("     … +{hidden} lines · ctrl+t"),
+                        Style::default().fg(current().border),
+                    )));
                 }
             }
             ChatEntry::Diff { path, lines: diff } => {
@@ -909,7 +962,15 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
                     ));
                 }
                 lines.push(Line::from(header));
-                for line in diff {
+                // Quiet mode shows only the first `DIFF_PREVIEW_LINES` diff
+                // rows and labels the rest; `ctrl+t` expands up to the full
+                // 200-line diff the agent already produced.
+                let cap = if expanded {
+                    diff.len()
+                } else {
+                    DIFF_PREVIEW_LINES.min(diff.len())
+                };
+                for line in diff.iter().take(cap) {
                     let (sign, sign_color, content_bg, gutter_bg) = match line.kind {
                         DiffKind::Add => (
                             "+",
@@ -962,6 +1023,16 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize) -> Vec<Line<'static>>
                         }
                         lines.push(Line::from(spans));
                     }
+                }
+                let hidden = diff.len().saturating_sub(cap);
+                if hidden > 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled("   ", Style::default()),
+                        Span::styled(
+                            format!("   … +{hidden} more · ctrl+t"),
+                            Style::default().fg(current().border),
+                        ),
+                    ]));
                 }
             }
         }
@@ -1226,6 +1297,18 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 fn spinner(tick: u64) -> &'static str {
     ["·", "•", "●", "•"][(tick % 4) as usize]
+}
+
+/// Compact turn duration: `12s`, `1m 42s`, `1h 05m`.
+fn fmt_elapsed(elapsed: Option<std::time::Duration>) -> String {
+    let secs = elapsed.unwrap_or_default().as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 fn input(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1499,10 +1582,14 @@ fn sidebar(frame: &mut Frame, area: Rect, app: &App) {
 
 fn footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = if app.busy {
-        let status = match app.iteration {
-            Some((n, max)) => format!("working · iteration {n}/{max}"),
-            None => "working".to_string(),
+        let elapsed = fmt_elapsed(app.turn_started.map(|at| at.elapsed()));
+        let mut status = match app.iteration {
+            Some((n, max)) => format!("working · {elapsed} · iteration {n}/{max}"),
+            None => format!("working · {elapsed}"),
         };
+        if !app.queued.is_empty() {
+            status.push_str(&format!(" · queued {}", app.queued.len()));
+        }
         vec![
             Span::styled(
                 format!(" {} ", spinner(app.tick)),
@@ -1512,9 +1599,6 @@ fn footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("  ·  ", Style::default().fg(current().border)),
             Span::styled("esc ", Style::default().fg(current().interactive)),
             Span::styled("cancel", Style::default().fg(current().muted)),
-            Span::styled("  ·  ", Style::default().fg(current().border)),
-            Span::styled("ctrl+c ", Style::default().fg(current().interactive)),
-            Span::styled("quit", Style::default().fg(current().muted)),
         ]
     } else {
         vec![
@@ -1954,6 +2038,13 @@ fn remote_modal(frame: &mut Frame, app: &App) {
     let password = match editing {
         Some(buf) if !buf.is_empty() => buf.to_string(),
         Some(_) => String::new(),
+        None if evrax_remote::is_weak_password(&state.config.password) => {
+            if state.config.password == "12345678" {
+                "default · set a password".to_string()
+            } else {
+                "not set".to_string()
+            }
+        }
         None => "•".repeat(8),
     };
 
@@ -2302,6 +2393,42 @@ mod tests {
     }
 
     #[test]
+    fn remote_modal_hides_fake_password_bullets() {
+        let mut app = App::new();
+        app.open_remote_dialog();
+
+        app.remote.as_mut().unwrap().config.password = String::new();
+        let text = render_text_with(&mut app, 100, 30);
+        assert!(text.contains("password     not set"), "empty:\n{text}");
+        assert!(
+            !text.contains(
+                "password     \u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+            ),
+            "fake bullets for empty password:\n{text}"
+        );
+
+        app.remote.as_mut().unwrap().config.password = "12345678".into();
+        let text = render_text_with(&mut app, 100, 30);
+        assert!(
+            text.contains("default \u{00b7} set a password"),
+            "default password hint missing:\n{text}"
+        );
+        assert!(
+            !text.contains(
+                "password     \u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}"
+            ),
+            "fake bullets for default password:\n{text}"
+        );
+
+        app.remote.as_mut().unwrap().config.password = "longenough".into();
+        let text = render_text_with(&mut app, 100, 30);
+        assert!(
+            text.contains(&format!("password     {}", "\u{2022}".repeat(8))),
+            "strong password must show bullets:\n{text}"
+        );
+    }
+
+    #[test]
     fn tunnel_modal_centers_status_and_hint() {
         let mut app = App::new();
         app.open_remote_dialog();
@@ -2611,7 +2738,7 @@ mod tests {
         cache.sync(&empty, 0, 0, 80, theme);
         let mut entries = vec![ChatEntry::User("hai bos".to_string())];
         let out = cache.sync(&entries, 0, 1, 80, theme).clone();
-        assert_eq!(out, conversation_lines(&entries, 0, 80));
+        assert_eq!(out, conversation_lines(&entries, 0, 80, false));
         assert_eq!(
             cache.rebuilds, 1,
             "growth from empty must extend, not rebuild"
@@ -2619,7 +2746,7 @@ mod tests {
         assert_eq!(out.first().unwrap().width(), 0);
         entries.push(ChatEntry::Assistant("sip".to_string()));
         let out = cache.sync(&entries, 0, 2, 80, theme).clone();
-        assert_eq!(out, conversation_lines(&entries, 0, 80));
+        assert_eq!(out, conversation_lines(&entries, 0, 80, false));
         assert_eq!(cache.rebuilds, 1);
     }
 
@@ -2629,7 +2756,7 @@ mod tests {
         let theme = crate::theme::index();
         let mut cache = TranscriptCache::default();
         let synced = cache.sync(&entries, 3, 0, 80, theme).clone();
-        assert_eq!(synced, conversation_lines(&entries, 3, 80));
+        assert_eq!(synced, conversation_lines(&entries, 3, 80, false));
         assert_eq!(cache.rebuilds, 1);
         for line in &synced {
             assert!(line.width() <= 80, "line too wide: {line:?}");
@@ -2644,7 +2771,7 @@ mod tests {
         grown.push(ChatEntry::Assistant("tambahan baru".to_string()));
         let out = cache.sync(&grown, 3, 1, 80, theme).clone();
         assert_eq!(cache.rebuilds, 1, "new entries extend the cache");
-        assert_eq!(out, conversation_lines(&grown, 3, 80));
+        assert_eq!(out, conversation_lines(&grown, 3, 80, false));
         let shrunk = &grown[..grown.len() - 1];
         cache.sync(shrunk, 3, 2, 80, theme);
         assert_eq!(cache.rebuilds, 2, "shrink (retention) forces a rebuild");
@@ -2671,7 +2798,7 @@ mod tests {
         let out = cache.sync(&entries, 1, 1, 80, theme).clone();
         assert_eq!(cache.rebuilds, 1, "tail edit must not rebuild the prefix");
         assert!(out.len() > after_prefix, "streaming must grow the tail");
-        assert_eq!(out, conversation_lines(&entries, 1, 80));
+        assert_eq!(out, conversation_lines(&entries, 1, 80, false));
         let same_len = out.len();
         let same = cache.sync(&entries, 1, 1, 80, theme).clone();
         assert_eq!(same.len(), same_len);
@@ -2714,6 +2841,101 @@ mod tests {
         assert!(
             text.contains("iteration 3/500"),
             "iteration status missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn footer_shows_elapsed_and_queue() {
+        // The footer shares its row with the pwd label on a real terminal, so
+        // 100 columns is not enough for "queued 1" — use a wider frame.
+        let mut terminal = Terminal::new(TestBackend::new(220, 40)).unwrap();
+        let mut app = App::new();
+        app.busy = true;
+        app.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(102));
+        app.queued.push_back("next".to_string());
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("working · 1m"), "elapsed missing:\n{text}");
+        assert!(text.contains("queued 1"), "queue count missing:\n{text}");
+    }
+
+    #[test]
+    fn elapsed_formatting_covers_seconds_minutes_hours() {
+        use std::time::Duration;
+        assert_eq!(fmt_elapsed(None), "0s");
+        assert_eq!(fmt_elapsed(Some(Duration::from_secs(9))), "9s");
+        assert_eq!(fmt_elapsed(Some(Duration::from_secs(102))), "1m 42s");
+        assert_eq!(fmt_elapsed(Some(Duration::from_secs(3900))), "1h 05m");
+    }
+
+    fn tool_entry(status: ToolStatus, detail: &str) -> ChatEntry {
+        ChatEntry::Tool(crate::app::ToolCall {
+            name: "shell".into(),
+            summary: "cargo test".into(),
+            status,
+            detail: detail.to_string(),
+        })
+    }
+
+    #[test]
+    fn quiet_transcript_hides_tool_bodies_until_expanded() {
+        let detail = "line one\nline two\nline three";
+        let mut app = App::new();
+        app.messages = vec![tool_entry(ToolStatus::Done, detail)];
+        let quiet = render_text_with(&mut app, 100, 30);
+        assert!(
+            quiet.contains("cargo test"),
+            "tool header missing:\n{quiet}"
+        );
+        assert!(
+            !quiet.contains("line two"),
+            "quiet view leaked the body:\n{quiet}"
+        );
+
+        app.expanded = true;
+        let expanded = render_text_with(&mut app, 100, 30);
+        assert!(
+            expanded.contains("line two"),
+            "expanded view hides the body:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn quiet_errors_keep_four_lines_and_count_the_rest() {
+        let detail: String = (0..10).map(|i| format!("err {i}\n")).collect();
+        let mut app = App::new();
+        app.messages = vec![tool_entry(ToolStatus::Error, detail.trim_end())];
+        let text = render_text_with(&mut app, 100, 40);
+        assert!(text.contains("err 3"), "first lines missing:\n{text}");
+        assert!(!text.contains("err 4"), "cap exceeded:\n{text}");
+        assert!(text.contains("+6 lines"), "hidden count missing:\n{text}");
+    }
+
+    #[test]
+    fn quiet_diffs_stop_at_the_preview_cap() {
+        let lines: Vec<evrax_core::DiffLine> = (0..60)
+            .map(|i| evrax_core::DiffLine {
+                kind: DiffKind::Add,
+                text: format!("row {i}"),
+            })
+            .collect();
+        let mut app = App::new();
+        app.messages = vec![ChatEntry::Diff {
+            path: "src/lib.rs".into(),
+            lines,
+        }];
+        let quiet = render_text_with(&mut app, 120, 200);
+        assert!(quiet.contains("+20 more"), "diff trailer missing:\n{quiet}");
+        assert!(
+            !quiet.contains("row 45"),
+            "quiet diff should stop at the cap:\n{quiet}"
+        );
+
+        app.expanded = true;
+        let expanded = render_text_with(&mut app, 120, 200);
+        assert!(
+            expanded.contains("row 59"),
+            "expanded diff should show the tail:\n{expanded}"
         );
     }
 

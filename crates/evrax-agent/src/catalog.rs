@@ -7,11 +7,14 @@ use serde::Deserialize;
 
 pub use crate::tools::ToolInfo;
 
+include!(concat!(env!("OUT_DIR"), "/embedded_skills.rs"));
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+    pub content: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,13 +43,29 @@ impl Default for Catalog {
 
 impl Catalog {
     pub fn load() -> Self {
-        let skill_dirs = env::var_os("EVRAX_SKILLS_DIR")
-            .map(|dir| vec![PathBuf::from(dir)])
-            .unwrap_or_else(default_skill_dirs);
+        let skill_dirs = skill_dirs();
         let mcp_path = env::var_os("EVRAX_MCP_CONFIG")
             .map(PathBuf::from)
             .or_else(default_mcp_path);
-        Self::load_from(&skill_dirs, mcp_path.as_deref())
+        // Embedded skills are the base set: they are merged last with `or_insert`,
+        // so any skill found on disk keeps winning on a lowercased-name collision.
+        let mut found = discover_skill_map(&skill_dirs);
+        for (label, text) in EMBEDDED_SKILLS {
+            let path = Path::new(label);
+            let fallback = path
+                .parent()
+                .and_then(Path::file_name)
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if let Some(skill) = skill_from_text(text, path, &fallback) {
+                found.entry(skill.name.to_lowercase()).or_insert(skill);
+            }
+        }
+        Self {
+            skills: found.into_values().collect(),
+            mcps: load_mcps(mcp_path.as_deref()),
+            tools: crate::tools::catalog(),
+        }
     }
 
     pub fn load_from(skill_dirs: &[PathBuf], mcp_path: Option<&Path>) -> Self {
@@ -58,16 +77,18 @@ impl Catalog {
     }
 }
 
-fn default_skill_dirs() -> Vec<PathBuf> {
+fn skill_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|path| path.parent())
-        .unwrap_or_else(|| Path::new("."));
-    dirs.push(repo.join("skill-evrax"));
+    if let Some(dir) = env::var_os("EVRAX_SKILLS_DIR") {
+        dirs.push(PathBuf::from(dir));
+    }
     if let Some(appdata) = env::var_os("APPDATA") {
         dirs.push(PathBuf::from(appdata).join("evrax").join("skills"));
     }
+    if let Some(exe_dir) = env::current_exe().ok().as_deref().and_then(Path::parent) {
+        dirs.push(exe_dir.join("skills"));
+    }
+    dirs.push(PathBuf::from("skill-evrax"));
     dirs
 }
 
@@ -79,6 +100,10 @@ fn default_mcp_path() -> Option<PathBuf> {
 }
 
 fn discover_skills(dirs: &[PathBuf]) -> Vec<SkillInfo> {
+    discover_skill_map(dirs).into_values().collect()
+}
+
+fn discover_skill_map(dirs: &[PathBuf]) -> BTreeMap<String, SkillInfo> {
     let mut found: BTreeMap<String, SkillInfo> = BTreeMap::new();
     for dir in dirs {
         for skill_path in find_skill_files(dir) {
@@ -87,7 +112,7 @@ fn discover_skills(dirs: &[PathBuf]) -> Vec<SkillInfo> {
             }
         }
     }
-    found.into_values().collect()
+    found
 }
 
 fn find_skill_files(root: &Path) -> Vec<PathBuf> {
@@ -123,9 +148,13 @@ fn find_skill_files(root: &Path) -> Vec<PathBuf> {
 
 fn read_skill(path: &Path) -> Option<SkillInfo> {
     let text = fs::read_to_string(path).ok()?;
-    let (name, description) = parse_frontmatter(&text);
     let fallback = path.parent()?.file_name()?.to_string_lossy().to_string();
-    let name = name.unwrap_or(fallback);
+    skill_from_text(&text, path, &fallback)
+}
+
+fn skill_from_text(text: &str, path: &Path, fallback: &str) -> Option<SkillInfo> {
+    let (name, description) = parse_frontmatter(text);
+    let name = name.unwrap_or_else(|| fallback.to_string());
     if name.trim().is_empty() {
         return None;
     }
@@ -133,6 +162,7 @@ fn read_skill(path: &Path) -> Option<SkillInfo> {
         name,
         description: description.unwrap_or_default(),
         path: path.to_path_buf(),
+        content: text.to_string(),
     })
 }
 
@@ -211,6 +241,29 @@ fn load_mcps(path: Option<&Path>) -> Vec<McpInfo> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn embedded_skills_are_bundled() {
+        assert_eq!(EMBEDDED_SKILLS.len(), 42);
+        let mut names = Vec::new();
+        for (label, text) in EMBEDDED_SKILLS {
+            let dir = Path::new(label).parent().unwrap();
+            let fallback = dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let skill = skill_from_text(text, Path::new(label), &fallback).unwrap();
+            assert!(!skill.content.is_empty());
+            names.push(skill.name.to_lowercase());
+        }
+        for expected in [
+            "humanizer",
+            "systematic-debugging",
+            "test-driven-development",
+        ] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
+    }
 
     #[test]
     fn tool_catalog_exposes_the_builtin_tools() {

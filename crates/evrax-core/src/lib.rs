@@ -17,6 +17,12 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
+    /// Arguments for a tool call are still streaming in (or the call is waiting
+    /// for approval). Throttled: at most one event per 4 KB / 200 ms.
+    ToolPreparing {
+        name: String,
+        bytes: usize,
+    },
     ToolStarted {
         name: String,
         summary: String,

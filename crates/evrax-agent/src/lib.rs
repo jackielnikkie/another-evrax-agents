@@ -1223,6 +1223,16 @@ async fn authorize_and_run(
     let needs_approval = tools::requires_approval(name, args.as_ref().ok()) || outside.is_some();
     if needs_approval {
         let key = tools::approval_key_for(name, args.as_ref().ok(), outside.as_deref());
+        // The call is fully formed but held for approval: show it as still
+        // "preparing" so the transcript does not read as a running tool.
+        emit(
+            tx,
+            AgentEvent::ToolPreparing {
+                name: name.to_string(),
+                bytes: args.as_ref().map(|v| v.to_string().len()).unwrap_or(0),
+            },
+        )
+        .await?;
         emit(
             tx,
             AgentEvent::ApprovalRequested {
@@ -1303,10 +1313,25 @@ struct Round {
     calls: Vec<ToolCall>,
 }
 
+/// Throttle for `AgentEvent::ToolPreparing`: one event per 4 KB of arguments
+/// per 200 ms window.
+const PREP_STEP_BYTES: usize = 4 * 1024;
+const PREP_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Per-call argument streaming progress, so the UI can show "preparing …".
+#[derive(Default)]
+struct Prep {
+    name: String,
+    bytes: usize,
+    emitted: usize,
+    at: Option<Instant>,
+}
+
 struct StreamState {
     text: String,
     thinking: Option<(String, Instant)>,
     acc: ToolCallAccumulator,
+    prep: HashMap<usize, Prep>,
 }
 
 async fn handle_payload(
@@ -1337,7 +1362,29 @@ async fn handle_payload(
                 emit(tx, AgentEvent::TextDelta { text: delta.text }).await?;
             }
             for call in delta.tool_calls {
+                let index = call.index;
+                let progress = {
+                    let prep = state.prep.entry(index).or_default();
+                    if let Some(name) = &call.name {
+                        prep.name = name.clone();
+                    }
+                    if let Some(args) = &call.arguments {
+                        prep.bytes += args.len();
+                    }
+                    let due = prep.bytes.saturating_sub(prep.emitted) >= PREP_STEP_BYTES
+                        || prep.at.is_none_or(|at| at.elapsed() >= PREP_INTERVAL);
+                    if due && !prep.name.is_empty() {
+                        prep.emitted = prep.bytes;
+                        prep.at = Some(Instant::now());
+                        Some((prep.name.clone(), prep.bytes))
+                    } else {
+                        None
+                    }
+                };
                 state.acc.apply(call);
+                if let Some((name, bytes)) = progress {
+                    emit(tx, AgentEvent::ToolPreparing { name, bytes }).await?;
+                }
             }
             Ok(false)
         }
@@ -1459,6 +1506,7 @@ async fn stream_round(
         text: String::new(),
         thinking: None,
         acc: ToolCallAccumulator::default(),
+        prep: HashMap::new(),
     };
 
     let mut finished = false;
@@ -1582,7 +1630,8 @@ fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
          Use todo for multi-step work, evrax-graph for code-graph queries (index/search/callers/impact/outline), git for repo inspection/mutations, web_fetch for docs, ast_grep for structural code search, and subagent to launch/control another evrax terminal agent.\n\
          After code changes, verify with `cargo test` (and `cargo clippy` when asked).\n\
          File tools run automatically inside the workspace (read AND write/edit). Any path outside the workspace needs explicit user approval, so ask before touching files elsewhere. Never write outside the workspace unless the user asked for it.\n\
-         Keep replies concise. When the task is done, answer with plain text and no tool calls.",
+         Keep replies concise. When the task is done, answer with plain text and no tool calls.\n\
+         Write your reply in the language the user writes in: Indonesian replies to Indonesian, English to English; never switch languages on your own. Keep code, identifiers, file paths, commands and error strings in their original form, and keep strings that render inside the evrax UI in English.",
         cfg.root.display(),
         std::env::consts::OS
     );
@@ -1590,6 +1639,40 @@ fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
         prompt.push_str("\nPLAN MODE: read-only and workspace-only. Read-only web_fetch, todo list, git status/diff/log/show, ast_grep search, and evrax-graph queries/index are allowed; never attempt write/edit/shell or mutating todo/git/ast-grep/subagent actions, and never read files outside the workspace; investigate and present a plan.");
     }
     prompt
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::*;
+
+    fn cfg() -> AgentConfig {
+        AgentConfig {
+            root: std::env::temp_dir(),
+            ..AgentConfig::default()
+        }
+    }
+
+    #[test]
+    fn system_prompt_matches_user_language_and_protects_english_ui() {
+        let prompt = system_prompt(&cfg(), false);
+        assert!(
+            prompt.contains("Indonesian replies to Indonesian, English to English"),
+            "language rule missing:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("keep strings that render inside the evrax UI in English"),
+            "UI-language rule missing:\n{prompt}"
+        );
+        assert!(prompt.contains("You are evrax"));
+        assert!(!prompt.contains("PLAN MODE"));
+    }
+
+    #[test]
+    fn system_prompt_includes_plan_mode_caveat() {
+        let prompt = system_prompt(&cfg(), true);
+        assert!(prompt.contains("PLAN MODE"));
+        assert!(prompt.contains("never attempt write/edit/shell"));
+    }
 }
 
 #[cfg(test)]
@@ -2607,6 +2690,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("enter the model manually"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn streamed_tool_arguments_emit_throttled_preparing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pad = "x".repeat(200);
+        let mut frames = vec![
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"list","arguments":"{\"pattern\":\""}}]}}]}"#
+                .to_string(),
+        ];
+        for _ in 0..40 {
+            frames.push(format!(
+                r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"function":{{"arguments":"{pad}"}}}}]}}}}]}}"#
+            ));
+        }
+        frames.push(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"}"}}]}}]}"#
+                .to_string(),
+        );
+        frames.push("[DONE]".to_string());
+        let refs: Vec<&str> = frames.iter().map(String::as_str).collect();
+        let call = sse(&refs);
+        let final_text = sse(&[r#"{"choices":[{"delta":{"content":"ok"}}]}"#, "[DONE]"]);
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        std::thread::spawn(move || {
+            for reply in [call, final_text] {
+                let mut request = server.recv().unwrap();
+                let mut sink = String::new();
+                request.as_reader().read_to_string(&mut sink).unwrap();
+                let _ = request.respond(Response::from_data(reply));
+            }
+        });
+        let backend = backend(format!("http://{addr}/v1"), dir.path().to_path_buf());
+        let (_, decide_rx) = mpsc::channel(1);
+        let mut stream = backend.run_turn(
+            TurnRequest {
+                prompt: "stream args".into(),
+                session: "prep".into(),
+                plan_mode: false,
+            },
+            decide_rx,
+        );
+        let mut prepares = Vec::new();
+        let mut saw_started = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentEvent::ToolPreparing { name, bytes } => {
+                    assert!(!saw_started, "preparing must arrive before ToolStarted");
+                    assert_eq!(name, "list");
+                    prepares.push(bytes);
+                }
+                AgentEvent::ToolStarted { .. } => saw_started = true,
+                _ => {}
+            }
+        }
+        assert!(!prepares.is_empty(), "no ToolPreparing event was emitted");
+        assert!(
+            prepares.iter().any(|bytes| *bytes >= 4096),
+            "the 4 KB throttle step was never reached: {prepares:?}"
+        );
+        assert!(
+            prepares.len() <= 4,
+            "preparing is not throttled: {prepares:?}"
+        );
     }
 
     #[tokio::test]

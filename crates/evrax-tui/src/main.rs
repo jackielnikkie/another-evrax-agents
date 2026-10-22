@@ -499,6 +499,7 @@ async fn run(
                 app.tick();
                 app.sync_remote_mode();
                 drain_remote_prompts(&mut app, &*backend, &event_tx, &mut decision_tx, &mut turn_task);
+                drain_queued_prompt(&mut app, &*backend, &event_tx, &mut decision_tx, &mut turn_task);
                 drain_remote_approvals(&mut app, &mut decision_tx);
                 drain_subagent_prompt(
                     &mut app,
@@ -759,6 +760,30 @@ fn drain_remote_prompts(
             plan_mode,
         );
     }
+}
+
+/// Runs a prompt the user typed while a turn was streaming. Called after the
+/// web queue is drained, so local typing keeps its order.
+fn drain_queued_prompt(
+    app: &mut App,
+    backend: &dyn AgentBackend,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    decision_tx: &mut Option<mpsc::Sender<bool>>,
+    turn_task: &mut Option<JoinHandle<()>>,
+) {
+    let Some(prompt) = app.take_queued_prompt() else {
+        return;
+    };
+    let (session, plan_mode) = (app.session_id.clone(), app.mode == AgentMode::Plan);
+    start_turn(
+        backend,
+        event_tx,
+        decision_tx,
+        turn_task,
+        prompt,
+        session,
+        plan_mode,
+    );
 }
 
 fn arg_value(name: &str) -> Option<String> {
@@ -1056,8 +1081,11 @@ fn handle_key(
             app.toggle_palette();
             return;
         }
-        if key.code == KeyCode::Char('o') {
-            app.open_sessions();
+        // `ctrl+t` and `ctrl+o` both toggle the transcript detail level
+        // (quiet <-> expanded). The session list stays reachable via
+        // `/sessions` and the `ctrl+p` palette.
+        if key.code == KeyCode::Char('o') || key.code == KeyCode::Char('t') {
+            app.toggle_expanded();
             return;
         }
         if key.code == KeyCode::Char('n') {

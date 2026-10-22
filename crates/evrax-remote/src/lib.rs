@@ -215,8 +215,17 @@ pub fn allow_remote(password_default: bool, ip: Option<IpAddr>) -> bool {
     }
 }
 
+/// A password that must never be exposed through a tunnel: empty, blank,
+/// shorter than the 8-char minimum, or the shipped default `12345678`.
+pub fn is_weak_password(password: &str) -> bool {
+    let trimmed = password.trim();
+    trimmed.is_empty() || password.chars().count() < 8 || password == "12345678"
+}
+
+/// Kept for callers that only care about the shipped default; the single source
+/// of truth for password strength is [`is_weak_password`].
 pub fn is_default_password(password: &str) -> bool {
-    password == "12345678"
+    is_weak_password(password)
 }
 
 #[derive(Deserialize)]
@@ -467,7 +476,7 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
 
     let remote_ip = req.remote_addr().map(|a| a.ip());
     let current_password = state.password.lock().map(|p| p.clone()).unwrap_or_default();
-    let password_default = is_default_password(&current_password);
+    let password_default = is_weak_password(&current_password);
 
     // Password policy gate (health is always reachable).
     if path != "/health" && !allow_remote(password_default, remote_ip) {
@@ -522,7 +531,9 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
             let body = read_body(&mut req);
             let parsed: Option<LoginBody> = serde_json::from_str(&body).ok();
             match parsed {
-                Some(b) if ct_eq(&b.password, &current_password) => {
+                Some(b)
+                    if !b.password.trim().is_empty() && ct_eq(&b.password, &current_password) =>
+                {
                     note_login_success(state, remote_ip);
                     let token = generate_token();
                     if let Ok(mut t) = state.token.lock() {
@@ -1103,6 +1114,40 @@ mod tests {
     }
 
     #[test]
+    fn weak_password_covers_empty_blank_short_and_default() {
+        for weak in ["", "   ", "\t\n", "short", "1234567", "12345678"] {
+            assert!(is_weak_password(weak), "{weak:?} must be weak");
+        }
+        for strong in ["longenough", "newpass123", "123456789"] {
+            assert!(!is_weak_password(strong), "{strong:?} must be accepted");
+        }
+        // Alias stays in sync with the single source of truth.
+        assert!(is_default_password(""));
+        assert!(is_default_password("12345678"));
+        assert!(!is_default_password("longenough"));
+    }
+
+    #[test]
+    fn weak_password_is_loopback_only_like_the_default() {
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        let wan: IpAddr = "203.0.113.5".parse().unwrap();
+        for weak in ["", "   ", "short", "12345678"] {
+            let flag = is_weak_password(weak);
+            assert!(flag, "{weak:?} weak");
+            assert!(
+                !allow_remote(flag, Some(wan)),
+                "{weak:?} must be refused from a remote ip"
+            );
+            assert!(
+                !allow_remote(flag, None),
+                "{weak:?} must be refused without a peer address"
+            );
+            assert!(allow_remote(flag, Some(lo)), "{weak:?} loopback stays open");
+        }
+        assert!(allow_remote(is_weak_password("longenough"), Some(wan)));
+    }
+
+    #[test]
     fn parse_register_body() {
         let body = r#"{"id":"abc","name":"Shell","permit":"write"}"#;
         let parsed: RegisterBody = serde_json::from_str(body).unwrap();
@@ -1433,6 +1478,92 @@ mod tests {
 
         let missing = post("/api/session/nope/approval", r#"{"decision":"once"}"#);
         assert!(missing.contains("404"), "response: {missing:?}");
+    }
+
+    /// End-to-end: with a weak password the server refuses non-loopback clients
+    /// (403) and never mints a token for an empty /login body.
+    #[test]
+    fn weak_password_blocks_remote_clients_and_empty_login() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let free = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let server = start(RemoteConfig {
+            bind: "0.0.0.0".into(),
+            port: free,
+            password: "12345678".into(),
+            ..Default::default()
+        });
+        assert!(server.is_running());
+
+        // A socket bound to 0.0.0.0 still answers on the loopback address with a
+        // loopback peer, so the gate is exercised directly for the remote case.
+        let wan: IpAddr = "203.0.113.5".parse().unwrap();
+        let empty: IpAddr = "203.0.113.6".parse().unwrap();
+        assert!(!allow_remote(is_weak_password("12345678"), Some(wan)));
+        assert!(!allow_remote(is_weak_password(""), Some(empty)));
+
+        // The POST /login route itself must not accept an empty password even
+        // from loopback, so an empty /login never yields a token.
+        let post_login = |body: &str| -> String {
+            let mut c = TcpStream::connect(("127.0.0.1", free)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let req = format!(
+                "POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            c.write_all(req.as_bytes()).unwrap();
+            let mut buf = [0u8; 512];
+            let n = c.read(&mut buf).unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        };
+
+        // With the shipped default still in place, an empty login is a 401.
+        let empty_login = post_login(r#"{"password":""}"#);
+        assert!(
+            empty_login.contains("401"),
+            "empty login must be rejected: {empty_login:?}"
+        );
+        assert!(
+            !empty_login.contains("token"),
+            "no token on empty login: {empty_login:?}"
+        );
+
+        // Real non-loopback request when this host has a LAN address: the
+        // password gate must answer 403 before any token check (which would
+        // have been a 401).
+        let lan = std::net::UdpSocket::bind("0.0.0.0:0")
+            .ok()
+            .and_then(|s| {
+                s.connect("203.0.113.1:9").ok()?;
+                s.local_addr().ok()
+            })
+            .map(|a| a.ip())
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+        if let Some(ip) = lan {
+            let mut c = TcpStream::connect((ip, free)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            c.write_all(b"GET /api/sessions HTTP/1.1\r\nHost: x\r\n\r\n")
+                .unwrap();
+            let mut buf = [0u8; 512];
+            let n = c.read(&mut buf).unwrap();
+            let resp = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                resp.contains("403"),
+                "weak password must 403 a non-loopback client ({ip}): {resp:?}"
+            );
+        }
+
+        // A short/blank stored password is still loopback-only.
+        set_password(&server, "   ".into());
+        assert!(!allow_remote(is_weak_password("   "), Some(wan)));
+        assert!(allow_remote(
+            is_weak_password("   "),
+            Some("127.0.0.1".parse().unwrap())
+        ));
     }
 
     #[test]

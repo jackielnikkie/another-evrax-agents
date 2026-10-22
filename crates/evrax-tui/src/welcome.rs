@@ -247,6 +247,7 @@ mod tests {
             name: format!("skill-{index:02}"),
             description: String::new(),
             path: PathBuf::new(),
+            content: String::new(),
         }
     }
 

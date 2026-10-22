@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::time::Instant;
 
 use evrax_agent::catalog::Catalog;
 use evrax_core::{AgentEvent, DiffLine};
@@ -32,6 +33,13 @@ pub struct App {
     pub busy: bool,
     /// Current tool-calling iteration inside the running turn (`n/max`).
     pub iteration: Option<(usize, usize)>,
+    /// Wall-clock start of the running turn, for the footer elapsed timer.
+    pub turn_started: Option<Instant>,
+    /// Prompts typed while a turn was streaming, run in order once it ends.
+    pub queued: VecDeque<String>,
+    /// Transcript detail level: false = quiet (tool bodies collapsed),
+    /// true = everything expanded (`ctrl+t` / `ctrl+o`).
+    pub expanded: bool,
     pub mode: AgentMode,
     pub scroll_from_bottom: u16,
     pub viewport_height: u16,
@@ -271,6 +279,7 @@ pub enum TunnelEffect {
 }
 
 /// Outcome of finishing a tunnel inline edit (caller persists + reacts).
+#[derive(Debug, PartialEq, Eq)]
 pub enum TunnelEditResult {
     UrlSaved,
     UrlCleared,
@@ -398,6 +407,15 @@ pub const MAX_RETAINED_SESSIONS: usize = 16;
 
 /// Minimum remote password length enforced by the in-TUI editor.
 pub const REMOTE_MIN_PASSWORD: usize = 8;
+
+/// Prompts allowed to wait while a turn streams (newest beyond this are dropped).
+pub const MAX_QUEUED_PROMPTS: usize = 8;
+
+/// Diff lines rendered before the "+N more" trailer while the view is quiet.
+pub const DIFF_PREVIEW_LINES: usize = 40;
+
+/// Body lines kept for an errored tool while quiet (successes show none).
+pub const QUIET_ERROR_LINES: usize = 4;
 
 pub struct Palette {
     pub query: String,
@@ -646,6 +664,8 @@ pub struct ToolCall {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum ToolStatus {
+    /// Arguments are still streaming in (or the call waits for approval).
+    Preparing,
     Running,
     Done,
     Error,
@@ -877,6 +897,9 @@ impl App {
             input: LineEditor::new(),
             busy: false,
             iteration: None,
+            turn_started: None,
+            queued: VecDeque::new(),
+            expanded: false,
             mode: AgentMode::Build,
             scroll_from_bottom: 0,
             viewport_height: 10,
@@ -1606,6 +1629,8 @@ impl App {
         self.attachments.clear();
         self.asst_open = false;
         self.busy = false;
+        self.turn_started = None;
+        self.queued.clear();
         self.scroll_from_bottom = 0;
         self.transcript.invalidate();
         true
@@ -1939,6 +1964,12 @@ impl App {
     }
 
     fn execute_command(&mut self, command: Command) {
+        // Read-only commands keep working while a turn streams; the ones that
+        // swap the session out from under the running turn do not.
+        if self.busy && matches!(command, Command::NewSession | Command::Rename) {
+            self.set_flash("not available while streaming".to_string());
+            return;
+        }
         match command {
             Command::ToggleMode => self.cycle_mode(),
             Command::Sessions => self.open_sessions(),
@@ -2000,7 +2031,10 @@ impl App {
         let query = self.slash_query();
         let current = self.input.text();
         let dismissed = self.slash_dismissed.as_deref() == Some(current.as_str());
-        let open = query.is_some() && !dismissed && !self.busy;
+        // Slash stays open while streaming: the read-only commands keep
+        // working, and mutating ones are refused with a flash (see
+        // `execute_command`).
+        let open = query.is_some() && !dismissed;
         if !open {
             if query.is_none() {
                 self.slash_dismissed = None;
@@ -2074,6 +2108,8 @@ impl App {
         self.input.take();
         self.asst_open = false;
         self.busy = false;
+        self.turn_started = None;
+        self.queued.clear();
         self.scroll_from_bottom = 0;
         self.selection.clear();
         self.transcript.invalidate();
@@ -2284,6 +2320,18 @@ impl App {
         match selected {
             // Enable/disable remote for this session.
             0 => {
+                let enabling = self.remote.as_ref().is_some_and(|s| !s.enabled);
+                let weak = self
+                    .remote
+                    .as_ref()
+                    .map(|s| evrax_remote::is_weak_password(&s.config.password))
+                    .unwrap_or(true);
+                if enabling && weak {
+                    self.set_flash(
+                        "set a password first (min 8) before enabling remote".to_string(),
+                    );
+                    return;
+                }
                 if let Some(state) = self.remote.as_mut() {
                     state.enabled = !state.enabled;
                 }
@@ -2357,6 +2405,9 @@ impl App {
             }
             return Err("password unchanged".into());
         }
+        if buf.trim().is_empty() || buf == "12345678" {
+            return Err("choose a different password (the default is not allowed)".into());
+        }
         if buf.chars().count() < REMOTE_MIN_PASSWORD {
             return Err(format!(
                 "password must be at least {REMOTE_MIN_PASSWORD} characters"
@@ -2383,10 +2434,16 @@ impl App {
 
     /// Menu rows for the tunnel dialog.
     pub fn tunnel_rows(&self) -> Vec<String> {
+        let weak = self
+            .remote
+            .as_ref()
+            .map(|s| evrax_remote::is_weak_password(&s.config.password))
+            .unwrap_or(true);
+        let note = if weak { " · password required" } else { "" };
         vec![
             "stop tunnel".to_string(),
-            "quick tunnel (trycloudflare.com)".to_string(),
-            "custom domain…".to_string(),
+            format!("quick tunnel (trycloudflare.com){note}"),
+            format!("custom domain…{note}"),
             "manual url…".to_string(),
             "copy url".to_string(),
         ]
@@ -2504,7 +2561,7 @@ impl App {
         let blocked = self
             .remote
             .as_ref()
-            .map(|s| evrax_remote::is_default_password(&s.config.password))
+            .map(|s| evrax_remote::is_weak_password(&s.config.password))
             .unwrap_or(true);
         if blocked {
             self.set_flash("set a password first (min 8) before using the tunnel".to_string());
@@ -2615,6 +2672,14 @@ impl App {
                 {
                     return Err("invalid hostname (example: evrax.example.com)".into());
                 }
+                if self
+                    .remote
+                    .as_ref()
+                    .map(|s| evrax_remote::is_weak_password(&s.config.password))
+                    .unwrap_or(true)
+                {
+                    return Err("set a password first (min 8) before using the tunnel".into());
+                }
                 if let Some(dialog) = self.tunnel_dialog.as_mut() {
                     dialog.editing = None;
                 }
@@ -2642,7 +2707,7 @@ impl App {
             state.config.tunnel_mode.clone(),
             state.config.tunnel_hostname.clone(),
             state.tunnel.is_active(),
-            evrax_remote::is_default_password(&state.config.password),
+            evrax_remote::is_weak_password(&state.config.password),
         );
         let process_mode = mode == "quick" || mode == "domain";
         if active
@@ -2675,6 +2740,15 @@ impl App {
     /// Spawn the process for the configured tunnel mode (effect executor for
     /// `TunnelEffect::Start`).
     pub fn tunnel_run(&mut self) {
+        let weak = self
+            .remote
+            .as_ref()
+            .map(|s| evrax_remote::is_weak_password(&s.config.password))
+            .unwrap_or(true);
+        if weak {
+            self.set_flash("set a password first (min 8) before using the tunnel".to_string());
+            return;
+        }
         let Some(state) = self.remote.as_ref() else {
             return;
         };
@@ -2860,9 +2934,6 @@ impl App {
     }
 
     pub fn submit_prompt(&mut self) -> Option<String> {
-        if self.busy {
-            return None;
-        }
         let prompt = self.input.text().trim().to_string();
         if prompt.is_empty() && self.attachments.is_empty() {
             return None;
@@ -2874,13 +2945,52 @@ impl App {
             self.run_slash_line(&prompt);
             return None;
         }
+        if self.busy {
+            // Attachments have nowhere to live between turns: keep them (and
+            // the draft) in the composer instead of dropping them in a queue.
+            if !self.attachments.is_empty() {
+                self.set_flash("not available while streaming (attachments)".to_string());
+                return None;
+            }
+            self.input.take();
+            self.queue_prompt(prompt);
+            return None;
+        }
         self.input.take();
         self.attachments.clear();
+        self.begin_turn(prompt)
+    }
+
+    /// Books a prompt that cannot start yet (a turn is streaming).
+    fn queue_prompt(&mut self, prompt: String) {
+        if self.queued.len() >= MAX_QUEUED_PROMPTS {
+            self.set_flash(format!(
+                "queue full ({MAX_QUEUED_PROMPTS}) · prompt dropped"
+            ));
+            return;
+        }
+        self.queued.push_back(prompt);
+        self.set_flash(format!("queued ({})", self.queued.len()));
+    }
+
+    /// Pops the oldest queued prompt and starts it — only while idle.
+    pub fn take_queued_prompt(&mut self) -> Option<String> {
+        if self.busy {
+            return None;
+        }
+        let prompt = self.queued.pop_front()?;
+        self.begin_turn(prompt)
+    }
+
+    /// Runs a prompt as a new turn: transcript, title placeholder, busy flag
+    /// and the remote echo are handled here for every entry path.
+    fn begin_turn(&mut self, prompt: String) -> Option<String> {
         self.push_entry(ChatEntry::User(prompt.clone()));
         self.save_current();
         self.ensure_placeholder_title(&prompt);
         self.busy = true;
         self.iteration = None;
+        self.turn_started = Some(Instant::now());
         self.asst_open = false;
         self.scroll_from_bottom = 0;
         if let Some(turn) = self.remote.as_ref().map(|s| s.session_id.clone()) {
@@ -2924,23 +3034,15 @@ impl App {
     /// composer, so web prompts run under the current TUI mode and surface tool
     /// approvals in the terminal as usual.
     pub fn submit_external_prompt(&mut self, text: String) -> Option<String> {
-        if self.busy {
-            return None;
-        }
         let prompt = text.trim().to_string();
         if prompt.is_empty() {
             return None;
         }
-        self.push_entry(ChatEntry::User(prompt.clone()));
-        self.ensure_placeholder_title(&prompt);
-        self.busy = true;
-        self.iteration = None;
-        self.asst_open = false;
-        self.scroll_from_bottom = 0;
-        if let Some(turn) = self.remote.as_ref().map(|s| s.session_id.clone()) {
-            self.emit_remote(evrax_remote::RemoteEvent::TurnStart { turn });
+        if self.busy {
+            self.queue_prompt(prompt);
+            return None;
         }
-        Some(prompt)
+        self.begin_turn(prompt)
     }
 
     pub fn paste_text(&mut self, text: &str) {
@@ -3009,16 +3111,34 @@ impl App {
 
     pub fn cancel_turn(&mut self) {
         self.busy = false;
+        self.turn_started = None;
         self.asst_open = false;
+        let cleared = self.queued.len();
+        self.queued.clear();
         for entry in self.messages.iter_mut().rev() {
             if let ChatEntry::Tool(tool) = entry
-                && matches!(tool.status, ToolStatus::Running)
+                && matches!(tool.status, ToolStatus::Running | ToolStatus::Preparing)
             {
                 tool.status = ToolStatus::Error;
                 tool.detail = "cancelled".to_string();
             }
         }
         self.content_rev = self.content_rev.wrapping_add(1);
+        if cleared > 0 {
+            self.set_flash(format!("cancelled · {cleared} queued prompt(s) cleared"));
+        }
+    }
+
+    /// Flips the transcript between quiet and fully-expanded (`ctrl+t`/`ctrl+o`).
+    pub fn toggle_expanded(&mut self) {
+        self.expanded = !self.expanded;
+        self.content_rev = self.content_rev.wrapping_add(1);
+        self.transcript.invalidate();
+        self.set_flash(if self.expanded {
+            "transcript: expanded".to_string()
+        } else {
+            "transcript: quiet".to_string()
+        });
     }
 
     pub fn apply_event(&mut self, event: AgentEvent) {
@@ -3066,14 +3186,48 @@ impl App {
                     });
                 }
             }
+            AgentEvent::ToolPreparing { name, bytes } => {
+                self.asst_open = false;
+                let detail = format!("preparing… {bytes} B");
+                let upgraded = if let Some(ChatEntry::Tool(tool)) = self.messages.last_mut()
+                    && tool.name == name
+                {
+                    tool.status = ToolStatus::Preparing;
+                    tool.detail = detail.clone();
+                    self.content_rev = self.content_rev.wrapping_add(1);
+                    true
+                } else {
+                    false
+                };
+                if !upgraded {
+                    self.push_entry(ChatEntry::Tool(ToolCall {
+                        name,
+                        summary: "preparing".to_string(),
+                        status: ToolStatus::Preparing,
+                        detail,
+                    }));
+                }
+            }
             AgentEvent::ToolStarted { name, summary } => {
                 self.asst_open = false;
-                self.push_entry(ChatEntry::Tool(ToolCall {
-                    name: name.clone(),
-                    summary,
-                    status: ToolStatus::Running,
-                    detail: "running…".to_string(),
-                }));
+                // A preparing placeholder for the same call is upgraded in
+                // place so the transcript shows one row per tool call.
+                if let Some(ChatEntry::Tool(tool)) = self.messages.last_mut()
+                    && matches!(tool.status, ToolStatus::Preparing)
+                    && tool.name == name
+                {
+                    tool.summary = summary;
+                    tool.status = ToolStatus::Running;
+                    tool.detail = "running…".to_string();
+                    self.content_rev = self.content_rev.wrapping_add(1);
+                } else {
+                    self.push_entry(ChatEntry::Tool(ToolCall {
+                        name: name.clone(),
+                        summary,
+                        status: ToolStatus::Running,
+                        detail: "running…".to_string(),
+                    }));
+                }
                 if let Some(turn) = &remote_turn {
                     self.emit_remote(evrax_remote::RemoteEvent::Tool {
                         turn: turn.clone(),
@@ -3087,7 +3241,7 @@ impl App {
                 self.asst_open = false;
                 for entry in self.messages.iter_mut().rev() {
                     if let ChatEntry::Tool(tool) = entry
-                        && matches!(tool.status, ToolStatus::Running)
+                        && matches!(tool.status, ToolStatus::Running | ToolStatus::Preparing)
                         && tool.name == name
                     {
                         tool.status = if ok {
@@ -3132,6 +3286,7 @@ impl App {
             AgentEvent::TurnFinished => {
                 self.busy = false;
                 self.iteration = None;
+                self.turn_started = None;
                 self.asst_open = false;
                 self.save_current();
                 self.plan_title_job();
@@ -3164,6 +3319,7 @@ impl App {
             AgentEvent::Failed { message } => {
                 self.busy = false;
                 self.iteration = None;
+                self.turn_started = None;
                 self.asst_open = false;
                 self.save_current();
                 self.push_entry(ChatEntry::Assistant(format!("error: {message}")));
@@ -3349,6 +3505,122 @@ mod tests {
         }
         assert!(app.submit_prompt().is_none());
         assert!(!app.busy);
+    }
+
+    #[test]
+    fn queued_prompts_run_after_the_current_turn() {
+        let mut app = app();
+        type_and_submit(&mut app, "first");
+        assert!(app.busy);
+        let before = app.messages.len();
+        // A second prompt typed mid-turn is queued, not dropped and not run.
+        for c in "second".chars() {
+            app.input.insert_char(c);
+        }
+        assert!(app.submit_prompt().is_none());
+        assert!(app.input.is_empty());
+        assert_eq!(app.queued.len(), 1);
+        assert_eq!(app.messages.len(), before);
+        // Nothing runs while the turn is streaming.
+        assert!(app.take_queued_prompt().is_none());
+        // The turn ends: the queued prompt becomes the next turn.
+        app.busy = false;
+        let prompt = app.take_queued_prompt().expect("queued prompt runs");
+        assert_eq!(prompt, "second");
+        assert!(app.busy);
+        assert!(app.queued.is_empty());
+    }
+
+    #[test]
+    fn queue_is_capped_and_cancel_clears_it() {
+        let mut app = app();
+        type_and_submit(&mut app, "first");
+        for i in 0..(MAX_QUEUED_PROMPTS + 3) {
+            app.queued.push_back(format!("queued-{i}"));
+        }
+        // Re-queueing through the public path respects the cap.
+        app.queued.truncate(MAX_QUEUED_PROMPTS);
+        for c in "extra".chars() {
+            app.input.insert_char(c);
+        }
+        assert!(app.submit_prompt().is_none());
+        assert_eq!(app.queued.len(), MAX_QUEUED_PROMPTS);
+        app.cancel_turn();
+        assert!(!app.busy);
+        assert!(app.queued.is_empty());
+        assert!(app.turn_started.is_none());
+    }
+
+    #[test]
+    fn mutating_slash_is_blocked_while_streaming_read_only_is_not() {
+        let mut app = app();
+        type_and_submit(&mut app, "first");
+        assert!(app.busy);
+        // `/new` swaps the session out from under the running turn -> refused.
+        for c in "/new".chars() {
+            app.input.insert_char(c);
+        }
+        app.submit_prompt();
+        assert!(app.sessions.is_empty());
+        assert!(
+            app.flash
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("not available while streaming"))
+        );
+        // `/mode` only flips a flag -> allowed while busy.
+        let mode_before = app.mode;
+        for c in "/mode".chars() {
+            app.input.insert_char(c);
+        }
+        app.submit_prompt();
+        assert_ne!(app.mode, mode_before);
+    }
+
+    #[test]
+    fn expanded_toggle_flips_the_flag_and_invalidates_the_cache() {
+        let mut app = app();
+        assert!(!app.expanded);
+        app.toggle_expanded();
+        assert!(app.expanded);
+        app.toggle_expanded();
+        assert!(!app.expanded);
+    }
+
+    #[test]
+    fn turn_started_is_tracked_for_the_footer_clock() {
+        let mut app = app();
+        assert!(app.turn_started.is_none());
+        type_and_submit(&mut app, "time me");
+        assert!(app.turn_started.is_some());
+        app.apply_event(AgentEvent::TurnFinished);
+        assert!(app.turn_started.is_none());
+    }
+
+    #[test]
+    fn tool_preparing_placeholder_is_upgraded_in_place() {
+        let mut app = app();
+        app.busy = true;
+        app.apply_event(AgentEvent::ToolPreparing {
+            name: "read".into(),
+            bytes: 4096,
+        });
+        assert!(matches!(
+            app.messages.last(),
+            Some(ChatEntry::Tool(tool))
+                if matches!(tool.status, ToolStatus::Preparing) && tool.name == "read"
+        ));
+        let before = app.messages.len();
+        app.apply_event(AgentEvent::ToolStarted {
+            name: "read".into(),
+            summary: "src/lib.rs".into(),
+        });
+        // Same row, now running — not a second entry.
+        assert_eq!(app.messages.len(), before);
+        assert!(matches!(
+            app.messages.last(),
+            Some(ChatEntry::Tool(tool))
+                if matches!(tool.status, ToolStatus::Running) && tool.summary == "src/lib.rs"
+        ));
     }
 
     #[test]
@@ -4451,6 +4723,133 @@ mod tests {
         assert!(matches!(app.tunnel_follow_remote(), TunnelEffect::None));
         let (flash, _) = app.flash.as_ref().expect("hint flashed");
         assert!(flash.contains("hostname"), "flash: {flash}");
+    }
+
+    #[test]
+    fn tunnel_hostname_commit_refused_with_weak_password() {
+        for weak in ["12345678", "", "short", "   "] {
+            let mut app = app();
+            app.ensure_remote();
+            {
+                let cfg = &mut app.remote.as_mut().unwrap().config;
+                cfg.password = weak.into();
+                cfg.tunnel_hostname.clear();
+                cfg.tunnel_mode.clear();
+            }
+            app.tunnel_dialog = Some(TunnelDialog {
+                selected: 2,
+                editing: Some("evrax.example.com".into()),
+                kind: TunnelEditKind::Hostname,
+            });
+            let err = app.tunnel_edit_commit().unwrap_err();
+            assert!(err.contains("password"), "{weak:?} err: {err}");
+            assert!(
+                app.tunnel_dialog.as_ref().unwrap().editing.is_some(),
+                "{weak:?}: editor must stay open"
+            );
+            let cfg = &app.remote.as_ref().unwrap().config;
+            assert!(
+                cfg.tunnel_mode.is_empty(),
+                "{weak:?}: mode must stay untouched"
+            );
+            assert!(
+                cfg.tunnel_hostname.is_empty(),
+                "{weak:?}: hostname not saved"
+            );
+            assert!(
+                !app.remote.as_ref().unwrap().enabled,
+                "{weak:?}: remote stays off"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_toggle_enable_refused_with_weak_password() {
+        let mut app = app();
+        app.open_remote_dialog();
+        app.remote.as_mut().unwrap().config.password = "12345678".into();
+        app.remote.as_mut().unwrap().enabled = false;
+        app.remote_dialog.as_mut().unwrap().selected = 0;
+        app.remote_toggle();
+        assert!(!app.remote.as_ref().unwrap().enabled, "must stay off");
+        let (flash, _) = app.flash.as_ref().expect("guard flash");
+        assert!(flash.contains("password"), "flash: {flash}");
+
+        // A real password lets the switch turn on.
+        app.remote.as_mut().unwrap().config.password = "longenough".into();
+        app.remote_toggle();
+        assert!(
+            app.remote.as_ref().unwrap().enabled,
+            "strong password enables"
+        );
+
+        // Turning it OFF always works, even after the password turns weak.
+        app.remote.as_mut().unwrap().config.password = "12345678".into();
+        app.remote_toggle();
+        assert!(
+            !app.remote.as_ref().unwrap().enabled,
+            "disable is never blocked"
+        );
+    }
+
+    #[test]
+    fn tunnel_follow_remote_waits_for_weak_password() {
+        let mut app = app();
+        app.ensure_remote();
+        {
+            let state = app.remote.as_mut().unwrap();
+            state.enabled = true;
+            state.config.tunnel_mode = "quick".into();
+            state.config.password = "12345678".into();
+        }
+        assert!(matches!(app.tunnel_follow_remote(), TunnelEffect::None));
+        let (flash, _) = app.flash.as_ref().expect("waiting flash");
+        assert!(flash.contains("password"), "flash: {flash}");
+        assert!(
+            !app.remote.as_ref().unwrap().tunnel.is_active(),
+            "no process started"
+        );
+    }
+
+    #[test]
+    fn tunnel_rows_mark_password_requirement() {
+        let mut app = app();
+        app.ensure_remote();
+        app.remote.as_mut().unwrap().config.password = "12345678".into();
+        let rows = app.tunnel_rows();
+        assert!(rows[1].contains("password required"), "rows: {rows:?}");
+        assert!(rows[2].contains("password required"), "rows: {rows:?}");
+        assert!(!rows[0].contains("password required"));
+        assert!(!rows[3].contains("password required"));
+        app.remote.as_mut().unwrap().config.password = "longenough".into();
+        let rows = app.tunnel_rows();
+        assert!(
+            rows.iter().all(|r| !r.contains("password required")),
+            "rows: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn remote_edit_commit_rejects_default_and_blank_passwords() {
+        let mut app = app();
+        app.open_remote_dialog();
+        // App::new() may seed a different default; force the shipped default
+        // to exercise the rejection path deterministically.
+        app.remote.as_mut().unwrap().config.password = "12345678".into();
+        app.remote_dialog.as_mut().unwrap().selected = 2;
+        app.remote_toggle();
+        app.remote_dialog.as_mut().unwrap().editing = Some("12345678".into());
+        let err = app.remote_edit_commit().unwrap_err();
+        assert!(err.contains("default is not allowed"), "err: {err}");
+        assert_eq!(app.remote.as_ref().unwrap().config.password, "12345678");
+
+        app.remote_dialog.as_mut().unwrap().editing = Some("        ".into());
+        let err = app.remote_edit_commit().unwrap_err();
+        assert!(err.contains("default is not allowed"), "err: {err}");
+        assert!(
+            app.remote_dialog.as_ref().unwrap().editing.is_some(),
+            "kept on error"
+        );
     }
     #[test]
     fn sessions_persist_and_resume_roundtrip() {
