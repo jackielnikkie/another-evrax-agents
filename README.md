@@ -163,16 +163,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Project layout
 
-```
-crates/evrax-core     backend contract (TurnRequest, AgentEvent, AgentBackend)
-crates/evrax-agent    SSE backend, agent loop, tools, catalog
-crates/evrax-remote   web remote server, SSE, tunnel
-crates/evrax-store    project and session storage
-crates/evrax-tui      the TUI app (binary: evrax)
-evrax-graph/          code graph indexer and CLI
-skill-evrax/          skills loaded by the catalog
-docs/                 code map, install, remote/tunnel, themes
-```
+| Path | Crate | What it is |
+| --- | --- | --- |
+| `crates/evrax-core` | `evrax-core` | backend contract — `TurnRequest`, `AgentEvent`, `AgentBackend` |
+| `crates/evrax-agent` | `evrax-agent` | OpenAI-compatible + Anthropic backends, agent loop, tools, catalog |
+| `crates/evrax-remote` | `evrax-remote` | web remote server, SSE stream, cloudflared tunnel |
+| `crates/evrax-store` | `evrax-store` | project and session storage on disk |
+| `crates/evrax-tui` | `evrax-tui` | the ratatui app — binary **`evrax`** |
+| `evrax-graph/` | `evrax-graph` | code-graph indexer and CLI — binary **`evrax-graph`** |
+| `skill-evrax/` | — | skills loaded by the catalog |
+| `docs/` | — | code map, install, remote/tunnel, themes |
 
 Module map and call flow: [`docs/code-map.md`](docs/code-map.md).
 

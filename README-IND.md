@@ -160,16 +160,16 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Struktur project
 
-```
-crates/evrax-core     kontrak backend (TurnRequest, AgentEvent, AgentBackend)
-crates/evrax-agent    backend SSE, agent loop, tools, catalog
-crates/evrax-remote   server web remote, SSE, tunnel
-crates/evrax-store    penyimpanan project dan sesi
-crates/evrax-tui      aplikasi TUI (binary: evrax)
-evrax-graph/          indexer code graph dan CLI
-skill-evrax/          skill yang dimuat catalog
-docs/                 peta kode, install, remote/tunnel, tema
-```
+| Path | Crate | Isinya |
+| --- | --- | --- |
+| `crates/evrax-core` | `evrax-core` | kontrak backend — `TurnRequest`, `AgentEvent`, `AgentBackend` |
+| `crates/evrax-agent` | `evrax-agent` | backend [OI]-compatible + Anthropic, agent loop, tools, catalog |
+| `crates/evrax-remote` | `evrax-remote` | server web remote, stream SSE, tunnel cloudflared |
+| `crates/evrax-store` | `evrax-store` | penyimpanan project dan sesi di disk |
+| `crates/evrax-tui` | `evrax-tui` | aplikasi ratatui — binary **`evrax`** |
+| `evrax-graph/` | `evrax-graph` | indexer code graph dan CLI — binary **`evrax-graph`** |
+| `skill-evrax/` | — | skill yang dimuat catalog |
+| `docs/` | — | peta kode, install, remote/tunnel, tema |
 
 Peta modul dan alur kode: [`docs/code-map.md`](docs/code-map.md).
 
