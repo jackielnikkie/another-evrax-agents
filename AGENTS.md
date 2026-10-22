@@ -49,6 +49,7 @@ Detail besar dipindah ke `docs/` (tidak di-inject tiap turn): lihat **Detail ref
 - Mapping 5 tema (hex lengkap catppuccin/dracula/gruvbox/nord/tokyonight): `docs/themes-notes.md`
 - Peta path & nomor baris + keybinds + render order + recon hermes: `docs/code-map.md`
 - Riwayat detail tiap batch kerja (verbatim): `docs/work-log.md`
+- **Changelog user-facing (English)**: `CHANGELOG.md` — update tiap rilis atau batch fix.
 - **Ringkasan state untuk pindah session (paling baru, v0.1.3)**: `docs/handoff-2026-10-22.md`
 - **Sisa kerja + todo + plan `evrax-store` (handoff sesi besar fork #1)**: `docs/handoff-2026-10-21.md`
 - Installer & rilis: `docs/install.md` · referensi desain UI: `docs/ui-reference.md` · catatan desain graph: `docs/evrax-graph-notes.md`
