@@ -87,3 +87,8 @@ Verbatim dari blok Completed AGENTS.md (2026-10-20). AGENTS.md cuma nyimpen ring
 - Permintaan user: tidak ada bahasa Indonesia di UI evrax. Diterjemahkan semua string user-facing: wizard & `/model` dialog (langkah→step, pilih→select, simpan & aktifkan→save & activate, kosong→empty, cari→search, dst), footer (`iterasi`→`iteration`), flash, status wizard/model, error provider 9router/401/403/404, error tunnel cloudflared, error CLI (`belum ada sesi`→`no saved sessions yet`), judul langkah wizard (`tipe provider`→`provider type`, `ringkasan`→`review`). AGENTS.md/docs tetap Indonesia.
 - PgUp/PgDn wizard sebelumnya terasa no-op karena step Kind hanya 2 baris dan `wizard_move` tidak mengubah tipe; kini panah & PgUp/PgDn di step Kind mengganti tipe provider, dan `wizard_page`/`model_page` jalan di list provider/model.
 - Test: `wizard_and_model_handlers_page_with_page_keys` (handler-level, membuktikan PageDown PageUp sampai ke App) + rename 4 assertion lama ke string Inggris → **279 test hijau**, clippy clean, name guard clean, release 0.1.2 rebuild. Belum rilis/tag.
+## Rilis v0.1.3 (2026-10-22)
+- Versi workspace 0.1.2 → 0.1.3 (Cargo.toml, tanpa BOM), README EN/ID pin contoh `v0.1.3`, commit `8b367f6` + tag anotasi `v0.1.3` di-push ke origin + another.
+- CI: workflow `release` sukses → asset `evrax-v0.1.3-x86_64-pc-windows-msvc.zip` (6,339,123 B) + `SHA256SUMS`.
+- Verifikasi installer: `install.ps1 -InstallDir <tmp> -NoPath` → unduh rilis terbaru → SHA-256 OK → `evrax 0.1.3`; direktori cek dihapus lagi.
+- Isi rilis: multi-provider + Anthropic native + wizard fetch model + `/model` picker + UI English-only + wizard paging.
