@@ -202,7 +202,7 @@ pub struct ModelDialog {
 }
 
 impl ModelDialog {
-    fn refilter(&mut self) {
+    pub(crate) fn refilter(&mut self) {
         let needle = self.filter.trim().to_lowercase();
         self.filtered = self
             .models
@@ -978,10 +978,17 @@ impl App {
     }
 
     pub fn wizard_move(&mut self, delta: i32) {
+        let Some(step) = self.wizard.as_ref().map(|wizard| wizard.step) else {
+            return;
+        };
+        if step == WizardStep::Kind {
+            self.wizard_kind(delta);
+            return;
+        }
         let Some(wizard) = self.wizard.as_mut() else {
             return;
         };
-        match wizard.step {
+        match step {
             WizardStep::Providers => {
                 let rows = self.providers.len() + 1;
                 wizard.cursor = (wizard.cursor as i32 + delta).rem_euclid(rows as i32) as usize;
@@ -1006,6 +1013,11 @@ impl App {
         };
         let page = DIALOG_PAGE as i32 * delta;
         match wizard.step {
+            WizardStep::Kind => {
+                let count = evrax_agent::ProviderKind::ALL.len() as i32;
+                let index = (wizard.kind as i32 + page.signum()).rem_euclid(count) as usize;
+                wizard.kind = evrax_agent::ProviderKind::ALL[index];
+            }
             WizardStep::Providers => {
                 let rows = (self.providers.len() + 1) as i32;
                 wizard.cursor = (wizard.cursor as i32 + page).clamp(0, rows - 1) as usize;
@@ -1137,7 +1149,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|wizard| wizard.name.trim().is_empty())
                 {
-                    self.wizard_status("nama provider wajib diisi", false);
+                    self.wizard_status("provider name is required", false);
                     return WizardAction::None;
                 }
                 if let Some(wizard) = self.wizard.as_mut() {
@@ -1152,7 +1164,7 @@ impl App {
                     url.starts_with("http://") || url.starts_with("https://")
                 });
                 if !valid {
-                    self.wizard_status("base URL harus diawali http:// atau https://", false);
+                    self.wizard_status("base URL must start with http:// or https://", false);
                     return WizardAction::None;
                 }
                 if let Some(wizard) = self.wizard.as_mut() {
@@ -1192,14 +1204,14 @@ impl App {
                     wizard.model = wizard.filter.trim().to_string();
                     wizard.step = WizardStep::Review;
                 } else {
-                    wizard.status = Some("ketik nama model dulu".to_string());
+                    wizard.status = Some("type a model name first".to_string());
                 }
                 WizardAction::None
             }
             WizardStep::Review => match self.wizard_settings() {
                 Some(settings) => WizardAction::Save(settings),
                 None => {
-                    self.wizard_status("lengkapi nama, base URL, dan model", false);
+                    self.wizard_status("fill in the name, base URL, and model", false);
                     WizardAction::None
                 }
             },
@@ -1258,7 +1270,7 @@ impl App {
                 wizard.refilter();
                 wizard.step = WizardStep::Models;
                 wizard.status = if wizard.models.is_empty() {
-                    Some("tidak ada model; ketik nama model manual lalu Enter".to_string())
+                    Some("no models; type a model name and press Enter".to_string())
                 } else {
                     None
                 };
@@ -1269,7 +1281,7 @@ impl App {
                 wizard.filter.clear();
                 wizard.model_cursor = 0;
                 wizard.step = WizardStep::Models;
-                wizard.status = Some(format!("{error} - ketik model manual lalu Enter"));
+                wizard.status = Some(format!("{error} - type the model manually and press Enter"));
             }
         }
     }
@@ -1371,7 +1383,7 @@ impl App {
 
     pub fn open_model_dialog(&mut self) {
         if self.providers.is_empty() {
-            self.set_flash("belum ada provider - jalankan evrax --setup".to_string());
+            self.set_flash("no providers yet - run evrax --setup".to_string());
             return;
         }
         let cursor = self
@@ -1452,7 +1464,7 @@ impl App {
                     dialog.filtered.clear();
                     dialog.filter.clear();
                     dialog.model_cursor = 0;
-                    dialog.status = Some("memuat model...".to_string());
+                    dialog.status = Some("loading models...".to_string());
                 }
                 ModelAction::FetchModels(FetchRequest {
                     request_id,
@@ -1476,7 +1488,8 @@ impl App {
                 let index = dialog.provider_cursor;
                 let Some(model) = chosen else {
                     if let Some(dialog) = self.model_dialog.as_mut() {
-                        dialog.status = Some("ketik nama model atau pilih dari daftar".to_string());
+                        dialog.status =
+                            Some("type a model name or pick one from the list".to_string());
                     }
                     return ModelAction::None;
                 };
@@ -1512,7 +1525,7 @@ impl App {
                 dialog.model_cursor = 0;
                 dialog.refilter();
                 dialog.status = if dialog.models.is_empty() {
-                    Some("tidak ada model; ketik nama model manual lalu Enter".to_string())
+                    Some("no models; type a model name and press Enter".to_string())
                 } else {
                     None
                 };
@@ -1521,7 +1534,7 @@ impl App {
                 dialog.models.clear();
                 dialog.filtered.clear();
                 dialog.filter.clear();
-                dialog.status = Some(format!("{error} - ketik model manual lalu Enter"));
+                dialog.status = Some(format!("{error} - type the model manually and press Enter"));
             }
         }
     }
@@ -2468,7 +2481,7 @@ impl App {
             _ => match self.tunnel_current_url() {
                 Some(url) => TunnelEffect::Copy(url),
                 None => {
-                    self.set_flash("tunnel: belum ada url".to_string());
+                    self.set_flash("tunnel: no url yet".to_string());
                     TunnelEffect::None
                 }
             },
@@ -2494,7 +2507,7 @@ impl App {
             .map(|s| evrax_remote::is_default_password(&s.config.password))
             .unwrap_or(true);
         if blocked {
-            self.set_flash("ganti password dulu (min 8) sebelum pakai tunnel".to_string());
+            self.set_flash("set a password first (min 8) before using the tunnel".to_string());
             return TunnelEffect::None;
         }
         if let Some(state) = &mut self.remote {
@@ -2568,7 +2581,7 @@ impl App {
                 if !trimmed.is_empty() {
                     let lower = trimmed.to_lowercase();
                     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-                        return Err("url harus mulai dengan http:// atau https://".into());
+                        return Err("url must start with http:// or https://".into());
                     }
                 }
                 if let Some(dialog) = self.tunnel_dialog.as_mut() {
@@ -2600,7 +2613,7 @@ impl App {
                     || hostname.contains('/')
                     || hostname.chars().any(|c| c.is_whitespace())
                 {
-                    return Err("hostname tidak valid (contoh: evrax.example.com)".into());
+                    return Err("invalid hostname (example: evrax.example.com)".into());
                 }
                 if let Some(dialog) = self.tunnel_dialog.as_mut() {
                     dialog.editing = None;
@@ -2642,7 +2655,7 @@ impl App {
             return TunnelEffect::None;
         }
         if password_default {
-            self.set_flash("tunnel menunggu · ganti password dulu (min 8)".to_string());
+            self.set_flash("tunnel waiting · set a password first (min 8)".to_string());
             return TunnelEffect::None;
         }
         if active {
@@ -2652,7 +2665,7 @@ impl App {
             "quick" => TunnelEffect::Start,
             "domain" if !hostname.is_empty() => TunnelEffect::Start,
             "domain" => {
-                self.set_flash("custom domain: isi hostname dulu (menu tunnel)".to_string());
+                self.set_flash("custom domain: set the hostname first (tunnel menu)".to_string());
                 TunnelEffect::None
             }
             _ => TunnelEffect::None,
@@ -2670,15 +2683,15 @@ impl App {
             "domain" => {
                 let hostname = state.config.tunnel_hostname.clone();
                 if hostname.is_empty() {
-                    self.set_flash("custom domain: hostname belum diisi".to_string());
+                    self.set_flash("custom domain: hostname not set".to_string());
                     return;
                 }
                 state.tunnel.start_domain(port, hostname.clone());
-                self.set_flash(format!("custom domain mulai… ({hostname})"));
+                self.set_flash(format!("custom domain starting… ({hostname})"));
             }
             _ => {
                 state.tunnel.start_quick(port);
-                self.set_flash("quick tunnel mulai…".to_string());
+                self.set_flash("quick tunnel starting…".to_string());
             }
         }
     }
@@ -4057,7 +4070,7 @@ mod tests {
         });
         assert!(
             app.take_title_job().is_none(),
-            "belum TurnFinished, belum ada job"
+            "no TurnFinished yet, no job"
         );
         app.apply_event(AgentEvent::TurnFinished);
         let job = app.take_title_job().expect("job should be queued");

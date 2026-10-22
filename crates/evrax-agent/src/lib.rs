@@ -578,7 +578,7 @@ fn parse_openai_models(value: &Value) -> Result<Vec<String>, String> {
         .as_array()
         .or_else(|| value.get("data").and_then(Value::as_array))
         .or_else(|| value.get("models").and_then(Value::as_array))
-        .ok_or("respons /models tidak dikenali")?;
+        .ok_or("/models response not recognized")?;
     Ok(items
         .iter()
         .filter_map(|item| {
@@ -606,8 +606,8 @@ fn models_error(status: u16, body: &str, kind: ProviderKind) -> String {
     };
     let detail = trunc(&raw.replace('\n', " "), 240);
     let hint = match status {
-        401 | 403 => "API key ditolak - cek api_key",
-        404 | 405 | 501 => "endpoint ini tidak menyediakan /models - isi model manual",
+        401 | 403 => "API key rejected - check api_key",
+        404 | 405 | 501 => "this endpoint does not serve /models - enter the model manually",
         _ => "",
     };
     if hint.is_empty() {
@@ -944,7 +944,7 @@ impl Exec {
 async fn emit(tx: &mpsc::Sender<AgentEvent>, event: AgentEvent) -> Result<(), String> {
     tx.send(event)
         .await
-        .map_err(|_| "turn dibatalkan".to_string())
+        .map_err(|_| "turn cancelled".to_string())
 }
 
 const SUMMARY_NUDGE: &str = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
@@ -1129,7 +1129,7 @@ async fn finish_budget(
     emit(
         tx,
         AgentEvent::Notice {
-            message: format!("batas iterasi tool tercapai ({max}/{max}) — minta ringkasan"),
+            message: format!("tool iteration budget reached ({max}/{max}) - requesting a summary"),
         },
     )
     .await?;
@@ -1147,14 +1147,14 @@ async fn finish_budget(
                 text = round.text;
                 break;
             }
-            Ok(_) => last_error = Some("respons kosong".to_string()),
+            Ok(_) => last_error = Some("empty response".to_string()),
             Err(error) => last_error = Some(error),
         }
         if attempt == 0 {
             emit(
                 tx,
                 AgentEvent::Notice {
-                    message: "ringkasan gagal, coba sekali lagi".into(),
+                    message: "summary failed, retrying once".into(),
                 },
             )
             .await?;
@@ -1162,15 +1162,15 @@ async fn finish_budget(
     }
 
     if text.trim().is_empty() {
-        let detail = last_error.unwrap_or_else(|| "respons kosong".into());
+        let detail = last_error.unwrap_or_else(|| "empty response".into());
         text = format!(
-            "Batas langkah turn ini habis ({max} tool call). Kirim `continue` untuk melanjutkan, atau naikkan `max_iterations` di agent.json."
+            "This turn hit its step budget ({max} tool calls). Send `continue` to keep going, or raise `max_iterations` in agent.json."
         );
         emit(
             tx,
             AgentEvent::Notice {
                 message: format!(
-                    "ringkasan tidak tersedia ({}) — pakai pesan fallback",
+                    "summary unavailable ({}) - using the fallback message",
                     trunc(&detail, 140)
                 ),
             },
@@ -1274,15 +1274,15 @@ fn provider_error(
     let is_nine_router = base_url.contains("20128") || lower.contains("9router");
     let hint = match status.as_u16() {
         401 if is_nine_router => {
-            "API key ditolak 9router (invalid/nonaktif) - cek `api_key` di agent.json dan status key di dashboard 9router"
+            "9router rejected the API key (invalid/inactive) - check `api_key` in agent.json and the key status in the 9router dashboard"
         }
-        401 => "API key ditolak provider - cek `api_key` di agent.json",
+        401 => "provider rejected the API key - check `api_key` in agent.json",
         402 => "kuota/kredit provider habis",
         403 if is_nine_router => {
-            "9router menolak key ini untuk model tersebut - buka dashboard 9router  API Keys, izinkan model itu atau matikan restrict access"
+            "9router denied this key for that model - open the 9router dashboard  API Keys, allow the model or disable restrict access"
         }
         403 => {
-            "provider menolak key ini untuk model tersebut - cek izin key/model di dashboard provider"
+            "provider denied this key for that model - check key/model permissions in the provider dashboard"
         }
         _ => "",
     };
@@ -1423,7 +1423,7 @@ async fn stream_round(
                     tokio::time::sleep(retry::sleep(delay)).await;
                     continue;
                 }
-                return Err(format!("gagal menghubungi {}: {error}", inner.cfg.base_url));
+                return Err(format!("failed to reach {}: {error}", inner.cfg.base_url));
             }
         }
     };
@@ -1435,7 +1435,7 @@ async fn stream_round(
         let mut thinking_started: Option<Instant> = None;
         let mut finished = false;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("stream terputus: {e}"))?;
+            let chunk = chunk.map_err(|e| format!("stream interrupted: {e}"))?;
             for payload in decoder.push(&chunk) {
                 if handle_anthropic_payload(&payload, &mut acc, &mut thinking_started, tx).await? {
                     finished = true;
@@ -1463,7 +1463,7 @@ async fn stream_round(
 
     let mut finished = false;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("stream terputus: {e}"))?;
+        let chunk = chunk.map_err(|e| format!("stream interrupted: {e}"))?;
         for payload in decoder.push(&chunk) {
             if handle_payload(&payload, &mut state, tx).await? {
                 finished = true;
@@ -1499,7 +1499,7 @@ async fn handle_anthropic_payload(
         emit(tx, AgentEvent::TextDelta { text }).await?;
     }
     if let Some(error) = acc.error.take() {
-        return Err(format!("error provider: {error}"));
+        return Err(format!("provider error: {error}"));
     }
     Ok(acc.done)
 }
@@ -1519,7 +1519,7 @@ async fn finish_anthropic_round(
         .await?;
     }
     if acc.calls.is_empty() && acc.text.trim().is_empty() {
-        return Err("model mengembalikan respons kosong".into());
+        return Err("model returned an empty response".into());
     }
     Ok(Round {
         text: acc.text,
@@ -1542,7 +1542,7 @@ async fn finish_round(
     }
     let calls = state.acc.take();
     if calls.is_empty() && state.text.trim().is_empty() {
-        return Err("model mengembalikan respons kosong".into());
+        return Err("model returned an empty response".into());
     }
     Ok(Round {
         text: state.text,
@@ -2108,7 +2108,7 @@ mod tests {
         };
         assert!(message.contains("403"));
         assert!(message.contains("test-model"), "{message}");
-        assert!(message.contains("izin key/model"), "{message}");
+        assert!(message.contains("check key/model permissions"), "{message}");
     }
 
     #[test]
@@ -2120,7 +2120,7 @@ mod tests {
             "denied",
             "m",
         );
-        assert!(message.contains("dashboard 9router"), "{message}");
+        assert!(message.contains("9router dashboard"), "{message}");
     }
 
     #[tokio::test]
@@ -2183,7 +2183,7 @@ mod tests {
         );
         assert!(events.iter().any(|event| matches!(
             event,
-            AgentEvent::TextDelta { text } if text.contains("Batas langkah")
+            AgentEvent::TextDelta { text } if text.contains("step budget")
         )));
         assert_eq!(events.last(), Some(&AgentEvent::TurnFinished));
     }
@@ -2600,13 +2600,13 @@ mod tests {
         let err = list_models(ProviderKind::Anthropic, &url, Some("k"))
             .await
             .unwrap_err();
-        assert!(err.contains("API key ditolak"), "{err}");
+        assert!(err.contains("API key rejected"), "{err}");
 
         let (_, url) = fake_server_raw(vec![FakeReply::status(404, "not found")]);
         let err = list_models(ProviderKind::Openai, &url, Some("k"))
             .await
             .unwrap_err();
-        assert!(err.contains("isi model manual"), "{err}");
+        assert!(err.contains("enter the model manually"), "{err}");
     }
 
     #[tokio::test]

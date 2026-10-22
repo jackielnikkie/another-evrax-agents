@@ -72,20 +72,20 @@ fn wizard_step_number(step: WizardStep) -> usize {
 fn wizard_step_label(step: WizardStep) -> &'static str {
     match step {
         WizardStep::Providers => "provider",
-        WizardStep::Kind => "tipe provider",
-        WizardStep::Name => "nama provider",
+        WizardStep::Kind => "provider type",
+        WizardStep::Name => "provider name",
         WizardStep::BaseUrl => "base url",
         WizardStep::ApiKey => "api key",
-        WizardStep::Checking => "cek koneksi",
-        WizardStep::Models => "pilih model",
-        WizardStep::Review => "ringkasan",
+        WizardStep::Checking => "checking connection",
+        WizardStep::Models => "select model",
+        WizardStep::Review => "review",
     }
 }
 
 fn endpoint_preview(kind: evrax_agent::ProviderKind, base_url: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
     if base.is_empty() {
-        return "(base url belum diisi)".to_string();
+        return "(base url not set)".to_string();
     }
     match kind {
         evrax_agent::ProviderKind::Openai => format!("{base}/chat/completions"),
@@ -134,7 +134,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
             if editing {
                 "\u{2588}".to_string()
             } else {
-                "(kosong)".to_string()
+                "(empty)".to_string()
             }
         } else if editing {
             format!("{value}\u{2588}")
@@ -162,7 +162,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled(format!(" langkah {number}/8 "), muted),
+        Span::styled(format!(" step {number}/8 "), muted),
         Span::styled("\u{b7} ", muted),
         Span::styled(wizard_step_label(step), accent),
     ]));
@@ -182,7 +182,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
     match step {
         WizardStep::Providers => {
             lines.push(Line::from(Span::styled(
-                format!("   {:<18} {:<18} {}", "nama", "tipe", "model"),
+                format!("   {:<18} {:<18} {}", "name", "type", "model"),
                 muted,
             )));
             let total = app.providers.len() + 1;
@@ -202,7 +202,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
                             provider.model
                         )
                     }
-                    None => "   + tambah provider baru".to_string(),
+                    None => "   + add new provider".to_string(),
                 };
                 lines.push(row(label, index == wizard.cursor));
             }
@@ -230,7 +230,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                " openai-compatible pakai /chat/completions, anthropic pakai /messages",
+                " openai-compatible uses /chat/completions · anthropic uses /messages",
                 muted,
             )));
         }
@@ -238,7 +238,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
             lines.extend(field("nama", &wizard.name, wizard.editing));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                " nama bebas untuk provider ini",
+                " free-form name for this provider",
                 muted,
             )));
         }
@@ -266,7 +266,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
             lines.extend(field("api key", &shown, wizard.editing));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                " disimpan lokal di agent.json",
+                " stored locally in agent.json",
                 muted,
             )));
             lines.push(Line::from(Span::styled(
@@ -276,7 +276,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
         }
         WizardStep::Checking => {
             lines.push(Line::from(vec![
-                Span::styled(" menghubungi ", muted),
+                Span::styled(" contacting ", muted),
                 Span::styled(wizard.name.clone(), text),
                 Span::styled(" \u{2026}", muted),
             ]));
@@ -288,7 +288,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
         }
         WizardStep::Models => {
             lines.push(Line::from(vec![
-                Span::styled(" cari  ", muted),
+                Span::styled(" search  ", muted),
                 Span::styled(format!("{}\u{2588}", wizard.filter), text),
             ]));
             lines.push(Line::from(""));
@@ -306,10 +306,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
             }
             if total == 0 {
                 lines.push(Line::from(Span::styled(
-                    format!(
-                        " (tidak ada model; enter memakai \"{}\")",
-                        wizard.filter.trim()
-                    ),
+                    format!(" (no models; enter uses \"{}\")", wizard.filter.trim()),
                     muted,
                 )));
             } else {
@@ -321,7 +318,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
         }
         WizardStep::Review => {
             let key = if wizard.api_key.is_empty() {
-                "(kosong)".to_string()
+                "(empty)".to_string()
             } else {
                 "*".repeat(wizard.api_key.chars().count().min(32))
             };
@@ -334,7 +331,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
                 ("endpoint", endpoint_preview(wizard.kind, &wizard.base_url)),
             ] {
                 let value = if value.trim().is_empty() {
-                    "(kosong)".to_string()
+                    "(empty)".to_string()
                 } else {
                     value
                 };
@@ -344,7 +341,7 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
                 ]));
             }
             lines.push(Line::from(""));
-            let action = " simpan & aktifkan ";
+            let action = " save & activate ";
             let pad = inner_w.saturating_sub(action.width());
             lines.push(Line::from(Span::styled(
                 format!("{action}{}", " ".repeat(pad)),
@@ -361,21 +358,21 @@ fn wizard_modal(frame: &mut Frame, app: &App) {
         lines.extend(status(wizard));
     }
     let hint: &[(&str, &str)] = match step {
-        WizardStep::Providers => &[("enter", "pilih"), ("esc", "tutup")],
+        WizardStep::Providers => &[("enter", "select"), ("esc", "close")],
         WizardStep::Kind => &[
-            ("\u{2191}\u{2193}", "geser"),
-            ("enter", "lanjut"),
-            ("esc", "kembali"),
+            ("\u{2191}\u{2193}", "move"),
+            ("enter", "next"),
+            ("esc", "back"),
         ],
         WizardStep::Models => &[
-            ("enter", "pakai"),
-            ("\u{2191}\u{2193}", "geser"),
-            ("pgup/pgdn", "halaman"),
-            ("esc", "kembali"),
+            ("enter", "use"),
+            ("\u{2191}\u{2193}", "move"),
+            ("pgup/pgdn", "page"),
+            ("esc", "back"),
         ],
         WizardStep::Checking => &[],
-        WizardStep::Review => &[("enter", "simpan"), ("esc", "kembali")],
-        _ => &[("enter", "lanjut"), ("esc", "kembali")],
+        WizardStep::Review => &[("enter", "save"), ("esc", "back")],
+        _ => &[("enter", "next"), ("esc", "back")],
     };
     let mut spans = vec![Span::styled(" ", muted)];
     for (index, (key, desc)) in hint.iter().enumerate() {
@@ -426,11 +423,11 @@ fn model_modal(frame: &mut Frame, app: &App) {
     match dialog.level {
         ModelLevel::Providers => {
             lines.push(Line::from(vec![
-                Span::styled(" pilih provider ", muted),
-                Span::styled("\u{b7} aktif", muted),
+                Span::styled(" select provider ", muted),
+                Span::styled("\u{b7} active", muted),
             ]));
             lines.push(Line::from(Span::styled(
-                format!("   {:<18} {:<18} {}", "nama", "tipe", "model"),
+                format!("   {:<18} {:<18} {}", "name", "type", "model"),
                 muted,
             )));
             let total = app.providers.len();
@@ -467,7 +464,7 @@ fn model_modal(frame: &mut Frame, app: &App) {
                 .unwrap_or_default();
             lines.push(Line::from(Span::styled(format!(" {provider}"), accent)));
             lines.push(Line::from(vec![
-                Span::styled(" cari  ", muted),
+                Span::styled(" search  ", muted),
                 Span::styled(format!("{}\u{2588}", dialog.filter), text),
             ]));
             let total = dialog.filtered.len();
@@ -484,7 +481,7 @@ fn model_modal(frame: &mut Frame, app: &App) {
             }
             if total == 0 {
                 lines.push(Line::from(Span::styled(
-                    format!(" (kosong; enter memakai \"{}\")", dialog.filter.trim()),
+                    format!(" (empty; enter uses \"{}\")", dialog.filter.trim()),
                     muted,
                 )));
             } else {
@@ -501,15 +498,11 @@ fn model_modal(frame: &mut Frame, app: &App) {
     }
     let hint: &[(&str, &str)] = match dialog.level {
         ModelLevel::Providers => &[
-            ("enter", "lihat model"),
-            ("pgup/pgdn", "halaman"),
-            ("esc", "tutup"),
+            ("enter", "view models"),
+            ("pgup/pgdn", "page"),
+            ("esc", "close"),
         ],
-        ModelLevel::Models => &[
-            ("enter", "pakai"),
-            ("pgup/pgdn", "halaman"),
-            ("esc", "kembali"),
-        ],
+        ModelLevel::Models => &[("enter", "use"), ("pgup/pgdn", "page"), ("esc", "back")],
     };
     let mut spans = vec![Span::styled(" ", muted)];
     for (index, (key, desc)) in hint.iter().enumerate() {
@@ -527,7 +520,7 @@ fn model_modal(frame: &mut Frame, app: &App) {
     let height = (lines.len() as u16 + 2).min(frame.area().height);
     let title = match dialog.level {
         ModelLevel::Providers => " model \u{b7} provider ".to_string(),
-        ModelLevel::Models => " model \u{b7} pilih model ".to_string(),
+        ModelLevel::Models => " model \u{b7} select model ".to_string(),
     };
     let Some(inner) = modal(frame, &title, width, height) else {
         return;
@@ -1507,7 +1500,7 @@ fn sidebar(frame: &mut Frame, area: Rect, app: &App) {
 fn footer(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = if app.busy {
         let status = match app.iteration {
-            Some((n, max)) => format!("working · iterasi {n}/{max}"),
+            Some((n, max)) => format!("working · iteration {n}/{max}"),
             None => "working".to_string(),
         };
         vec![
@@ -2719,7 +2712,7 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.contains("iterasi 3/500"),
+            text.contains("iteration 3/500"),
             "iteration status missing:\n{text}"
         );
     }
@@ -3125,8 +3118,8 @@ mod tests {
         for needle in [
             "9router",
             "openai-compatible",
-            "tambah provider baru",
-            "langkah 1/8",
+            "add new provider",
+            "step 1/8",
         ] {
             assert!(text.contains(needle), "missing {needle}:\n{text}");
         }
@@ -3139,8 +3132,8 @@ mod tests {
             wizard.step = WizardStep::Name;
         }
         let text = render_text_with(&mut app, 100, 30);
-        assert!(text.contains("langkah 3/8"), "{text}");
-        assert!(text.contains("nama bebas"), "{text}");
+        assert!(text.contains("step 3/8"), "{text}");
+        assert!(text.contains("free-form name"), "{text}");
         if let Some(wizard) = app.wizard.as_mut() {
             wizard.step = WizardStep::Review;
             wizard.name = "Nimbus Go".into();
@@ -3148,7 +3141,7 @@ mod tests {
             wizard.model = "bebas".into();
         }
         let text = render_text_with(&mut app, 100, 30);
-        assert!(text.contains("simpan & aktifkan"), "{text}");
+        assert!(text.contains("save & activate"), "{text}");
         assert!(text.contains("/chat/completions"), "{text}");
         if let Some(wizard) = app.wizard.as_mut() {
             wizard.step = WizardStep::Models;
@@ -3158,7 +3151,7 @@ mod tests {
         }
         let text = render_text_with(&mut app, 100, 30);
         assert!(text.contains("gpt-5-mini"), "{text}");
-        assert!(text.contains("cari"), "{text}");
+        assert!(text.contains("search"), "{text}");
         assert!(text.contains("pgup/pgdn"), "{text}");
     }
 

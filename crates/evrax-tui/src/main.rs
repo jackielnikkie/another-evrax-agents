@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
                 .list()?
                 .first()
                 .map(|m| m.id.clone())
-                .ok_or_else(|| anyhow::anyhow!("belum ada sesi tersimpan"))?,
+                .ok_or_else(|| anyhow::anyhow!("no saved sessions yet"))?,
         };
         Some(id)
     } else {
@@ -137,7 +137,7 @@ fn print_sessions(store: &ProjectStore) -> Result<()> {
     println!("project: {}", store.root().display());
     let metas = store.list()?;
     if metas.is_empty() {
-        println!("(belum ada sesi)");
+        println!("(no sessions yet)");
         return Ok(());
     }
     for meta in metas {
@@ -175,9 +175,9 @@ fn resolve_session(store: &ProjectStore, spec: &str) -> Result<String> {
         return Ok(by_title[0].id.clone());
     }
     if by_title.len() > 1 {
-        bail!("judul '{spec}' ambigu ({} sesi)", by_title.len());
+        bail!("title '{spec}' is ambiguous ({} sessions)", by_title.len());
     }
-    bail!("session '{spec}' tidak ditemukan; coba evrax --list")
+    bail!("session '{spec}' not found; try evrax --list")
 }
 
 fn fmt_ms(ms: u64) -> String {
@@ -299,7 +299,7 @@ fn chat_backend(
         Err(e) => (
             Box::new(MockBackend::new()),
             "mock".to_string(),
-            Some(format!("backend gagal ({e}) · pakai mock")),
+            Some(format!("backend failed ({e}) · using mock")),
         ),
     }
 }
@@ -366,7 +366,7 @@ async fn run(
         }
         if let Some(cfg) = app.take_reload_config() {
             if loaded.mock {
-                app.set_flash("config tersimpan · mock tetap aktif".to_string());
+                app.set_flash("config saved · mock still active".to_string());
             } else {
                 let (next, label, note) = chat_backend(cfg, store.clone(), false);
                 backend = next;
@@ -833,7 +833,7 @@ fn handle_wizard_key(app: &mut App, key: KeyEvent, fetch_tx: &mpsc::Sender<Fetch
         KeyCode::Esc => {
             if app.wizard_escape() {
                 app.wizard_close();
-                app.set_flash("setup dilewati".to_string());
+                app.set_flash("setup skipped".to_string());
             }
         }
         KeyCode::Up => app.wizard_move(-1),
@@ -858,9 +858,9 @@ fn handle_wizard_key(app: &mut App, key: KeyEvent, fetch_tx: &mpsc::Sender<Fetch
                 Ok(path) => {
                     app.apply_settings(settings);
                     app.wizard_close();
-                    app.set_flash(format!("config tersimpan · {}", path.display()));
+                    app.set_flash(format!("config saved · {}", path.display()));
                 }
-                Err(e) => app.wizard_status(format!("save gagal: {e}"), false),
+                Err(e) => app.wizard_status(format!("save failed: {e}"), false),
             },
             WizardAction::None => {}
         },
@@ -896,9 +896,9 @@ fn handle_model_key(app: &mut App, key: KeyEvent, fetch_tx: &mpsc::Sender<FetchR
                 Ok(path) => {
                     app.apply_settings(settings);
                     app.model_close();
-                    app.set_flash(format!("model disimpan · {}", path.display()));
+                    app.set_flash(format!("model saved · {}", path.display()));
                 }
-                Err(e) => app.set_flash(format!("simpan gagal: {e}")),
+                Err(e) => app.set_flash(format!("save failed: {e}")),
             },
             ModelAction::None => {}
         },
@@ -954,7 +954,7 @@ fn handle_event(
                                 copy_to_clipboard(url);
                                 app.set_flash("tunnel url copied".to_string());
                             }
-                            None => app.set_flash("tunnel: belum ada url".to_string()),
+                            None => app.set_flash("tunnel: no url yet".to_string()),
                         }
                         return;
                     }
@@ -1388,6 +1388,55 @@ mod cli_tests {
             &tx,
         );
         assert_eq!(app.wizard.as_ref().unwrap().name, "o");
+    }
+
+    #[test]
+    fn wizard_and_model_handlers_page_with_page_keys() {
+        let mut app = App::new();
+        for index in 0..20 {
+            app.providers.push(evrax_agent::Provider::new(
+                format!("p{index}"),
+                "http://a/v1",
+            ));
+        }
+        app.open_wizard();
+        let (tx, _rx) = mpsc::channel(4);
+        handle_wizard_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(app.wizard.as_ref().unwrap().cursor, crate::app::DIALOG_PAGE);
+        handle_wizard_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(app.wizard.as_ref().unwrap().cursor, 0);
+        app.wizard.as_mut().unwrap().step = crate::app::WizardStep::Kind;
+        handle_wizard_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            app.wizard.as_ref().unwrap().kind,
+            evrax_agent::ProviderKind::Anthropic
+        );
+
+        app.open_model_dialog();
+        app.model_dialog.as_mut().unwrap().level = crate::app::ModelLevel::Models;
+        app.model_dialog.as_mut().unwrap().models = (0..30).map(|i| format!("m{i}")).collect();
+        app.model_dialog.as_mut().unwrap().refilter();
+        handle_model_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &tx,
+        );
+        assert_eq!(
+            app.model_dialog.as_ref().unwrap().model_cursor,
+            crate::app::DIALOG_PAGE
+        );
     }
 
     #[test]

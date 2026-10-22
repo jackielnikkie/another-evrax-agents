@@ -191,7 +191,7 @@ fn run_quick(inner: Arc<Mutex<Inner>>, port: u16, generation: u64) {
                 &inner,
                 generation,
                 TunnelStatus::Error {
-                    message: format!("gagal menjalankan cloudflared: {err}"),
+                    message: format!("failed to start cloudflared: {err}"),
                 },
             );
             return;
@@ -235,7 +235,7 @@ fn run_quick(inner: Arc<Mutex<Inner>>, port: u16, generation: u64) {
                     let _ = child.kill();
                 }
                 g.status = TunnelStatus::Error {
-                    message: "timeout menunggu URL dari cloudflared".into(),
+                    message: "timed out waiting for a cloudflared URL".into(),
                 };
             }
         });
@@ -246,7 +246,7 @@ fn run_quick(inner: Arc<Mutex<Inner>>, port: u16, generation: u64) {
             &inner,
             generation,
             TunnelStatus::Error {
-                message: "cloudflared tidak memberi output".into(),
+                message: "cloudflared produced no output".into(),
             },
         );
         return;
@@ -282,11 +282,11 @@ fn run_quick(inner: Arc<Mutex<Inner>>, port: u16, generation: u64) {
         let _ = child.wait();
     }
     let message = if was_running {
-        "cloudflared berhenti".to_string()
+        "cloudflared stopped".to_string()
     } else {
         let trimmed = last_line.trim();
         if trimmed.is_empty() {
-            "cloudflared keluar tanpa URL".to_string()
+            "cloudflared exited without a URL".to_string()
         } else {
             trimmed.chars().take(80).collect()
         }
@@ -346,7 +346,7 @@ fn run_domain(inner: Arc<Mutex<Inner>>, port: u16, hostname: String, generation:
                 &inner,
                 generation,
                 TunnelStatus::Error {
-                    message: format!("gagal menjalankan cloudflared: {err}"),
+                    message: format!("failed to start cloudflared: {err}"),
                 },
             );
             return;
@@ -397,7 +397,7 @@ fn run_domain(inner: Arc<Mutex<Inner>>, port: u16, hostname: String, generation:
             &inner,
             generation,
             TunnelStatus::Error {
-                message: "cloudflared tidak memberi output".into(),
+                message: "cloudflared produced no output".into(),
             },
         );
         return;
@@ -429,11 +429,11 @@ fn run_domain(inner: Arc<Mutex<Inner>>, port: u16, hostname: String, generation:
         let _ = child.wait();
     }
     let message = if was_running {
-        "cloudflared berhenti".to_string()
+        "cloudflared stopped".to_string()
     } else {
         let trimmed = last_line.trim();
         if trimmed.is_empty() {
-            "cloudflared keluar tanpa URL".to_string()
+            "cloudflared exited without a URL".to_string()
         } else {
             trimmed.chars().take(80).collect()
         }
@@ -463,7 +463,7 @@ fn ensure_login(
     hide_console(&mut cmd);
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("gagal menjalankan cloudflared login: {e}"))?;
+        .map_err(|e| format!("failed to run cloudflared login: {e}"))?;
     let stderr = child.stderr.take();
     {
         let Ok(mut g) = inner.lock() else {
@@ -482,7 +482,7 @@ fn ensure_login(
     set_status(inner, generation, TunnelStatus::Starting);
 
     let Some(stderr) = stderr else {
-        return Err("cloudflared login tidak memberi output".into());
+        return Err("cloudflared login produced no output".into());
     };
 
     // Login waits for the user's browser; allow up to 8 minutes.
@@ -517,7 +517,7 @@ fn ensure_login(
                     let _ = child.kill();
                 }
                 g.status = TunnelStatus::Error {
-                    message: "timeout login cloudflare (browser belum selesai)".into(),
+                    message: "cloudflare login timed out (browser flow not finished)".into(),
                 };
             }
         });
@@ -552,7 +552,7 @@ fn ensure_login(
         set_status(inner, generation, TunnelStatus::Starting);
         Ok(())
     } else {
-        Err("login cloudflare belum selesai — coba lagi".into())
+        Err("cloudflare login not finished yet - try again".into())
     }
 }
 
@@ -563,7 +563,7 @@ fn provision_tunnel(bin: &std::path::Path, hostname: &str) -> Result<(), String>
         let text = output_text(&out);
         if !text.contains("already exists") {
             return Err(format!(
-                "cloudflared tunnel create gagal: {}",
+                "cloudflared tunnel create failed: {}",
                 summarize(&text)
             ));
         }
@@ -572,7 +572,7 @@ fn provision_tunnel(bin: &std::path::Path, hostname: &str) -> Result<(), String>
     if !out.status.success() {
         let text = output_text(&out);
         if !(text.contains("already exists") || text.contains("already configured")) {
-            return Err(format!("route dns gagal: {}", summarize(&text)));
+            return Err(format!("dns route failed: {}", summarize(&text)));
         }
     }
     Ok(())
@@ -583,7 +583,7 @@ fn run_capture(bin: &std::path::Path, args: &[&str]) -> Result<std::process::Out
     cmd.args(args);
     hide_console(&mut cmd);
     cmd.output()
-        .map_err(|e| format!("gagal menjalankan cloudflared: {e}"))
+        .map_err(|e| format!("failed to start cloudflared: {e}"))
 }
 
 fn output_text(out: &std::process::Output) -> String {
@@ -649,11 +649,11 @@ fn ensure_cloudflared(inner: &Arc<Mutex<Inner>>, generation: u64) -> Result<Path
     if let Some(bin) = resolve_cloudflared() {
         return Ok(bin);
     }
-    let dest = managed_bin_path().ok_or_else(|| "APPDATA tidak ditemukan".to_string())?;
+    let dest = managed_bin_path().ok_or_else(|| "APPDATA not found".to_string())?;
     set_status(inner, generation, TunnelStatus::Downloading);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("gagal membuat {}: {e}", parent.display()))?;
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     }
     let dest_str = dest.to_string_lossy().to_string();
 
@@ -691,7 +691,7 @@ fn ensure_cloudflared(inner: &Arc<Mutex<Inner>>, generation: u64) -> Result<Path
     if downloaded && size > 1_000_000 {
         Ok(dest)
     } else {
-        Err("unduh cloudflared gagal".into())
+        Err("cloudflared download failed".into())
     }
 }
 
