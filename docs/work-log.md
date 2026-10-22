@@ -92,3 +92,7 @@ Verbatim dari blok Completed AGENTS.md (2026-10-20). AGENTS.md cuma nyimpen ring
 - CI: workflow `release` sukses → asset `evrax-v0.1.3-x86_64-pc-windows-msvc.zip` (6,339,123 B) + `SHA256SUMS`.
 - Verifikasi installer: `install.ps1 -InstallDir <tmp> -NoPath` → unduh rilis terbaru → SHA-256 OK → `evrax 0.1.3`; direktori cek dihapus lagi.
 - Isi rilis: multi-provider + Anthropic native + wizard fetch model + `/model` picker + UI English-only + wizard paging.
+## Handoff v0.1.3 (2026-10-22)
+- Rilis `v0.1.3` live + installer terverifikasi (unduh → SHA-256 OK → `evrax 0.1.3`); tag `8b367f6`, docs commit `87ecf2d`.
+- Ringkasan state untuk pindah session ditulis di `docs/handoff-2026-10-22.md` (status, arsitektur, config, jebakan, sisa kerja). `AGENTS.md` menunjuk ke file itu.
+- Sisa: smoke manual v0.1.3 → Fase 3 clean-install Sandbox → Fase 4 batch skills (`v0.1.4`).
