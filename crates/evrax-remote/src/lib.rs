@@ -4,7 +4,7 @@
 //! single-file Vue 3 web UI. Full realtime streaming is wired in a later stage.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -105,11 +105,17 @@ pub enum RemoteEvent {
         name: String,
         status: String,
         detail: Option<String>,
+        /// Monotonic per-session call id so repeated same-name tools stay
+        /// distinct rows in the web UI.
+        call: u64,
     },
     Approval {
         turn: String,
         name: String,
         summary: String,
+        /// Approval nonce echoed back in `POST /approval`; the TUI applies a
+        /// decision only when it matches the currently open approval.
+        id: u64,
     },
     ApprovalResolved {
         turn: String,
@@ -159,17 +165,19 @@ impl RemoteEvent {
                 name,
                 status,
                 detail,
+                call,
             } => (
                 "tool",
-                serde_json::json!({"type":"tool","turn":turn,"name":name,"status":status,"detail":detail}),
+                serde_json::json!({"type":"tool","turn":turn,"name":name,"status":status,"detail":detail,"call":call}),
             ),
             RemoteEvent::Approval {
                 turn,
                 name,
                 summary,
+                id,
             } => (
                 "approval",
-                serde_json::json!({"type":"approval","turn":turn,"name":name,"summary":summary}),
+                serde_json::json!({"type":"approval","turn":turn,"name":name,"summary":summary,"id":id}),
             ),
             RemoteEvent::ApprovalResolved { turn, decision } => (
                 "approval_resolved",
@@ -191,13 +199,30 @@ impl RemoteEvent {
     }
 }
 
+/// Replay-history caps: a new subscriber receives everything since the session
+/// was registered, bounded so a long-lived session cannot grow the buffer
+/// without limit.
+const HISTORY_MAX_BYTES: usize = 512 * 1024;
+const HISTORY_MAX_EVENTS: usize = 2000;
+
+/// Live SSE subscribers plus the replayable frame history, guarded by ONE lock
+/// so a new subscriber's history snapshot can never race a concurrent
+/// broadcast. Senders carry pre-serialized SSE frames: every event is
+/// serialized exactly once, both for replay and for live delivery.
+struct Core {
+    subs: Vec<Sender<String>>,
+    history: VecDeque<String>,
+    history_bytes: usize,
+}
+
 /// Internal registry entry: the public session plus its live SSE subscribers.
 struct Registered {
     session: Session,
-    subs: Arc<Mutex<Vec<Sender<RemoteEvent>>>>,
+    core: Arc<Mutex<Core>>,
     pending_prompts: Arc<Mutex<VecDeque<String>>>,
-    /// Accept/reject decisions sent from the web while an approval is open.
-    pending_approvals: Arc<Mutex<VecDeque<String>>>,
+    /// Accept/reject decisions sent from the web while an approval is open,
+    /// paired with the approval nonce (`id`) they target.
+    pending_approvals: Arc<Mutex<VecDeque<(String, u64)>>>,
     /// Mode switches requested from the web, awaiting the owning TUI.
     pending_modes: Arc<Mutex<VecDeque<String>>>,
 }
@@ -253,6 +278,9 @@ struct PromptBody {
 struct ApprovalBody {
     #[serde(default)]
     decision: String,
+    /// Approval nonce from the `approval` SSE event; 0 means "unspecified".
+    #[serde(default)]
+    id: u64,
 }
 
 #[derive(Deserialize)]
@@ -281,7 +309,8 @@ struct State {
     public_url: Arc<Mutex<String>>,
     registry: Arc<Mutex<HashMap<String, Registered>>>,
     refcount: Arc<AtomicUsize>,
-    token: Arc<Mutex<Option<(String, Instant)>>>,
+    /// Valid login tokens, oldest first, one per device.
+    token: Arc<Mutex<Vec<(String, Instant)>>>,
     login_attempts: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
     alive: Arc<AtomicBool>,
 }
@@ -320,7 +349,7 @@ pub fn start(config: RemoteConfig) -> RemoteServer {
         public_url: Arc::new(Mutex::new(config.public_url.clone())),
         registry: Arc::new(Mutex::new(HashMap::new())),
         refcount: Arc::new(AtomicUsize::new(0)),
-        token: Arc::new(Mutex::new(None)),
+        token: Arc::new(Mutex::new(Vec::new())),
         login_attempts: Arc::new(Mutex::new(HashMap::new())),
         alive: Arc::new(AtomicBool::new(false)),
     };
@@ -381,9 +410,16 @@ fn run_server(state: State, server: tiny_http::Server, rx: std::sync::mpsc::Rece
     }
 }
 
+/// Read a request body, capped at 256 KiB so a hostile client cannot make the
+/// server allocate unbounded memory. A truncated body fails JSON parsing, which
+/// the callers already answer with 400/401.
 fn read_body(req: &mut tiny_http::Request) -> String {
+    const MAX_BODY_BYTES: u64 = 256 * 1024;
     let mut buf = String::new();
-    let _ = req.as_reader().read_to_string(&mut buf);
+    let _ = req
+        .as_reader()
+        .take(MAX_BODY_BYTES)
+        .read_to_string(&mut buf);
     buf
 }
 
@@ -402,10 +438,30 @@ fn respond_json<T: Serialize>(
     )
 }
 
-/// Push an event to every live subscriber of a session, dropping dead senders.
-fn broadcast(subs: &Arc<Mutex<Vec<Sender<RemoteEvent>>>>, event: RemoteEvent) {
-    if let Ok(mut list) = subs.lock() {
-        list.retain(|tx| tx.send(event.clone()).is_ok());
+/// Record a serialized frame in the session's replay history (respecting both
+/// caps) and push it to every live subscriber, dropping dead senders. Holding
+/// the core lock across append + fan-out is what makes replay race-free: a
+/// subscriber either sees a frame in its history snapshot or on the channel,
+/// never both and never neither.
+fn broadcast(core: &Arc<Mutex<Core>>, frame: String) {
+    if let Ok(mut c) = core.lock() {
+        c.history_bytes += frame.len();
+        c.history.push_back(frame.clone());
+        while c.history_bytes > HISTORY_MAX_BYTES || c.history.len() > HISTORY_MAX_EVENTS {
+            match c.history.pop_front() {
+                Some(old) => c.history_bytes -= old.len(),
+                None => break,
+            }
+        }
+        c.subs.retain(|tx| tx.send(frame.clone()).is_ok());
+    }
+}
+
+/// Push a frame to every live subscriber without recording it in the replay
+/// history (`done` must reach open tabs but never replay to a fresh client).
+fn broadcast_transient(core: &Arc<Mutex<Core>>, frame: String) {
+    if let Ok(mut c) = core.lock() {
+        c.subs.retain(|tx| tx.send(frame.clone()).is_ok());
     }
 }
 
@@ -421,12 +477,18 @@ fn broadcast(subs: &Arc<Mutex<Vec<Sender<RemoteEvent>>>>, event: RemoteEvent) {
 fn spawn_stream(
     req: tiny_http::Request,
     id: String,
-    subs: Arc<Mutex<Vec<Sender<RemoteEvent>>>>,
+    core: Arc<Mutex<Core>>,
 ) -> std::io::Result<()> {
-    let (tx, rx) = channel::<RemoteEvent>();
-    if let Ok(mut list) = subs.lock() {
-        list.push(tx);
-    }
+    let (tx, rx) = channel::<String>();
+    // Register the subscriber AND snapshot the history under the same lock so a
+    // concurrent broadcast cannot slip through the gap between the two.
+    let history: Vec<String> = match core.lock() {
+        Ok(mut c) => {
+            c.subs.push(tx);
+            c.history.iter().cloned().collect()
+        }
+        Err(_) => return Ok(()),
+    };
 
     let mut stream = req.into_writer();
 
@@ -444,6 +506,13 @@ fn spawn_stream(
     if stream.write_all(connected.as_bytes()).is_err() {
         return Ok(());
     }
+    // Replay the session's past events before any live frame. Everything is
+    // buffered then flushed once so replay arrives as one write.
+    for frame in &history {
+        if stream.write_all(frame.as_bytes()).is_err() {
+            return Ok(());
+        }
+    }
     if stream.flush().is_err() {
         return Ok(());
     }
@@ -451,8 +520,8 @@ fn spawn_stream(
     // 15s keep-alive comment: also detects a dead client and keeps proxies open.
     loop {
         match rx.recv_timeout(Duration::from_secs(15)) {
-            Ok(ev) => {
-                if stream.write_all(ev.to_sse().as_bytes()).is_err() {
+            Ok(frame) => {
+                if stream.write_all(frame.as_bytes()).is_err() {
                     break;
                 }
             }
@@ -468,6 +537,24 @@ fn spawn_stream(
         }
     }
     Ok(())
+}
+
+/// Caps on the per-session queues the web can fill while the owning TUI drains
+/// them. Prompt/approval queues refuse new work at the cap (429); the mode
+/// queue coalesces instead, because a burst of switches only needs the newest.
+const MAX_PENDING_PROMPTS: usize = 16;
+const MAX_PENDING_APPROVALS: usize = 16;
+const MAX_PENDING_MODES: usize = 8;
+
+/// Push onto a bounded queue, enforcing `cap`. Returns the queue length after
+/// the push, or `None` when the queue is already full (or its lock is poisoned).
+fn push_bounded<T>(queue: &Mutex<VecDeque<T>>, cap: usize, item: T) -> Option<usize> {
+    let mut queue = queue.lock().ok()?;
+    if queue.len() >= cap {
+        return None;
+    }
+    queue.push_back(item);
+    Some(queue.len())
 }
 
 fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
@@ -506,17 +593,26 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                 &b"text/html; charset=utf-8"[..],
             )
             .expect("static header");
-            req.respond(tiny_http::Response::from_string(WEBUI).with_header(header))
+            // Never serve a stale UI from cache after an upgrade.
+            let no_store = tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..])
+                .expect("static header");
+            req.respond(
+                tiny_http::Response::from_string(WEBUI)
+                    .with_header(header)
+                    .with_header(no_store),
+            )
         }
 
         (Method::Get, "/health") => health_ok(state, req),
 
         (Method::Get, "/api/sessions") => {
-            let sessions: Vec<Session> = state
+            let mut sessions: Vec<Session> = state
                 .registry
                 .lock()
                 .map(|r| r.values().map(|reg| reg.session.clone()).collect())
                 .unwrap_or_default();
+            // The registry is a HashMap, so sort for a stable list across polls.
+            sessions.sort_by_cached_key(|s| (s.name.to_lowercase(), s.id.clone()));
             respond_json(req, 200, &sessions)
         }
 
@@ -536,8 +632,14 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                 {
                     note_login_success(state, remote_ip);
                     let token = generate_token();
-                    if let Ok(mut t) = state.token.lock() {
-                        *t = Some((token.clone(), Instant::now()));
+                    if let Ok(mut tokens) = state.token.lock() {
+                        // Multi-device: prune expired, then evict the oldest
+                        // token beyond the cap so the new one always fits.
+                        tokens.retain(|(_, at)| at.elapsed() < TOKEN_TTL);
+                        while tokens.len() >= MAX_TOKENS {
+                            tokens.remove(0);
+                        }
+                        tokens.push((token.clone(), Instant::now()));
                     }
                     respond_json(req, 200, &serde_json::json!({ "token": token }))
                 }
@@ -549,8 +651,11 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
         }
 
         (Method::Post, "/logout") => {
-            if let Ok(mut t) = state.token.lock() {
-                *t = None;
+            // Drop only the presented token, leaving other devices logged in.
+            if let Some(tok) = request_token(&req)
+                && let Ok(mut tokens) = state.token.lock()
+            {
+                tokens.retain(|(t, _)| !ct_eq(t, &tok));
             }
             respond_json(req, 200, &serde_json::json!({"ok": true}))
         }
@@ -580,7 +685,11 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                         } else {
                             let registered = Registered {
                                 session,
-                                subs: Arc::new(Mutex::new(Vec::new())),
+                                core: Arc::new(Mutex::new(Core {
+                                    subs: Vec::new(),
+                                    history: VecDeque::new(),
+                                    history_bytes: 0,
+                                })),
                                 pending_prompts: Arc::new(Mutex::new(VecDeque::new())),
                                 pending_approvals: Arc::new(Mutex::new(VecDeque::new())),
                                 pending_modes: Arc::new(Mutex::new(VecDeque::new())),
@@ -619,19 +728,19 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                 .trim_start_matches("/api/session/")
                 .trim_end_matches("/stream")
                 .to_string();
-            let subs = state
+            let core = state
                 .registry
                 .lock()
                 .ok()
-                .and_then(|r| r.get(&id).map(|reg| reg.subs.clone()));
-            let Some(subs) = subs else {
+                .and_then(|r| r.get(&id).map(|reg| reg.core.clone()));
+            let Some(core) = core else {
                 return respond_json(req, 404, &serde_json::json!({"error": "unknown session"}));
             };
             // Serve on a dedicated thread so the request loop keeps polling.
             thread::Builder::new()
                 .name(format!("evrax-sse-{id}"))
                 .spawn(move || {
-                    if let Err(e) = spawn_stream(req, id, subs) {
+                    if let Err(e) = spawn_stream(req, id, core) {
                         eprintln!("evrax-remote: stream error: {e}");
                     }
                 })
@@ -664,26 +773,41 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                     // Queue the prompt for the owning TUI and echo it as a
                     // `user` event so every open tab renders the same bubble.
                     let turn = format!("remote_{}", REMOTE_TURN_SEQ.fetch_add(1, Ordering::SeqCst));
-                    let subs = state.registry.lock().ok().and_then(|r| {
-                        r.get(&id).map(|reg| {
-                            if let Ok(mut q) = reg.pending_prompts.lock() {
-                                q.push_back(p.prompt.clone());
-                            }
-                            reg.subs.clone()
-                        })
+                    let entry = state.registry.lock().ok().and_then(|r| {
+                        r.get(&id)
+                            .map(|reg| (reg.pending_prompts.clone(), reg.core.clone()))
                     });
-                    if let Some(subs) = subs {
-                        // Only echo the user bubble; the TUI emits its own
-                        // TurnStart/Delta/... stream when it runs the prompt.
-                        broadcast(
-                            &subs,
-                            RemoteEvent::User {
-                                turn: turn.clone(),
-                                text: p.prompt,
-                            },
+                    let Some((queue, core)) = entry else {
+                        return respond_json(
+                            req,
+                            404,
+                            &serde_json::json!({"error": "unknown session"}),
                         );
-                    }
-                    respond_json(req, 200, &serde_json::json!({"ok": true, "turn": turn}))
+                    };
+                    // A full queue refuses the prompt and echoes nothing.
+                    let Some(queued) = push_bounded(&queue, MAX_PENDING_PROMPTS, p.prompt.clone())
+                    else {
+                        return respond_json(
+                            req,
+                            429,
+                            &serde_json::json!({"error": "queue full (16 prompts pending)"}),
+                        );
+                    };
+                    // Only echo the user bubble; the TUI emits its own
+                    // TurnStart/Delta/... stream when it runs the prompt.
+                    broadcast(
+                        &core,
+                        RemoteEvent::User {
+                            turn: turn.clone(),
+                            text: p.prompt,
+                        }
+                        .to_sse(),
+                    );
+                    respond_json(
+                        req,
+                        200,
+                        &serde_json::json!({"ok": true, "turn": turn, "queued": queued}),
+                    )
                 }
                 (Some(Permit::Write), _) => {
                     respond_json(req, 400, &serde_json::json!({"error": "empty prompt"}))
@@ -712,10 +836,17 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                 {
                     // The owning TUI drains this on its next tick and settles
                     // the open approval dialog; it then broadcasts
-                    // `approval_resolved` so every tab updates.
-                    if let Ok(mut q) = q.lock() {
-                        q.push_back(p.decision);
-                    }
+                    // `approval_resolved` so every tab updates. A full queue
+                    // means a tab flooded decisions: reject rather than let a
+                    // stale decision settle a later approval.
+                    let Some(_) = push_bounded(&q, MAX_PENDING_APPROVALS, (p.decision, p.id))
+                    else {
+                        return respond_json(
+                            req,
+                            429,
+                            &serde_json::json!({"error": "too many pending approvals"}),
+                        );
+                    };
                     respond_json(req, 200, &serde_json::json!({"ok": true}))
                 }
                 (Some(_), _) => {
@@ -747,8 +878,12 @@ fn handle(state: &State, mut req: tiny_http::Request) -> std::io::Result<()> {
                 (Some((_, q)), Some(m)) if m.mode == "plan" || m.mode == "build" => {
                     // Only queue the request; the owning TUI applies it and
                     // confirms via `set_session_mode`, which broadcasts the
-                    // final state to every tab.
+                    // final state to every tab. Mode clicks are idempotent
+                    // toggles: when the queue is full keep only the newest.
                     if let Ok(mut q) = q.lock() {
+                        while q.len() >= MAX_PENDING_MODES {
+                            q.pop_front();
+                        }
                         q.push_back(m.mode);
                     }
                     respond_json(req, 202, &serde_json::json!({"ok": true}))
@@ -773,6 +908,10 @@ fn health_ok(state: &State, req: tiny_http::Request) -> std::io::Result<()> {
 
 /// Bearer/session token TTL. After this the client must log in again.
 const TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Max simultaneously valid tokens (one per device); the oldest is dropped
+/// when a login exceeds the cap.
+const MAX_TOKENS: usize = 8;
 
 /// Max failed logins within `LOGIN_WINDOW` before a temporary lockout.
 const LOGIN_MAX: u32 = 5;
@@ -840,13 +979,12 @@ fn auth_token_valid(state: &State, req: &tiny_http::Request) -> bool {
     let Some(tok) = request_token(req) else {
         return false;
     };
-    match state.token.lock() {
-        Ok(guard) => match guard.as_ref() {
-            Some((t, at)) => ct_eq(t, &tok) && at.elapsed() < TOKEN_TTL,
-            None => false,
-        },
-        Err(_) => false,
-    }
+    let Ok(mut tokens) = state.token.lock() else {
+        return false;
+    };
+    // Expire lazily on every check, then accept any live device token.
+    tokens.retain(|(_, at)| at.elapsed() < TOKEN_TTL);
+    tokens.iter().any(|(t, _)| ct_eq(t, &tok))
 }
 
 fn login_key(ip: Option<IpAddr>) -> IpAddr {
@@ -899,7 +1037,11 @@ pub fn register(server: &RemoteServer, id: String, name: String, permit: Permit)
             id,
             Registered {
                 session,
-                subs: Arc::new(Mutex::new(Vec::new())),
+                core: Arc::new(Mutex::new(Core {
+                    subs: Vec::new(),
+                    history: VecDeque::new(),
+                    history_bytes: 0,
+                })),
                 pending_prompts: Arc::new(Mutex::new(VecDeque::new())),
                 pending_approvals: Arc::new(Mutex::new(VecDeque::new())),
                 pending_modes: Arc::new(Mutex::new(VecDeque::new())),
@@ -932,17 +1074,22 @@ pub fn rename_session(server: &RemoteServer, id: &str, name: String) {
     }
 }
 
-/// Push a realtime event to every web subscriber of one session. No-op when the
-/// session is not registered (remote disabled or closed).
+/// Push a realtime event to every web subscriber of one session and record it
+/// for history replay. No-op when the session is not registered (remote
+/// disabled or closed).
 pub fn emit(server: &RemoteServer, id: &str, event: RemoteEvent) {
-    let subs = server
+    let core = server
         .state
         .registry
         .lock()
         .ok()
-        .and_then(|r| r.get(id).map(|reg| reg.subs.clone()));
-    if let Some(subs) = subs {
-        broadcast(&subs, event);
+        .and_then(|r| r.get(id).map(|reg| reg.core.clone()));
+    if let Some(core) = core {
+        let frame = event.to_sse();
+        match event {
+            RemoteEvent::Done => broadcast_transient(&core, frame),
+            _ => broadcast(&core, frame),
+        }
     }
 }
 
@@ -958,8 +1105,9 @@ pub fn take_pending_prompt(server: &RemoteServer, id: &str) -> Option<String> {
         .flatten()
 }
 
-/// Pop the next web accept/reject decision for one session, if any.
-pub fn take_pending_approval(server: &RemoteServer, id: &str) -> Option<String> {
+/// Pop the next web accept/reject decision for one session, if any, paired with
+/// the approval nonce it targets (`0` when the client did not send one).
+pub fn take_pending_approval(server: &RemoteServer, id: &str) -> Option<(String, u64)> {
     server
         .state
         .registry
@@ -970,14 +1118,29 @@ pub fn take_pending_approval(server: &RemoteServer, id: &str) -> Option<String> 
         .flatten()
 }
 
+/// Drop every queued web decision for a session (called when its approval
+/// dialog closes so stale decisions can never settle a later approval).
+pub fn clear_pending_approvals(server: &RemoteServer, id: &str) {
+    if let Some(q) = server
+        .state
+        .registry
+        .lock()
+        .ok()
+        .and_then(|r| r.get(id).map(|reg| reg.pending_approvals.clone()))
+        && let Ok(mut q) = q.lock()
+    {
+        q.clear();
+    }
+}
+
 /// Record + broadcast the session's authoritative mode ("plan"|"build").
 /// No-op when unchanged or unknown. Broadcasts `RemoteEvent::Mode` to all subscribers.
 pub fn set_session_mode(server: &RemoteServer, id: &str, mode: &str) {
     if mode != "plan" && mode != "build" {
         return;
     }
-    // Clone the subscriber list and drop the registry lock before broadcasting.
-    let subs = {
+    // Clone the core handle and drop the registry lock before broadcasting.
+    let core = {
         let Ok(mut reg) = server.state.registry.lock() else {
             return;
         };
@@ -986,13 +1149,14 @@ pub fn set_session_mode(server: &RemoteServer, id: &str, mode: &str) {
             return;
         }
         entry.session.mode = mode.to_string();
-        entry.subs.clone()
+        entry.core.clone()
     };
     broadcast(
-        &subs,
+        &core,
         RemoteEvent::Mode {
             mode: mode.to_string(),
-        },
+        }
+        .to_sse(),
     );
 }
 
@@ -1034,13 +1198,13 @@ pub fn config_snapshot(server: &RemoteServer) -> RemoteConfig {
 }
 
 /// Change the login password on a running server. Takes effect immediately and
-/// invalidates the current token (clients must log in again).
+/// invalidates every current token (all devices must log in again).
 pub fn set_password(server: &RemoteServer, password: String) {
     if let Ok(mut p) = server.state.password.lock() {
         *p = password;
     }
-    if let Ok(mut t) = server.state.token.lock() {
-        *t = None;
+    if let Ok(mut tokens) = server.state.token.lock() {
+        tokens.clear();
     }
 }
 
@@ -1302,7 +1466,7 @@ mod tests {
         register(&server, "s1".into(), "one".into(), Permit::Write);
         // Authenticate up-front: the stream route now requires a token.
         if let Ok(mut t) = server.state.token.lock() {
-            *t = Some(("tok".into(), Instant::now()));
+            t.push(("tok".into(), Instant::now()));
         }
 
         let mut c = TcpStream::connect(("127.0.0.1", free)).unwrap();
@@ -1325,21 +1489,22 @@ mod tests {
         );
 
         // A broadcast event must be flushed promptly, not held until close.
-        let subs = server
+        let core = server
             .state
             .registry
             .lock()
             .unwrap()
             .get("s1")
             .unwrap()
-            .subs
+            .core
             .clone();
         broadcast(
-            &subs,
+            &core,
             RemoteEvent::Delta {
                 turn: "t".into(),
                 text: "hello-prompt".into(),
-            },
+            }
+            .to_sse(),
         );
 
         let mut got = String::new();
@@ -1399,10 +1564,10 @@ mod tests {
             .unwrap()
             .pending_approvals
             .clone();
-        q.lock().unwrap().push_back("once".into());
+        q.lock().unwrap().push_back(("once".into(), 7));
         assert_eq!(
-            take_pending_approval(&server, "s1").as_deref(),
-            Some("once")
+            take_pending_approval(&server, "s1"),
+            Some(("once".to_string(), 7))
         );
         assert_eq!(take_pending_approval(&server, "s1"), None);
         assert_eq!(take_pending_approval(&server, "missing"), None);
@@ -1414,6 +1579,7 @@ mod tests {
             turn: "t1".into(),
             name: "shell".into(),
             summary: "rm -rf build".into(),
+            id: 42,
         }
         .to_sse();
         assert!(req.contains("event: approval\n"), "frame: {req:?}");
@@ -1422,6 +1588,7 @@ mod tests {
             req.contains("\"summary\":\"rm -rf build\""),
             "frame: {req:?}"
         );
+        assert!(req.contains("\"id\":42"), "frame: {req:?}");
 
         let res = RemoteEvent::ApprovalResolved {
             turn: "t1".into(),
@@ -1449,7 +1616,7 @@ mod tests {
         assert!(server.is_running());
         register(&server, "s1".into(), "one".into(), Permit::Write);
         if let Ok(mut t) = server.state.token.lock() {
-            *t = Some(("tok".into(), Instant::now()));
+            t.push(("tok".into(), Instant::now()));
         }
 
         let post = |path: &str, body: &str| -> String {
@@ -1465,11 +1632,14 @@ mod tests {
             String::from_utf8_lossy(&buf[..n]).to_string()
         };
 
-        let ok = post("/api/session/s1/approval", r#"{"decision":"always"}"#);
+        let ok = post(
+            "/api/session/s1/approval",
+            r#"{"decision":"always","id":3}"#,
+        );
         assert!(ok.contains("200 OK"), "response: {ok:?}");
         assert_eq!(
-            take_pending_approval(&server, "s1").as_deref(),
-            Some("always")
+            take_pending_approval(&server, "s1"),
+            Some(("always".to_string(), 3))
         );
 
         let bad = post("/api/session/s1/approval", r#"{"decision":"maybe"}"#);
@@ -1624,11 +1794,11 @@ mod tests {
     fn set_password_updates_snapshot_and_invalidates_token() {
         let server = start(RemoteConfig::default());
         if let Ok(mut t) = server.state.token.lock() {
-            *t = Some(("tok".into(), Instant::now()));
+            t.push(("tok".into(), Instant::now()));
         }
         set_password(&server, "newpass123".into());
         assert!(
-            server.state.token.lock().unwrap().is_none(),
+            server.state.token.lock().unwrap().is_empty(),
             "token invalidated"
         );
         assert_eq!(config_snapshot(&server).password, "newpass123");
@@ -1668,7 +1838,7 @@ mod tests {
         assert!(health.contains("200"), "health must stay open: {health:?}");
 
         if let Ok(mut t) = server.state.token.lock() {
-            *t = Some(("tok".into(), Instant::now()));
+            t.push(("tok".into(), Instant::now()));
         }
         let authed =
             request(b"GET /api/sessions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\n\r\n");
@@ -1720,7 +1890,7 @@ mod tests {
         assert!(server.is_running());
         register(&server, "s1".into(), "one".into(), Permit::Write);
         if let Ok(mut t) = server.state.token.lock() {
-            *t = Some(("tok".into(), Instant::now()));
+            t.push(("tok".into(), Instant::now()));
         }
 
         let mut c = TcpStream::connect(("127.0.0.1", free)).unwrap();
@@ -1755,7 +1925,7 @@ mod tests {
         register(&server, "s1".into(), "one".into(), Permit::Write);
         register(&server, "ro".into(), "ro".into(), Permit::Read);
         if let Ok(mut t) = server.state.token.lock() {
-            *t = Some(("tok".into(), Instant::now()));
+            t.push(("tok".into(), Instant::now()));
         }
 
         let post = |path: &str, body: &str| -> String {
@@ -1798,23 +1968,26 @@ mod tests {
             ..Default::default()
         });
         register(&server, "s1".into(), "one".into(), Permit::Write);
-        let subs = server
+        let core = server
             .state
             .registry
             .lock()
             .unwrap()
             .get("s1")
             .unwrap()
-            .subs
+            .core
             .clone();
-        let (tx, rx) = channel::<RemoteEvent>();
-        subs.lock().unwrap().push(tx);
+        let (tx, rx) = channel::<String>();
+        core.lock().unwrap().subs.push(tx);
 
         assert_eq!(session_mode(&server, "s1").as_deref(), Some("build"));
         set_session_mode(&server, "s1", "plan");
         assert_eq!(session_mode(&server, "s1").as_deref(), Some("plan"));
         match rx.try_recv() {
-            Ok(RemoteEvent::Mode { mode }) => assert_eq!(mode, "plan"),
+            Ok(frame) => assert!(
+                frame.contains("\"type\":\"mode\"") && frame.contains("\"mode\":\"plan\""),
+                "expected mode broadcast, got {frame:?}"
+            ),
             other => panic!("expected mode broadcast, got {other:?}"),
         }
 
@@ -1828,5 +2001,329 @@ mod tests {
         assert_eq!(session_mode(&server, "s1").as_deref(), Some("plan"));
         assert_eq!(session_mode(&server, "missing"), None);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Tiny HTTP client for the tests: one request, one response read.
+    fn http_call(port: u16, request: &str) -> String {
+        use std::io::{Read, Write};
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        c.write_all(request.as_bytes()).unwrap();
+        let mut buf = [0u8; 4096];
+        let n = c.read(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    }
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn sse_stream_replays_history_then_live() {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let port = free_port();
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        });
+        assert!(server.is_running());
+        register(&server, "s1".into(), "one".into(), Permit::Write);
+        if let Ok(mut t) = server.state.token.lock() {
+            t.push(("tok".into(), Instant::now()));
+        }
+
+        // Two events land before the client connects.
+        emit(
+            &server,
+            "s1",
+            RemoteEvent::Delta {
+                turn: "t".into(),
+                text: "first".into(),
+            },
+        );
+        emit(
+            &server,
+            "s1",
+            RemoteEvent::Delta {
+                turn: "t".into(),
+                text: "second".into(),
+            },
+        );
+
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        c.write_all(b"GET /api/session/s1/stream?token=tok HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n")
+            .unwrap();
+
+        // Read until both replayed frames arrive, then add a live frame.
+        let mut got = String::new();
+        for _ in 0..8 {
+            let mut b = [0u8; 2048];
+            match c.read(&mut b) {
+                Ok(0) => break,
+                Ok(n) => got.push_str(&String::from_utf8_lossy(&b[..n])),
+                Err(_) => break,
+            }
+            if got.contains("first") && got.contains("second") {
+                break;
+            }
+        }
+        assert!(got.contains("event: connected"), "got: {got:?}");
+        let first_at = got.find("first").expect("first replayed");
+        let second_at = got.find("second").expect("second replayed");
+        assert!(
+            first_at < second_at,
+            "history replay must keep order: {got:?}"
+        );
+
+        emit(
+            &server,
+            "s1",
+            RemoteEvent::Delta {
+                turn: "t".into(),
+                text: "third".into(),
+            },
+        );
+        let mut live = String::new();
+        for _ in 0..8 {
+            let mut b = [0u8; 2048];
+            match c.read(&mut b) {
+                Ok(0) => break,
+                Ok(n) => live.push_str(&String::from_utf8_lossy(&b[..n])),
+                Err(_) => break,
+            }
+            if live.contains("third") {
+                break;
+            }
+        }
+        assert!(live.contains("third"), "live frame after replay: {live:?}");
+        assert!(
+            !live.contains("first"),
+            "history must not be re-sent on the live channel: {live:?}"
+        );
+    }
+
+    #[test]
+    fn history_caps_drop_oldest_frames() {
+        let server = start(RemoteConfig {
+            port: 0,
+            ..Default::default()
+        });
+        register(&server, "s1".into(), "one".into(), Permit::Write);
+        let core = server
+            .state
+            .registry
+            .lock()
+            .unwrap()
+            .get("s1")
+            .unwrap()
+            .core
+            .clone();
+
+        // ~1 MiB of 8 KiB frames: both caps must hold simultaneously.
+        for i in 0..128 {
+            emit(
+                &server,
+                "s1",
+                RemoteEvent::Delta {
+                    turn: "t".into(),
+                    text: format!("{i:04}-{}", "x".repeat(8 * 1024)),
+                },
+            );
+        }
+        let (len, bytes) = {
+            let c = core.lock().unwrap();
+            (c.history.len(), c.history_bytes)
+        };
+        assert!(len <= HISTORY_MAX_EVENTS, "history events capped: {len}");
+        assert!(bytes <= HISTORY_MAX_BYTES, "history bytes capped: {bytes}");
+        let oldest = {
+            let c = core.lock().unwrap();
+            c.history.front().cloned().unwrap_or_default()
+        };
+        assert!(
+            !oldest.contains("0000"),
+            "oldest frame must have been evicted: {oldest:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_queue_caps_and_reports_depth() {
+        let port = free_port();
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        });
+        assert!(server.is_running());
+        register(&server, "s1".into(), "one".into(), Permit::Write);
+        if let Ok(mut t) = server.state.token.lock() {
+            t.push(("tok".into(), Instant::now()));
+        }
+
+        let post = |body: &str| -> String {
+            http_call(
+                port,
+                &format!(
+                    "POST /api/session/s1/prompt HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+
+        let first = post(r#"{"prompt":"one"}"#);
+        assert!(first.contains("200 OK"), "response: {first:?}");
+        assert!(first.contains("\"queued\":1"), "depth reported: {first:?}");
+
+        for _ in 0..(MAX_PENDING_PROMPTS - 1) {
+            let r = post(r#"{"prompt":"fill"}"#);
+            assert!(r.contains("200 OK"), "response: {r:?}");
+        }
+        let full = post(r#"{"prompt":"overflow"}"#);
+        assert!(full.contains("429"), "full queue must refuse: {full:?}");
+        assert_eq!(
+            server
+                .state
+                .registry
+                .lock()
+                .unwrap()
+                .get("s1")
+                .unwrap()
+                .pending_prompts
+                .lock()
+                .unwrap()
+                .len(),
+            MAX_PENDING_PROMPTS
+        );
+    }
+
+    #[test]
+    fn mode_queue_coalesces_to_newest() {
+        let port = free_port();
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        });
+        assert!(server.is_running());
+        register(&server, "s1".into(), "one".into(), Permit::Write);
+        if let Ok(mut t) = server.state.token.lock() {
+            t.push(("tok".into(), Instant::now()));
+        }
+
+        for i in 0..(MAX_PENDING_MODES + 4) {
+            let mode = if i % 2 == 0 { "plan" } else { "build" };
+            let body = format!("{{\"mode\":\"{mode}\"}}");
+            let r = http_call(
+                port,
+                &format!(
+                    "POST /api/session/s1/mode HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            );
+            assert!(r.contains("202"), "response: {r:?}");
+        }
+        let q = server
+            .state
+            .registry
+            .lock()
+            .unwrap()
+            .get("s1")
+            .unwrap()
+            .pending_modes
+            .clone();
+        assert_eq!(q.lock().unwrap().len(), MAX_PENDING_MODES);
+        // 12 pushes into an 8-slot queue: the oldest 4 were dropped, so the
+        // drain starts at index 4 (even => "plan") and ends at 11 (odd =>
+        // "build").
+        let mut drained = Vec::new();
+        while let Some(m) = take_pending_mode(&server, "s1") {
+            drained.push(m);
+        }
+        assert_eq!(drained.first().map(String::as_str), Some("plan"));
+        assert_eq!(drained.last().map(String::as_str), Some("build"));
+    }
+
+    #[test]
+    fn multiple_devices_keep_independent_sessions() {
+        let port = free_port();
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        });
+        assert!(server.is_running());
+        set_password(&server, "newpass123".into());
+
+        let login = |pwd: &str| -> String {
+            let body = format!("{{\"password\":\"{pwd}\"}}");
+            let r = http_call(
+                port,
+                &format!(
+                    "POST /login HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            );
+            let marker = "\"token\":\"";
+            let start = r.find(marker).expect("token in login response") + marker.len();
+            r[start..].split('"').next().unwrap().to_string()
+        };
+
+        let a = login("newpass123");
+        let b = login("newpass123");
+        assert_ne!(a, b, "each login mints a fresh token");
+
+        let get = |tok: &str| -> String {
+            http_call(
+                port,
+                &format!(
+                    "GET /api/sessions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {tok}\r\n\r\n"
+                ),
+            )
+        };
+        assert!(get(&a).contains("200 OK"));
+        assert!(get(&b).contains("200 OK"));
+
+        // Logging out device A must not invalidate device B.
+        let out = http_call(
+            port,
+            &format!("POST /logout HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {a}\r\n\r\n"),
+        );
+        assert!(out.contains("200 OK"), "logout: {out:?}");
+        assert!(get(&a).contains("401"), "A logged out");
+        assert!(get(&b).contains("200 OK"), "B stays logged in");
+    }
+
+    #[test]
+    fn api_sessions_are_sorted_by_name() {
+        let port = free_port();
+        let server = start(RemoteConfig {
+            bind: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        });
+        assert!(server.is_running());
+        register(&server, "z".into(), "Zulu".into(), Permit::Write);
+        register(&server, "a".into(), "alpha".into(), Permit::Write);
+        register(&server, "m".into(), "Mike".into(), Permit::Write);
+        if let Ok(mut t) = server.state.token.lock() {
+            t.push(("tok".into(), Instant::now()));
+        }
+
+        let body = http_call(
+            port,
+            "GET /api/sessions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok\r\n\r\n",
+        );
+        let alpha = body.find("alpha").expect("alpha present");
+        let mike = body.find("Mike").expect("Mike present");
+        let zulu = body.find("Zulu").expect("Zulu present");
+        assert!(
+            alpha < mike && mike < zulu,
+            "sessions must be sorted by name: {body:?}"
+        );
     }
 }

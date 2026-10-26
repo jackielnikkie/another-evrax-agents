@@ -59,6 +59,15 @@ pub struct App {
     pub slash: Option<SlashMenu>,
     slash_dismissed: Option<String>,
     pub approval: Option<Approval>,
+    /// Per-session sequence stamped on remote `tool` events so the web can keep
+    /// repeated same-name tool calls as distinct rows.
+    remote_tool_seq: u64,
+    /// Per-session sequence stamped on remote `approval` events; the web echoes
+    /// it back so a stale decision can never settle a later approval.
+    remote_approval_seq: u64,
+    /// Test-only: every remote event this app tried to emit, in order.
+    #[cfg(test)]
+    pub(crate) remote_log: Vec<evrax_remote::RemoteEvent>,
     pub auto_allow: HashSet<String>,
     pub session_dialog: Option<SessionDialog>,
     pub theme_dialog: Option<ThemeDialog>,
@@ -117,6 +126,8 @@ pub struct Approval {
     /// access, so granting one folder does not open the whole filesystem.
     pub key: String,
     pub selected: usize,
+    /// Nonce broadcast to the web; a decision may only settle this approval.
+    pub id: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -660,6 +671,10 @@ pub struct ToolCall {
     pub summary: String,
     pub status: ToolStatus,
     pub detail: String,
+    /// Remote call id assigned when this row starts; the finishing event
+    /// reuses it so the web keeps one row per call.
+    #[serde(default)]
+    pub call: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -915,6 +930,10 @@ impl App {
             slash: None,
             slash_dismissed: None,
             approval: None,
+            remote_tool_seq: 0,
+            remote_approval_seq: 0,
+            #[cfg(test)]
+            remote_log: Vec::new(),
             auto_allow: HashSet::new(),
             session_dialog: None,
             theme_dialog: None,
@@ -2882,13 +2901,34 @@ impl App {
             ApprovalDecision::Always => "always",
             ApprovalDecision::Reject => "reject",
         };
+        // Any decision still queued for the approval that just closed targets a
+        // dialog the operator can no longer see; drop it instead of letting it
+        // settle the next one.
+        self.discard_remote_approvals();
         self.emit_approval_resolved(label);
         Some(allow)
     }
 
+    /// Clear every undrained web decision for the current remote session.
+    fn discard_remote_approvals(&self) {
+        let Some(session_id) = self.remote.as_ref().map(|s| s.session_id.clone()) else {
+            return;
+        };
+        let Some(server) = self.remote_server() else {
+            return;
+        };
+        evrax_remote::clear_pending_approvals(server, &session_id);
+    }
+
     /// Settle the open approval from a web decision string ("once" / "always"
-    /// / "reject"). Unknown strings are ignored.
-    pub fn settle_remote_approval(&mut self, decision: &str) -> Option<bool> {
+    /// / "reject"), but only when `id` matches the approval currently open.
+    /// Unknown strings, a closed dialog, or a stale id are all ignored — a
+    /// decision that arrives after its dialog closed must never settle the
+    /// next one.
+    pub fn settle_remote_approval(&mut self, decision: &str, id: u64) -> Option<bool> {
+        if self.approval.as_ref()?.id != id {
+            return None;
+        }
         let decision = match decision {
             "once" => ApprovalDecision::Once,
             "always" => ApprovalDecision::Always,
@@ -2903,6 +2943,7 @@ impl App {
             && self.auto_allow.contains(&approval.key)
         {
             self.approval = None;
+            self.discard_remote_approvals();
             self.emit_approval_resolved("auto");
             return true;
         }
@@ -2958,7 +2999,7 @@ impl App {
         }
         self.input.take();
         self.attachments.clear();
-        self.begin_turn(prompt)
+        self.begin_turn(prompt, true)
     }
 
     /// Books a prompt that cannot start yet (a turn is streaming).
@@ -2979,12 +3020,12 @@ impl App {
             return None;
         }
         let prompt = self.queued.pop_front()?;
-        self.begin_turn(prompt)
+        self.begin_turn(prompt, true)
     }
 
     /// Runs a prompt as a new turn: transcript, title placeholder, busy flag
     /// and the remote echo are handled here for every entry path.
-    fn begin_turn(&mut self, prompt: String) -> Option<String> {
+    fn begin_turn(&mut self, prompt: String, echo_user: bool) -> Option<String> {
         self.push_entry(ChatEntry::User(prompt.clone()));
         self.save_current();
         self.ensure_placeholder_title(&prompt);
@@ -2994,10 +3035,15 @@ impl App {
         self.asst_open = false;
         self.scroll_from_bottom = 0;
         if let Some(turn) = self.remote.as_ref().map(|s| s.session_id.clone()) {
-            self.emit_remote(evrax_remote::RemoteEvent::User {
-                turn: turn.clone(),
-                text: prompt.clone(),
-            });
+            // Web-originated prompts (`echo_user == false`) already have their
+            // bubble broadcast by the remote server; echoing again here would
+            // render the same prompt twice in every open tab.
+            if echo_user {
+                self.emit_remote(evrax_remote::RemoteEvent::User {
+                    turn: turn.clone(),
+                    text: prompt.clone(),
+                });
+            }
             self.emit_remote(evrax_remote::RemoteEvent::TurnStart { turn });
         }
         Some(prompt)
@@ -3029,11 +3075,22 @@ impl App {
         self.execute_command(command);
     }
 
-    /// Submit a prompt that originated from the web UI (queued by the remote
-    /// server). Mirrors `submit_prompt` but uses the given text instead of the
-    /// composer, so web prompts run under the current TUI mode and surface tool
-    /// approvals in the terminal as usual.
+    /// Submit a prompt that originated from an external inbox (subagent).
+    /// Mirrors `submit_prompt` but uses the given text instead of the
+    /// composer, so external prompts run under the current TUI mode and surface
+    /// tool approvals in the terminal as usual.
     pub fn submit_external_prompt(&mut self, text: String) -> Option<String> {
+        self.submit_with_echo(text, true)
+    }
+
+    /// Submit a prompt queued by the remote server (web UI). Its user bubble
+    /// was already broadcast to every open tab at POST time, so the TUI must
+    /// not echo it a second time when the turn actually starts.
+    pub fn submit_web_prompt(&mut self, text: String) -> Option<String> {
+        self.submit_with_echo(text, false)
+    }
+
+    fn submit_with_echo(&mut self, text: String, echo_user: bool) -> Option<String> {
         let prompt = text.trim().to_string();
         if prompt.is_empty() {
             return None;
@@ -3042,7 +3099,7 @@ impl App {
             self.queue_prompt(prompt);
             return None;
         }
-        self.begin_turn(prompt)
+        self.begin_turn(prompt, echo_user)
     }
 
     pub fn paste_text(&mut self, text: &str) {
@@ -3189,30 +3246,51 @@ impl App {
             AgentEvent::ToolPreparing { name, bytes } => {
                 self.asst_open = false;
                 let detail = format!("preparing… {bytes} B");
-                let upgraded = if let Some(ChatEntry::Tool(tool)) = self.messages.last_mut()
-                    && tool.name == name
-                {
-                    tool.status = ToolStatus::Preparing;
-                    tool.detail = detail.clone();
-                    self.content_rev = self.content_rev.wrapping_add(1);
-                    true
+                // Repeated progress frames for the same call keep its row (and
+                // id); anything else starts a new call row with a fresh id.
+                let continues = matches!(
+                    self.messages.last(),
+                    Some(ChatEntry::Tool(t)) if t.name == name
+                        && matches!(t.status, ToolStatus::Preparing)
+                );
+                let call = if continues {
+                    match self.messages.last() {
+                        Some(ChatEntry::Tool(t)) => t.call,
+                        _ => 0,
+                    }
                 } else {
-                    false
+                    self.remote_tool_seq = self.remote_tool_seq.wrapping_add(1);
+                    self.remote_tool_seq
                 };
-                if !upgraded {
+                if continues {
+                    if let Some(ChatEntry::Tool(tool)) = self.messages.last_mut() {
+                        tool.detail = detail.clone();
+                        self.content_rev = self.content_rev.wrapping_add(1);
+                    }
+                } else {
                     self.push_entry(ChatEntry::Tool(ToolCall {
-                        name,
+                        name: name.clone(),
                         summary: "preparing".to_string(),
                         status: ToolStatus::Preparing,
-                        detail,
+                        detail: detail.clone(),
+                        call,
                     }));
+                }
+                if let Some(turn) = &remote_turn {
+                    self.emit_remote(evrax_remote::RemoteEvent::Tool {
+                        turn: turn.clone(),
+                        name,
+                        status: "preparing".into(),
+                        detail: Some(detail),
+                        call,
+                    });
                 }
             }
             AgentEvent::ToolStarted { name, summary } => {
                 self.asst_open = false;
                 // A preparing placeholder for the same call is upgraded in
                 // place so the transcript shows one row per tool call.
-                if let Some(ChatEntry::Tool(tool)) = self.messages.last_mut()
+                let call = if let Some(ChatEntry::Tool(tool)) = self.messages.last_mut()
                     && matches!(tool.status, ToolStatus::Preparing)
                     && tool.name == name
                 {
@@ -3220,25 +3298,32 @@ impl App {
                     tool.status = ToolStatus::Running;
                     tool.detail = "running…".to_string();
                     self.content_rev = self.content_rev.wrapping_add(1);
+                    tool.call
                 } else {
+                    self.remote_tool_seq = self.remote_tool_seq.wrapping_add(1);
+                    let call = self.remote_tool_seq;
                     self.push_entry(ChatEntry::Tool(ToolCall {
                         name: name.clone(),
                         summary,
                         status: ToolStatus::Running,
                         detail: "running…".to_string(),
+                        call,
                     }));
-                }
+                    call
+                };
                 if let Some(turn) = &remote_turn {
                     self.emit_remote(evrax_remote::RemoteEvent::Tool {
                         turn: turn.clone(),
                         name,
                         status: "running".into(),
                         detail: None,
+                        call,
                     });
                 }
             }
             AgentEvent::ToolFinished { name, ok, detail } => {
                 self.asst_open = false;
+                let mut call = 0;
                 for entry in self.messages.iter_mut().rev() {
                     if let ChatEntry::Tool(tool) = entry
                         && matches!(tool.status, ToolStatus::Running | ToolStatus::Preparing)
@@ -3250,26 +3335,35 @@ impl App {
                             ToolStatus::Error
                         };
                         tool.detail = detail.clone();
+                        call = tool.call;
                         self.content_rev = self.content_rev.wrapping_add(1);
                         break;
                     }
                 }
                 if let Some(turn) = &remote_turn {
+                    // `call` comes from the row that just finished, so the web
+                    // updates the same row instead of adding another.
                     self.emit_remote(evrax_remote::RemoteEvent::Tool {
                         turn: turn.clone(),
                         name,
                         status: if ok { "done".into() } else { "error".into() },
                         detail: Some(detail),
+                        call,
                     });
                 }
             }
             AgentEvent::ApprovalRequested { name, summary, key } => {
                 self.asst_open = false;
+                // Ids start at 1: 0 means "client sent no nonce" and can never
+                // match an open dialog.
+                self.remote_approval_seq = self.remote_approval_seq.wrapping_add(1);
+                let id = self.remote_approval_seq;
                 if let Some(turn) = &remote_turn {
                     self.emit_remote(evrax_remote::RemoteEvent::Approval {
                         turn: turn.clone(),
                         name: name.clone(),
                         summary: summary.clone(),
+                        id,
                     });
                 }
                 self.approval = Some(Approval {
@@ -3277,6 +3371,7 @@ impl App {
                     summary,
                     key,
                     selected: 0,
+                    id,
                 });
             }
             AgentEvent::Diff { path, lines } => {
@@ -3340,6 +3435,10 @@ impl App {
     }
 
     fn emit_remote(&mut self, event: evrax_remote::RemoteEvent) {
+        // Test-only trace of every emission attempt (before the enabled/server
+        // gates) so unit tests can assert which events a code path emits.
+        #[cfg(test)]
+        self.remote_log.push(event.clone());
         let enabled = self.remote.as_ref().map(|s| s.enabled).unwrap_or(false);
         if !enabled {
             return;
@@ -4190,12 +4289,27 @@ mod tests {
             summary: "cargo test".into(),
             key: "shell".into(),
         });
-        assert_eq!(app.settle_remote_approval("bogus"), None, "unknown ignored");
+        let id = app.approval.as_ref().expect("open dialog").id;
+        assert!(id >= 1, "ids start at 1 so 0 means unspecified");
+        assert_eq!(
+            app.settle_remote_approval("bogus", id),
+            None,
+            "unknown ignored"
+        );
         assert!(
             app.approval.is_some(),
             "unknown must not consume the dialog"
         );
-        assert_eq!(app.settle_remote_approval("reject"), Some(false));
+        assert_eq!(
+            app.settle_remote_approval("reject", id + 99),
+            None,
+            "stale id ignored"
+        );
+        assert!(
+            app.approval.is_some(),
+            "a decision for another dialog must not settle this one"
+        );
+        assert_eq!(app.settle_remote_approval("reject", id), Some(false));
         assert!(app.approval.is_none(), "decision consumed the dialog");
 
         app.apply_event(AgentEvent::ApprovalRequested {
@@ -4203,8 +4317,112 @@ mod tests {
             summary: "cargo test".into(),
             key: "shell".into(),
         });
-        assert_eq!(app.settle_remote_approval("always"), Some(true));
+        let id2 = app.approval.as_ref().expect("second dialog").id;
+        assert_ne!(id2, id, "every dialog gets a fresh id");
+        assert_eq!(app.settle_remote_approval("always", id2), Some(true));
         assert!(app.auto_allow.contains("shell"));
+        assert_eq!(
+            app.settle_remote_approval("once", id),
+            None,
+            "the previous dialog's id stays dead"
+        );
+    }
+
+    #[test]
+    fn web_prompt_does_not_echo_user_but_external_does() {
+        let mut app = app();
+        app.ensure_remote();
+        app.remote_log.clear();
+
+        assert!(app.submit_web_prompt("halo dari web".into()).is_some());
+        let kinds: Vec<&str> = app
+            .remote_log
+            .iter()
+            .map(|e| match e {
+                evrax_remote::RemoteEvent::User { .. } => "user",
+                evrax_remote::RemoteEvent::TurnStart { .. } => "turn_start",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["turn_start"],
+            "the server already echoed the web prompt's bubble"
+        );
+
+        app.busy = false;
+        app.remote_log.clear();
+        assert!(app.submit_external_prompt("dari inbox".into()).is_some());
+        let kinds: Vec<&str> = app
+            .remote_log
+            .iter()
+            .map(|e| match e {
+                evrax_remote::RemoteEvent::User { .. } => "user",
+                evrax_remote::RemoteEvent::TurnStart { .. } => "turn_start",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["user", "turn_start"],
+            "subagent prompts are echoed only by the TUI"
+        );
+    }
+
+    #[test]
+    fn remote_tool_events_carry_distinct_call_ids() {
+        let mut app = app();
+        app.ensure_remote();
+        app.remote_log.clear();
+
+        app.apply_event(AgentEvent::ToolStarted {
+            name: "shell".into(),
+            summary: "cargo test".into(),
+        });
+        app.apply_event(AgentEvent::ToolFinished {
+            name: "shell".into(),
+            ok: true,
+            detail: "ok".into(),
+        });
+        app.apply_event(AgentEvent::ToolStarted {
+            name: "shell".into(),
+            summary: "cargo check".into(),
+        });
+        app.apply_event(AgentEvent::ToolFinished {
+            name: "shell".into(),
+            ok: true,
+            detail: "ok".into(),
+        });
+
+        let calls: Vec<u64> = app
+            .remote_log
+            .iter()
+            .filter_map(|e| match e {
+                evrax_remote::RemoteEvent::Tool { call, .. } => Some(*call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 4, "four tool frames: {calls:?}");
+        assert!(
+            calls[0] >= 1 && calls[0] == calls[1],
+            "first run's running+done share one id: {calls:?}"
+        );
+        assert!(
+            calls[2] > calls[1],
+            "the second invocation gets a fresh id: {calls:?}"
+        );
+        assert_eq!(calls[2], calls[3], "second run shares its id: {calls:?}");
+
+        // The transcript rows carry the same ids, one per invocation.
+        let row_calls: Vec<u64> = app
+            .messages
+            .iter()
+            .filter_map(|e| match e {
+                ChatEntry::Tool(t) => Some(t.call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(row_calls, vec![calls[0], calls[2]], "rows: {row_calls:?}");
     }
 
     #[test]

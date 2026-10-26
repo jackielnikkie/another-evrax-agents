@@ -2282,6 +2282,7 @@ mod tests {
                 summary: "crates/evrax-tui/src/markdown.rs".to_string(),
                 status: ToolStatus::Done,
                 detail: "96 lines".to_string(),
+                call: 0,
             }),
             ChatEntry::Diff {
                 path: "crates/evrax-tui/src/markdown.rs".to_string(),
@@ -2301,6 +2302,7 @@ mod tests {
                 summary: "cargo test".to_string(),
                 status: ToolStatus::Error,
                 detail: "1 failed".to_string(),
+                call: 0,
             }),
             ChatEntry::Assistant("One case still fails on wrapped code rows.".to_string()),
         ]
@@ -2874,6 +2876,7 @@ mod tests {
             summary: "cargo test".into(),
             status,
             detail: detail.to_string(),
+            call: 0,
         })
     }
 

@@ -103,7 +103,7 @@
     .err { color: var(--err); }
     .muted { color: var(--muted); }
     .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
-    .chat { display: flex; flex-direction: column; height: calc(100dvh - 2rem); min-height: 320px; }
+    .chat { display: flex; flex-direction: column; height: calc(100dvh - 2rem); min-height: 320px; margin-bottom: 0; }
     @supports not (height: 100dvh) { .chat { height: 75vh; } }
     .messages {
       flex: 1;
@@ -190,7 +190,7 @@
 </head>
 <body>
   <div id="app">
-    <h1>evrax remote</h1>
+    <h1 v-if="token && !active">evrax remote</h1>
 
     <!-- Login view -->
     <div v-if="!token" class="login">
@@ -246,7 +246,7 @@
         <span class="status" :class="connState">{{ connLabel }}</span>
       </div>
 
-      <div class="messages" ref="scroller">
+      <div class="messages" ref="scroller" @scroll.passive="onScroll">
         <template v-for="(m, i) in messages" :key="i">
           <div v-if="m.kind === 'user'" class="msg">
             <span class="label">you</span>
@@ -302,6 +302,7 @@
               @click="setMode('build')"
             >Build</button>
           </div>
+          <span v-if="queuedHint" class="muted">{{ queuedHint }}</span>
           <span v-if="active.permit === 'read'" class="muted">read-only session</span>
           <button :disabled="active.permit === 'read' || sending || !draft.trim()" @click="send">
             {{ sending ? 'Sending...' : 'Send' }}
@@ -319,17 +320,19 @@
      *  Auth model (from crates/evrax-remote/src/lib.rs):
      *    - POST /login with JSON body { "password": "..." }
      *      -> 200 { "token": "<32-hex>" }   (or 401 { "error": "invalid password" })
-     *    - The token is opaque to the client. The v1 server stores it in-memory and
-     *      does NOT currently validate it on /api/sessions or /api/session/*.
-     *      We send it as "Authorization: Bearer <token>" anyway so C3 can add
-     *      enforcement without changing this client.
+     *    - Each login mints an independent token (one per device); POST /logout
+     *      invalidates only the token presented with it. The token is opaque to
+     *      the client and sent as "Authorization: Bearer <token>".
      *
       *  Endpoints used by this UI:
       *    POST /login                          body {"password"} -> {"token"}
       *    GET  /api/sessions                   -> [{ "id", "name", "permit", "mode" }]
       *    GET  /api/session/{id}/stream        -> Server-Sent Events (see contract below)
-      *    POST /api/session/{id}/prompt        body {"prompt": "..."}  (C3)
-      *    POST /api/session/{id}/approval      body {"decision": "once"|"always"|"reject"}
+      *    POST /api/session/{id}/prompt        body {"prompt": "..."}
+      *      -> 200 {"ok":true,"turn":"...","queued":N}; 429 when the queue is full
+      *    POST /api/session/{id}/approval      body {"decision": "once"|"always"|"reject", "id": N}
+      *      `id` is the nonce from the `approval` event; the TUI ignores a
+      *      decision whose id does not match the approval currently open.
       *    POST /api/session/{id}/mode          body {"mode": "plan"|"build"} -> 202 {"ok":true}
       *      Queues the request for the owning TUI; the UI only flips when the
       *      'mode' SSE event (or a /api/sessions refresh) confirms it.
@@ -367,21 +370,26 @@
      *
      *    event: tool
      *      data: { "type": "tool", "turn": "<turn-id>", "name": "<tool>",
-     *              "status": "<queued|running|done|error>", "detail": "<optional>" }
-     *      A tool invocation lifecycle. 'status' is one of:
-     *        - "queued"   tool selected, not yet started
-     *        - "running"  tool is executing
-     *        - "done"     tool finished successfully
-     *        - "error"    tool failed
+     *              "status": "<preparing|running|done|error>",
+     *              "detail": "<optional>", "call": <per-session sequence> }
+     *      A tool invocation lifecycle. Rows are keyed by `call`, so repeated
+     *      invocations of the same tool stay separate rows. A finishing frame
+     *      (`done`/`error`) without a matching row is ignored (the replay may
+     *      start mid-call).
+     *      - "preparing"  arguments still streaming (or awaiting approval)
+     *      - "running"    tool is executing
+     *      - "done"       tool finished successfully
+     *      - "error"      tool failed
      *      'detail' may carry an error message or short summary (may be empty/absent).
      *
      *    event: approval
      *      data: { "type": "approval", "turn": "<turn-id>", "name": "<tool>",
-     *              "summary": "<what it wants to do>" }
+     *              "summary": "<what it wants to do>", "id": <nonce> }
      *      A tool needs the operator's consent before running. The UI renders
      *      approve / always-allow / reject buttons; picking one POSTs to
-     *      /api/session/{id}/approval (the dialog also opens in the TUI, either
-     *      side may decide).
+     *      /api/session/{id}/approval together with `id` (the dialog also opens
+     *      in the TUI; either side may decide, and a decision whose id no longer
+     *      matches the open dialog is discarded by the TUI).
      *
      *    event: approval_resolved
      *      data: { "type": "approval_resolved", "turn": "<turn-id>",
@@ -409,9 +417,14 @@
      *      Server is closing the stream (no more events). UI marks the connection
      *      closed and stops reconnecting automatically.
      *
-     *  Note: the legacy v1 stub sends 'data: {"type":"connected"}' with no
-     *  'event:' line (the default "message" event). This client handles that too
-     *  by reading the JSON 'type' field as a fallback.
+     *  Replay: on connect the server sends `connected` followed by every event
+     *  recorded since the session was registered (capped), then the live feed.
+     *  The client clears its transcript before connecting, so the replayed
+     *  frames rebuild the conversation for a fresh tab or after a reload.
+     *
+     *  Transport errors: the browser's EventSource raises a native "error"
+     *  event with no `data` on disconnects — those are handled via `es.onerror`
+     *  (status only) and never rendered as transcript errors.
      * ============================================================================
      */
 
@@ -433,6 +446,8 @@
           es: null,            // EventSource handle
           pollTimer: null,
           currentTurn: null,   // id of the turn currently being streamed
+          queuedHint: "",      // "queued (n)" shown while the TUI drains
+          stick: true,         // auto-scroll only while the user is at the bottom
         };
       },
 
@@ -548,6 +563,8 @@
           this.active = s;
           this.messages = [];
           this.draft = "";
+          this.stick = true;
+          this.queuedHint = "";
           this.connectStream(s.id);
         },
 
@@ -556,6 +573,7 @@
           this.active = null;
           this.messages = [];
           this.draft = "";
+          this.queuedHint = "";
         },
 
         connectStream(id) {
@@ -607,9 +625,14 @@
           }
         },
 
-        curTurn() {
+        curTurn(mayCreate) {
           const last = this.messages[this.messages.length - 1];
-          if (last && last.kind === "turn") return last;
+          if (last && last.kind === "turn" && !last.done) return last;
+          if (!mayCreate) {
+            // Finishing events (turn_done / error) must never fabricate an empty
+            // assistant block when turn_start was missed.
+            return null;
+          }
           const t = { kind: "turn", turn: null, thinking: "", text: "", tools: [], approval: null, done: false, error: "" };
           this.messages.push(t);
           return t;
@@ -628,20 +651,25 @@
           const d = this.parseData(e);
           this.messages.push({ kind: "turn", turn: d && d.turn ? d.turn : null, thinking: "", text: "", tools: [], approval: null, done: false, error: "" });
           this.currentTurn = d && d.turn ? d.turn : null;
+          this.queuedHint = "";
           this.scrollDown();
         },
 
         onDelta(e) {
           const d = this.parseData(e);
           if (!d || d.text == null) return;
-          this.curTurn().text += d.text;
+          const turn = this.curTurn(true);
+          if (!turn) return;
+          turn.text += d.text;
           this.scrollDown();
         },
 
         onThinking(e) {
           const d = this.parseData(e);
           if (!d || d.text == null) return;
-          this.curTurn().thinking += d.text;
+          const turn = this.curTurn(true);
+          if (!turn) return;
+          turn.thinking += d.text;
           this.scrollDown();
         },
 
@@ -651,22 +679,42 @@
           const name = d.name || "tool";
           const status = d.status || "queued";
           const detail = d.detail || "";
-          const tools = this.curTurn().tools;
+          // A finishing frame with no matching row creates nothing: after a
+          // reload the replay may start mid-call, and a stray "done" row would
+          // be confusing noise.
+          const finishing = status === "done" || status === "error";
+          const turn = this.curTurn(!finishing);
+          if (!turn) return;
+          const tools = turn.tools;
+          const call = typeof d.call === "number" ? d.call : null;
           let row = null;
           for (let i = tools.length - 1; i >= 0; i--) {
-            if (tools[i].name === name) { row = tools[i]; break; }
+            if (call !== null ? tools[i].call === call : tools[i].name === name && !tools[i].done) {
+              row = tools[i];
+              break;
+            }
           }
-          if (row) { row.status = status; if (detail) row.detail = detail; }
-          else tools.push({ name, status, detail });
+          if (row) {
+            row.status = status;
+            if (detail) row.detail = detail;
+            if (finishing) row.done = true;
+          } else {
+            tools.push({ name, status, detail, call, done: finishing });
+          }
           this.scrollDown();
         },
 
         onApproval(e) {
           const d = this.parseData(e);
           if (!d) return;
-          this.curTurn().approval = {
+          const turn = this.curTurn(true);
+          if (!turn) return;
+          turn.approval = {
             name: d.name || "tool",
             summary: d.summary || "",
+            // Nonce from the server; echoed back so the TUI can refuse a
+            // decision that arrives after its dialog already closed.
+            id: d.id || 0,
             state: "pending",
             sending: false,
           };
@@ -675,8 +723,8 @@
 
         onApprovalResolved(e) {
           const d = this.parseData(e);
-          const t = this.curTurn();
-          if (!t.approval) return;
+          const t = this.curTurn(false);
+          if (!t || !t.approval) return;
           t.approval.sending = false;
           t.approval.state =
             d && d.decision === "reject"
@@ -700,7 +748,7 @@
                   "Content-Type": "application/json",
                   Authorization: "Bearer " + this.token,
                 },
-                body: JSON.stringify({ decision }),
+                body: JSON.stringify({ decision, id: a.id || 0 }),
               }
             );
             if (!r.ok) {
@@ -760,14 +808,21 @@
         },
 
         onTurnDone(e) {
-          this.curTurn().done = true;
+          const turn = this.curTurn(false);
+          if (turn) turn.done = true;
           this.scrollDown();
         },
 
         onError(e) {
+          // The EventSource "error" listener ALSO fires for transport-level
+          // disconnects, where `e.data` is undefined. Only frames sent by the
+          // server (a JSON payload) belong in the transcript; connection loss
+          // is already reflected by es.onerror / connState.
+          if (e.data == null || e.data === "") return;
           const d = this.parseData(e);
           const msg = d && d.message ? d.message : "stream error";
-          this.curTurn().error = msg;
+          const turn = this.curTurn(true);
+          if (turn) turn.error = msg;
           this.scrollDown();
         },
 
@@ -785,7 +840,16 @@
           }
         },
 
+        // Reading history must not be yanked back to the bottom by incoming
+        // deltas: auto-scroll only while the user is already near the bottom.
+        onScroll() {
+          const el = this.$refs.scroller;
+          if (!el) return;
+          this.stick = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+        },
+
         scrollDown() {
+          if (!this.stick) return;
           nextTick(() => {
             const el = this.$refs.scroller;
             if (el) el.scrollTop = el.scrollHeight;
@@ -803,6 +867,7 @@
           this.draft = "";
           // The user bubble is rendered from the server's `user` echo, so every
           // open tab (including this one) stays in sync.
+          this.stick = true;
           this.scrollDown();
 
           try {
@@ -821,10 +886,17 @@
               let msg = "prompt failed (" + r.status + ")";
               try {
                 const j = await r.json();
-                if (j && j.error) msg = j.error;
+                if (j && (j.error || j.message)) msg = j.error || j.message;
               } catch (ignore) {}
               this.messages.push({ kind: "error", text: msg });
               this.scrollDown();
+            } else {
+              // The server reports queue depth after accepting: surface it so a
+              // prompt that will not run immediately is never silent.
+              try {
+                const j = await r.json();
+                this.queuedHint = j && j.queued ? "queued (" + j.queued + ")" : "";
+              } catch (ignore) {}
             }
           } catch (e) {
             this.messages.push({ kind: "error", text: String(e) });

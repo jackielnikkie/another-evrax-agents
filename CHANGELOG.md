@@ -15,12 +15,23 @@ All notable changes to evrax are documented here. The format follows
   prompts share the queue; read-only slash commands still run immediately.
 - 42 skills embedded in the binary, so fresh installs have skills without a
   repository checkout.
+- Web remote replays the session transcript on connect (capped at 512 KiB /
+  2000 events), so a fresh tab or a reload rebuilds the conversation instead of
+  showing an empty chat.
+- Web remote reports queue depth (`queued N`) when a prompt is accepted while
+  the TUI is busy, and refuses new prompts at the cap with `429`.
+- Independent login tokens: each device logs in separately and `/logout` only
+  invalidates the presented token.
 
 ### Changed
 
 - Quiet transcript by default: thinking and successful tool calls render as one
   line; errors show up to four lines. Toggle with `ctrl+t` / `ctrl+o`.
 - Diff previews are capped at 40 lines by default and 200 lines when expanded.
+- Web remote keys tool rows by a per-call id, so repeated invocations of the
+  same tool stay separate rows and finishing events update the right one.
+- Web remote keeps the scroll position while the user reads history, and the
+  chat view no longer overflows the viewport on mobile.
 
 ### Fixed
 
@@ -31,6 +42,17 @@ All notable changes to evrax are documented here. The format follows
   blocked until a non-default password is set, and the password editor rejects
   weak values.
 - Replies follow the user's language instead of drifting to another language.
+- Web remote no longer renders a duplicate user bubble for prompts sent from
+  the browser (the server echoes once, the TUI no longer echoes again).
+- Approval decisions carry a nonce: a click that arrives after its dialog
+  closed can no longer settle the next approval, and stale decisions are
+  dropped when a dialog is settled from the terminal.
+- Browser connection drops no longer appear as assistant "stream error"
+  bubbles (native `EventSource` errors are told apart from server `error`
+  frames).
+- Session list order is stable across polls; the web UI is served with
+  `Cache-Control: no-store` so an upgrade is never masked by a cached page.
+- Request bodies are capped at 256 KiB.
 
 ### Security
 

@@ -748,7 +748,7 @@ fn drain_remote_prompts(
         evrax_remote::take_pending_prompt(server, &session_id)
     };
     let Some(text) = text else { return };
-    if let Some(prompt) = app.submit_external_prompt(text) {
+    if let Some(prompt) = app.submit_web_prompt(text) {
         let (session, plan_mode) = (app.session_id.clone(), app.mode == AgentMode::Plan);
         start_turn(
             backend,
@@ -827,23 +827,40 @@ fn drain_subagent_prompt(
     }
 }
 
-/// Applies an accept/reject decision sent from the web while the approval
-/// dialog is open (the dialog may also be settled from the terminal).
+/// Applies accept/reject decisions sent from the web while the approval
+/// dialog is open (the dialog may also be settled from the terminal). Each
+/// decision carries the id of the approval it targets: only the decision for
+/// the dialog currently open is applied; anything stale is dropped as it is
+/// drained.
 fn drain_remote_approvals(app: &mut App, decision_tx: &mut Option<mpsc::Sender<bool>>) {
     if app.approval.is_none() {
         return;
     }
-    let decision = {
-        let Some(session_id) = app.remote.as_ref().map(|r| r.session_id.clone()) else {
-            return;
+    let mut apply: Option<(String, u64)> = None;
+    loop {
+        let next = {
+            let Some(session_id) = app.remote.as_ref().map(|r| r.session_id.clone()) else {
+                return;
+            };
+            let Some(server) = app.remote_server() else {
+                return;
+            };
+            evrax_remote::take_pending_approval(server, &session_id)
         };
-        let Some(server) = app.remote_server() else {
-            return;
-        };
-        evrax_remote::take_pending_approval(server, &session_id)
-    };
-    let Some(decision) = decision else { return };
-    if let Some(allow) = app.settle_remote_approval(&decision)
+        match next {
+            Some((decision, id)) => {
+                if app.approval.as_ref().map(|a| a.id) == Some(id) {
+                    apply = Some((decision, id));
+                }
+            }
+            None => break,
+        }
+        if app.approval.is_none() {
+            break;
+        }
+    }
+    let Some((decision, id)) = apply else { return };
+    if let Some(allow) = app.settle_remote_approval(&decision, id)
         && let Some(tx) = decision_tx
     {
         let _ = tx.try_send(allow);
