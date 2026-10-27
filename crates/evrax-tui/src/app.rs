@@ -110,6 +110,10 @@ pub struct App {
     title_pending: std::collections::HashSet<String>,
     /// Queued LLM title job picked up by the event loop (session, prompt, reply).
     title_job: Option<(String, String, String)>,
+    /// True when the last requested update check should always report its result.
+    update_explicit: bool,
+    /// True while an update check is in flight (blocks a second spawn).
+    update_inflight: bool,
     /// Flattened transcript lines, rebuilt per entry only when it changes.
     pub transcript: crate::ui::TranscriptCache,
     /// Bumped whenever transcript content changes; lets the render cache skip
@@ -320,6 +324,7 @@ pub enum Command {
     Model,
     Remote,
     Rename,
+    Update,
     Quit,
 }
 
@@ -382,6 +387,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         aliases: &[],
         description: "set this session's title",
         command: Command::Rename,
+    },
+    SlashCommand {
+        name: "update",
+        aliases: &[],
+        description: "check for a newer evrax release",
+        command: Command::Update,
     },
     SlashCommand {
         name: "exit",
@@ -964,6 +975,8 @@ impl App {
             manual_titles: std::collections::HashSet::new(),
             title_pending: std::collections::HashSet::new(),
             title_job: None,
+            update_explicit: false,
+            update_inflight: false,
             transcript: crate::ui::TranscriptCache::default(),
             content_rev: 0,
             last_esc: None,
@@ -1794,6 +1807,69 @@ impl App {
         self.title_job.take()
     }
 
+    /// Explicit `/update` request: reports its outcome either way.
+    pub fn request_update_check(&mut self) {
+        self.update_explicit = true;
+        if !self.update_inflight {
+            self.set_flash("checking for updates\u{2026}".to_string());
+        }
+    }
+
+    /// Startup probe: silent unless a newer release exists.
+    pub fn request_startup_update_check(&mut self) {
+        self.update_explicit = false;
+    }
+
+    /// Hands the event loop one update job; `None` while a check is in flight.
+    pub fn update_job(&mut self) -> Option<bool> {
+        if self.update_inflight {
+            return None;
+        }
+        self.update_inflight = true;
+        Some(self.update_explicit)
+    }
+
+    /// Applies a finished check. Explicit requests always flash; the startup
+    /// probe stays quiet unless an update is available.
+    pub fn apply_update_check(
+        &mut self,
+        explicit: bool,
+        result: Result<Option<evrax_agent::update::UpdateCheck>, String>,
+    ) {
+        self.update_inflight = false;
+        let current = env!("CARGO_PKG_VERSION");
+        let message = match result {
+            Ok(Some(check)) => {
+                if explicit {
+                    format!(
+                        "update available: {} (you: {}) \u{00b7} {}",
+                        check.latest, current, check.url
+                    )
+                } else {
+                    format!(
+                        "update available: {} \u{2014} /update for details",
+                        check.latest
+                    )
+                }
+            }
+            Ok(None) => {
+                if explicit {
+                    format!("up to date: {current}")
+                } else {
+                    return;
+                }
+            }
+            Err(err) => {
+                if explicit {
+                    format!("update check failed: {err}")
+                } else {
+                    return;
+                }
+            }
+        };
+        self.set_flash(message);
+    }
+
     fn plan_title_job(&mut self) {
         let id = self.session_id.clone();
         if self.manual_titles.contains(&id) || self.title_pending.contains(&id) {
@@ -1966,6 +2042,7 @@ impl App {
             ("Change theme".to_string(), Command::Theme),
             ("Provider and model".to_string(), Command::Model),
             ("Remote web".to_string(), Command::Remote),
+            ("Check for updates".to_string(), Command::Update),
             ("Quit evrax".to_string(), Command::Quit),
         ]
     }
@@ -2005,6 +2082,7 @@ impl App {
             Command::Model => self.open_model_dialog(),
             Command::Remote => self.open_remote_dialog(),
             Command::Rename => self.rename_session_title(""),
+            Command::Update => self.request_update_check(),
             Command::Quit => self.quit(),
         }
     }
@@ -4052,7 +4130,7 @@ mod tests {
         let mut app = app();
         app.toggle_palette();
         assert!(app.palette.is_some());
-        assert_eq!(app.filtered_commands().len(), 8);
+        assert_eq!(app.filtered_commands().len(), 9);
         for c in "plan".chars() {
             app.palette_type(c);
         }
@@ -4084,13 +4162,13 @@ mod tests {
         let mut app = app();
         app.toggle_palette();
         app.palette_move(-1);
-        assert_eq!(app.palette.as_ref().unwrap().selected, 7);
+        assert_eq!(app.palette.as_ref().unwrap().selected, 8);
         app.palette_move(1);
         assert_eq!(app.palette.as_ref().unwrap().selected, 0);
         app.palette_type('z');
         assert_eq!(app.filtered_commands().len(), 0);
         app.palette_backspace();
-        assert_eq!(app.filtered_commands().len(), 8);
+        assert_eq!(app.filtered_commands().len(), 9);
     }
 
     #[test]
@@ -4653,9 +4731,9 @@ mod tests {
     fn palette_page_clamps_to_bounds() {
         let mut app = app();
         app.toggle_palette();
-        // 8 commands; page size 8 → down stays on the last row.
+        // 9 commands; page size 8 → down stays on the last row.
         app.palette_page(1, 8);
-        assert_eq!(app.palette.as_ref().unwrap().selected, 7);
+        assert_eq!(app.palette.as_ref().unwrap().selected, 8);
         // Up two pages of 8 â†’ still on the first row.
         app.palette_page(-1, 8);
         app.palette_page(-1, 8);
@@ -5292,5 +5370,94 @@ mod tests {
         });
         assert_eq!(app.take_reload_config().unwrap().model, "m");
         assert!(app.take_reload_config().is_none());
+    }
+
+    #[test]
+    fn update_check_explicit_up_to_date_flashes() {
+        let mut app = app();
+        app.apply_update_check(true, Ok(None));
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert!(
+            flash.as_deref().is_some_and(|t| t.contains("up to date")),
+            "explicit up-to-date must flash: {flash:?}"
+        );
+    }
+
+    #[test]
+    fn update_check_startup_error_stays_quiet() {
+        let mut app = app();
+        app.apply_update_check(false, Err("boom".into()));
+        assert!(app.flash.is_none(), "startup error must not flash");
+    }
+
+    #[test]
+    fn update_check_startup_available_flashes() {
+        let mut app = app();
+        app.apply_update_check(
+            false,
+            Ok(Some(evrax_agent::update::UpdateCheck {
+                latest: "v9.9.9".into(),
+                url: "https://x".into(),
+            })),
+        );
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert!(
+            flash
+                .as_deref()
+                .is_some_and(|t| t.contains("update available")),
+            "startup update must flash: {flash:?}"
+        );
+    }
+
+    #[test]
+    fn update_check_explicit_error_flashes() {
+        let mut app = app();
+        app.apply_update_check(true, Err("boom".into()));
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert!(
+            flash
+                .as_deref()
+                .is_some_and(|t| t.contains("update check failed")),
+            "explicit error must flash: {flash:?}"
+        );
+    }
+
+    #[test]
+    fn slash_has_update_command() {
+        assert!(
+            slash_options().iter().any(|option| option.0 == "update"),
+            "slash menu must offer /update"
+        );
+    }
+
+    #[test]
+    fn update_job_is_none_while_inflight() {
+        let mut app = app();
+        app.request_update_check();
+        assert_eq!(app.update_job(), Some(true));
+        assert_eq!(
+            app.update_job(),
+            None,
+            "in-flight check blocks a second spawn"
+        );
+        app.apply_update_check(true, Ok(None));
+        app.request_update_check();
+        assert_eq!(app.update_job(), Some(true), "check can be requested again");
+    }
+
+    #[test]
+    fn update_is_read_only_while_streaming() {
+        let mut app = app();
+        type_and_submit(&mut app, "hello");
+        assert!(app.busy);
+        app.flash = None;
+        app.execute_command(Command::Update);
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert!(
+            flash
+                .as_deref()
+                .is_some_and(|t| !t.contains("not available while streaming")),
+            "/update must work while streaming: {flash:?}"
+        );
     }
 }

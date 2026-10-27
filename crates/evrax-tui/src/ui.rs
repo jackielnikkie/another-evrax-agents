@@ -2555,7 +2555,8 @@ mod tests {
             text.contains("Switch to plan mode"),
             "palette list missing:\n{text}"
         );
-        assert!(text.contains("Quit evrax"), "palette list missing:\n{text}");
+        // The list windows to DIALOG_PAGE rows; the last command renders once
+        // the query narrows the list (checked below).
         for c in "quit".chars() {
             app.palette_type(c);
         }

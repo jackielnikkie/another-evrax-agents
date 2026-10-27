@@ -8,6 +8,7 @@ mod retry;
 pub mod sse;
 pub mod subagent;
 pub mod tools;
+pub mod update;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

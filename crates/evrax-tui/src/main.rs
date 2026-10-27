@@ -315,6 +315,10 @@ async fn run(
         chat_backend(loaded.config.clone(), store.clone(), loaded.mock);
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let (fetch_tx, mut fetch_rx) = mpsc::channel::<FetchResult>(8);
+    let (update_tx, mut update_rx) = mpsc::channel::<(
+        bool,
+        Result<Option<evrax_agent::update::UpdateCheck>, String>,
+    )>(4);
     let mut turn_task: Option<JoinHandle<()>> = None;
     let mut app = App::new();
     app.attach_config(&loaded);
@@ -335,6 +339,8 @@ async fn run(
     if let Some(note) = backend_note {
         app.set_flash(note);
     }
+    // One silent probe at startup: only a newer release breaks the silence.
+    app.request_startup_update_check();
     let mut subagent_link = subagent_id.and_then(|id| {
         let mut link = subagent_link::Link::load(&id)?;
         app.session_id = id.clone();
@@ -362,6 +368,19 @@ async fn run(
         while let Ok((request_id, result)) = fetch_rx.try_recv() {
             app.wizard_models_ready(request_id, result.clone());
             app.model_ready(request_id, result);
+            needs_draw = true;
+        }
+        // An explicit `/update` or the startup probe: spawn at most one check.
+        if let Some(explicit) = app.update_job() {
+            let tx = update_tx.clone();
+            let current = env!("CARGO_PKG_VERSION");
+            tokio::spawn(async move {
+                let result = evrax_agent::update::check_update(current).await;
+                let _ = tx.send((explicit, result)).await;
+            });
+        }
+        while let Ok((explicit, result)) = update_rx.try_recv() {
+            app.apply_update_check(explicit, result);
             needs_draw = true;
         }
         if let Some(cfg) = app.take_reload_config() {
