@@ -133,9 +133,10 @@ Keyboard:
 | `Ctrl+C` | quit |
 
 Slash commands: `/new`, `/sessions`, `/mode`, `/copy`, `/theme`, `/model`,
-`/remote`, `/rename <title>`, `/exit`. `/model` lists saved providers, fetches
-their models on demand, and switches the active provider/model without a
-restart.
+`/remote`, `/rename <title>`, `/update`, `/exit`. `/model` lists saved
+providers, fetches their models on demand, and switches the active
+provider/model without a restart. `/update` checks GitHub for a newer release
+(evrax also checks once at startup).
 
 ## Sessions
 

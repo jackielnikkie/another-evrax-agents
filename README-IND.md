@@ -130,9 +130,10 @@ Keyboard:
 | `Ctrl+C` | keluar |
 
 Slash command: `/new`, `/sessions`, `/mode`, `/copy`, `/theme`, `/model`,
-`/remote`, `/rename <judul>`, `/exit`. `/model` menampilkan provider tersimpan,
-mengambil daftar model saat dibutuhkan, dan mengganti provider/model aktif tanpa
-restart.
+`/remote`, `/rename <judul>`, `/update`, `/exit`. `/model` menampilkan provider
+tersimpan, mengambil daftar model saat dibutuhkan, dan mengganti provider/model
+aktif tanpa restart. `/update` memeriksa rilis evrax terbaru di GitHub (evrax
+juga memeriksa sekali saat startup).
 
 ## Sesi
 

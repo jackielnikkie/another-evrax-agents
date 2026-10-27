@@ -22,6 +22,9 @@ All notable changes to evrax are documented here. The format follows
   the TUI is busy, and refuses new prompts at the cap with `429`.
 - Independent login tokens: each device logs in separately and `/logout` only
   invalidates the presented token.
+- `/update` slash command that checks GitHub for a newer evrax release.
+- Startup update check (notification only: a passive flash when a newer
+  release exists, silent otherwise).
 
 ### Changed
 
