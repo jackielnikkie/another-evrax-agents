@@ -105,6 +105,11 @@ function Resolve-LatestVersion {
     return ""
 }
 
+# Everything below runs inside one try/catch so a failure prints a message and
+# the script ends normally. Combined with `throw` in Fail (never `exit`), this
+# keeps the caller's PowerShell window open whether the script is run from a
+# console or piped through `irm ... | iex`.
+try {
 if (-not $InstallDir) {
     if ($System) {
         $InstallDir = Join-Path $env:ProgramFiles 'evrax\bin'
@@ -112,7 +117,6 @@ if (-not $InstallDir) {
         $InstallDir = Join-Path $env:USERPROFILE '.evrax\bin'
     }
 }
-
 if ($Uninstall) {
     Assert-NotRunning
     $exe = Join-Path $InstallDir $ExeName
@@ -192,4 +196,9 @@ try {
     Write-Host 'Done. Open a new terminal and run: evrax --version'
 } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+} catch {
+    Write-Host ''
+    Write-Host "evrax install did not complete: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host 'Fix the problem above and run the installer again.'
 }
