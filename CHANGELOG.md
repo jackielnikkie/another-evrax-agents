@@ -6,6 +6,35 @@ All notable changes to evrax are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-10-28
+
+### Added
+
+- `web_search` tool: searches the web (DuckDuckGo HTML endpoint) and returns the
+  top results as title, URL, and snippet. No browser or API key required.
+- `skills_list` / `skill_view` tools surface the embedded skills, so the agent
+  can pull in specialized playbooks (search, debugging, TDD, and more) on demand.
+- The system prompt now carries an engineering brief (gather context before
+  editing, never invent symbols, batch independent lookups, fix root causes,
+  verify before finishing), a live workspace snapshot (branch, status, recent
+  commits, manifests, verify commands), and the project's `AGENTS.md` when
+  present.
+- Worker panes are only spawned by `/worker N`; the main agent acts as the
+  orchestrator through the `subagent` tool instead of an injected prompt.
+
+### Changed
+
+- The composer stays editable while a turn streams: a small spinner sits above
+  the input, typed text shows live, slash commands run immediately, and plain
+  text is queued.
+- `AGENTS.md` is loaded into the system prompt (capped) so project conventions
+  apply without repeating them each session.
+
+### Fixed
+
+- `/worker N` no longer starts a turn on its own or shows an internal
+  orchestrator prompt as a user message.
+
 ## [0.1.5] - 2026-10-28
 
 ### Added

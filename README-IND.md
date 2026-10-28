@@ -8,7 +8,8 @@ satu binary kecil, hemat memori, backend LLM asli, plus web UI yang bisa dibuka 
 ## Fitur
 
 - **Agent loop dengan tools** — `read`, `list`, `grep`, `write`, `edit`, `shell`,
-  `web_fetch`, `todo`, `git`, `ast_grep`, `evrax-graph`, `subagent`, `memory`.
+  `web_fetch`, `web_search`, `todo`, `memory`, `git`, `ast_grep`, `evrax-graph`,
+  `subagent`, `skills_list`, `skill_view`.
 - **Multi-provider** — simpan banyak endpoint (openai-compatible atau Anthropic
   native), daftar model diambil otomatis, ganti provider/model lewat `/model`.
 - **Mode Plan / Build** — Plan membuat semua tool jadi read-only.

@@ -11,7 +11,8 @@ Indonesian: [README-IND.md](README-IND.md)
 ## Features
 
 - **Agent loop with tools** — `read`, `list`, `grep`, `write`, `edit`, `shell`,
-  `web_fetch`, `todo`, `git`, `ast_grep`, `evrax-graph`, `subagent`, `memory`.
+  `web_fetch`, `web_search`, `todo`, `memory`, `git`, `ast_grep`, `evrax-graph`,
+  `subagent`, `skills_list`, `skill_view`.
 - **Multi-provider** — save many endpoints (openai-compatible or native
   Anthropic), fetch their models automatically, and switch with `/model`.
 - **Plan / Build modes** — Plan mode makes every tool read-only.
