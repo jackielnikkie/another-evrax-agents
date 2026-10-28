@@ -2,8 +2,12 @@
 
 use std::time::Duration;
 
-const LATEST_RELEASE_URL: &str =
+const API_RELEASE_URL: &str =
     "https://api.github.com/repos/jackielnikkie/another-evrax-agents/releases/latest";
+/// The web endpoint redirects to `/releases/tag/<tag>`; unlike the API it has
+/// no unauthenticated rate limit, so it backs up the API path.
+const WEB_RELEASE_URL: &str =
+    "https://github.com/jackielnikkie/another-evrax-agents/releases/latest";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateCheck {
@@ -12,6 +16,10 @@ pub struct UpdateCheck {
 }
 
 /// Returns `Some` only when `latest` is strictly newer than `current`.
+///
+/// Tries the GitHub API first (gives the exact `html_url`), then falls back to
+/// the unauthenticated web redirect when the API is rate-limited or blocked
+/// (HTTP 403), which is common behind shared IPs.
 pub async fn check_update(current: &str) -> Result<Option<UpdateCheck>, String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -19,8 +27,23 @@ pub async fn check_update(current: &str) -> Result<Option<UpdateCheck>, String> 
         .no_proxy()
         .build()
         .map_err(|e| e.to_string())?;
+
+    let release = match fetch_api(&client).await {
+        Ok(release) => release,
+        Err(api_error) => fetch_web(&client)
+            .await
+            .map_err(|web_error| format!("{api_error}; fallback failed: {web_error}"))?,
+    };
+    if is_newer(&release.latest, current) {
+        Ok(Some(release))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn fetch_api(client: &reqwest::Client) -> Result<UpdateCheck, String> {
     let response = client
-        .get(LATEST_RELEASE_URL)
+        .get(API_RELEASE_URL)
         .header("User-Agent", "evrax")
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -34,12 +57,24 @@ pub async fn check_update(current: &str) -> Result<Option<UpdateCheck>, String> 
         ));
     }
     let body = response.text().await.map_err(|e| e.to_string())?;
-    let release = parse_release(&body)?;
-    if is_newer(&release.latest, current) {
-        Ok(Some(release))
-    } else {
-        Ok(None)
-    }
+    parse_release(&body)
+}
+
+/// Follows the web redirect manually so the tag can be read from the
+/// `Location` header without the API.
+async fn fetch_web(client: &reqwest::Client) -> Result<UpdateCheck, String> {
+    let response = client
+        .get(WEB_RELEASE_URL)
+        .header("User-Agent", "evrax")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "no release redirect".to_string())?;
+    parse_redirect_location(location)
 }
 
 /// Pure version comparison: true only when `latest` is strictly newer.
@@ -79,6 +114,31 @@ fn parse_release(body: &str) -> Result<UpdateCheck, String> {
         return Err("unexpected release payload".to_string());
     }
     Ok(UpdateCheck { latest, url })
+}
+
+/// Extracts the tag from a `/releases/tag/<tag>` redirect target.
+fn parse_redirect_location(location: &str) -> Result<UpdateCheck, String> {
+    let marker = "/releases/tag/";
+    let index = location
+        .find(marker)
+        .ok_or_else(|| "unexpected release redirect".to_string())?;
+    let tag = location[index + marker.len()..]
+        .split(['?', '#', '/'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if tag.is_empty() {
+        return Err("unexpected release redirect".to_string());
+    }
+    let url = location
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(location)
+        .to_string();
+    Ok(UpdateCheck {
+        latest: tag.to_string(),
+        url,
+    })
 }
 
 #[cfg(test)]
@@ -127,6 +187,23 @@ mod tests {
             release.url,
             "https://github.com/jackielnikkie/another-evrax-agents/releases/tag/v0.1.5"
         );
+    }
+
+    #[test]
+    fn parse_redirect_location_reads_tag() {
+        let location = "https://github.com/jackielnikkie/another-evrax-agents/releases/tag/v0.1.4";
+        let release = parse_redirect_location(location).expect("valid redirect");
+        assert_eq!(release.latest, "v0.1.4");
+        assert_eq!(release.url, location);
+        // trailing query/hash stripped
+        let with_query =
+            parse_redirect_location("https://github.com/o/r/releases/tag/v9.9.9?foo=bar")
+                .expect("valid redirect with query");
+        assert_eq!(with_query.latest, "v9.9.9");
+        assert_eq!(with_query.url, "https://github.com/o/r/releases/tag/v9.9.9");
+        // no tag
+        assert!(parse_redirect_location("https://github.com/o/r/releases").is_err());
+        assert!(parse_redirect_location("https://example.com/").is_err());
     }
 
     #[test]
