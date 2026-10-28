@@ -6,6 +6,18 @@ All notable changes to evrax are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-10-28
+
+### Fixed
+
+- `HTTP 413 Payload Too Large`: a single large tool result (a big `read`,
+  `shell`, `web_fetch`, or search) is now capped before it is sent back to the
+  provider, and the whole request is trimmed (oldest history dropped first) to
+  stay under a body limit, so a long conversation or a heavy tool call no
+  longer trips the gateway's limit.
+- A `413` now reports a clear message (start a new session or keep tool output
+  smaller) instead of the raw status.
+
 ## [0.1.6] - 2026-10-28
 
 ### Added
