@@ -32,6 +32,13 @@ pub const DEFAULT_MODEL: &str = "bebas";
 pub const DEFAULT_MAX_ITERATIONS: usize = 500;
 const MAX_HISTORY_CHARS: usize = 100_000;
 const MAX_HISTORY_SESSIONS: usize = 24;
+/// Cap on a single tool result before it is sent back to the provider. Large
+/// `read`/`shell`/`web_fetch` output otherwise bloats one request until the
+/// gateway rejects it with HTTP 413.
+const MAX_TOOL_RESULT_CHARS: usize = 24_000;
+/// Cap on the whole request body (system + history + the running turn). Older
+/// history is dropped first so the newest context survives.
+const MAX_REQUEST_CHARS: usize = 200_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -730,6 +737,17 @@ impl Inner {
     }
 }
 
+/// Drops the oldest history messages until the whole request (system, history,
+/// and the running turn) fits under `MAX_REQUEST_CHARS`, keeping the running
+/// turn intact. The per-tool-result cap bounds the turn itself.
+fn trim_request(history: &mut Vec<Value>, committed: &[Value], system: &Value) {
+    let size = |messages: &[Value]| -> usize { messages.iter().map(message_chars).sum() };
+    let fixed = message_chars(system) + size(committed);
+    while !history.is_empty() && fixed + size(history) > MAX_REQUEST_CHARS {
+        history.remove(0);
+    }
+}
+
 fn message_chars(message: &Value) -> usize {
     let content = message.get("content").and_then(Value::as_str).unwrap_or("");
     let calls = message
@@ -999,6 +1017,10 @@ async fn run_turn(
 
         let mut messages = Vec::with_capacity(history.len() + committed.len() + 1);
         messages.push(system.clone());
+        // Drop the oldest history turns first so the newest context (and the
+        // running turn) always fits under the provider's body limit.
+        let mut history = history.clone();
+        trim_request(&mut history, &committed, &system);
         messages.extend(history.iter().cloned());
         messages.extend(committed.iter().cloned());
 
@@ -1101,6 +1123,15 @@ async fn run_turn(
             let mut result = outcome.result_text();
             if let Some(stub) = guard.observe(&call.name, &call.arguments, outcome.ok, &result) {
                 result = stub;
+            }
+            // Bound what goes back to the provider: a single huge tool output
+            // must not push the request past the gateway's body limit (413).
+            if result.chars().count() > MAX_TOOL_RESULT_CHARS {
+                let omitted = result.chars().count() - MAX_TOOL_RESULT_CHARS;
+                result = format!(
+                    "{}\n[... truncated {omitted} chars; use offset/limit or a narrower query ...]",
+                    trunc(&result, MAX_TOOL_RESULT_CHARS)
+                );
             }
             if let Some(notice) = guard.take_notice() {
                 emit(&tx, AgentEvent::Notice { message: notice }).await?;
@@ -1302,6 +1333,9 @@ fn provider_error(
         }
         403 => {
             "provider denied this key for that model - check key/model permissions in the provider dashboard"
+        }
+        413 => {
+            "request too large for the provider - the conversation or a tool output exceeded its body limit; start a new session (/new) or keep tool output smaller"
         }
         _ => "",
     };
@@ -2623,6 +2657,39 @@ mod tests {
         let replay = inner.replay("s");
         assert_eq!(replay.len(), 1, "only the newest turn survives");
         assert!(replay[0]["content"].as_str().unwrap().contains("q2"));
+    }
+
+    #[test]
+    fn trim_request_drops_oldest_history_first() {
+        let system = json!({"role":"system","content":"sys"});
+        let committed = vec![json!({"role":"user","content":"now"})];
+        let big = "x".repeat(MAX_REQUEST_CHARS / 2);
+        let mut history = vec![
+            json!({"role":"user","content":format!("old {big}")}),
+            json!({"role":"user","content":format!("mid {big}")}),
+        ];
+        trim_request(&mut history, &committed, &system);
+        assert!(history.len() <= 1, "oldest history must be dropped");
+        if let Some(last) = history.last() {
+            assert!(
+                last["content"].as_str().unwrap().contains("mid"),
+                "newest history kept"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_tool_result_is_truncated_for_the_provider() {
+        let big = "y".repeat(MAX_TOOL_RESULT_CHARS + 5000);
+        let text = big.clone();
+        assert!(text.chars().count() > MAX_TOOL_RESULT_CHARS);
+        let omitted = text.chars().count() - MAX_TOOL_RESULT_CHARS;
+        let capped = format!(
+            "{}\n[... truncated {omitted} chars; use offset/limit or a narrower query ...]",
+            trunc(&text, MAX_TOOL_RESULT_CHARS)
+        );
+        assert!(capped.chars().count() > MAX_TOOL_RESULT_CHARS);
+        assert!(capped.contains("truncated 5000 chars"));
     }
 
     #[test]
