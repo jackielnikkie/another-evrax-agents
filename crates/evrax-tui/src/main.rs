@@ -89,6 +89,12 @@ async fn main() -> Result<()> {
                 .trim()
                 .is_empty()
             && std::env::var_os("EVRAX_API_KEY").is_none());
+    // Worker mode: run the agent loop without touching the terminal at all.
+    // Checked from argv (not config) so a stale agent.json never sends an
+    // interactive run down this path, and vice versa.
+    if has_flag("--headless") {
+        return run_headless(loaded, store).await;
+    }
     let mut terminal = init_terminal().context("evrax needs an interactive terminal")?;
     let result = run(&mut terminal, loaded, store, resume, need_wizard).await;
     let restored = restore_terminal(&mut terminal);
@@ -206,7 +212,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn cli_info_flag() -> bool {
-    const HELP: &str = "USAGE:\n    evrax [OPTIONS]\n\nOPTIONS:\n    -c, --continue         resume the most recent session\n    -s, --session <spec>   resume by id, unique prefix, or title\n    -l, --list             list saved sessions and exit\n        --setup            open the provider setup wizard\n        --no-save          do not persist sessions\n        --mock             run with the built-in mock backend\n        --provider <name>  use a saved provider for this run\n        --model <name>     model id\n        --base-url <url>   openai-compatible base URL\n        --api-key <key>    API key (else agent.json / EVRAX_API_KEY)\n        --max-iterations <n>  tool rounds per turn (default 500)\n        --root <path>      workspace root\n    -V, --version          print version and exit\n    -h, --help             print this help and exit\n\nIn the TUI: /model switches provider or model.";
+    const HELP: &str = "USAGE:\n    evrax [OPTIONS]\n\nOPTIONS:\n    -c, --continue         resume the most recent session\n    -s, --session <spec>   resume by id, unique prefix, or title\n    -l, --list             list saved sessions and exit\n        --setup            open the provider setup wizard\n        --no-save          do not persist sessions\n        --mock             run with the built-in mock backend\n        --provider <name>  use a saved provider for this run\n        --model <name>     model id\n        --base-url <url>   openai-compatible base URL\n        --api-key <key>    API key (else agent.json / EVRAX_API_KEY)\n        --max-iterations <n>  tool rounds per turn (default 500)\n        --root <path>      workspace root\n        --headless             run the agent loop without the TUI (used by workers)\n        --subagent-id <id>     internal: run as a named worker\n    -V, --version          print version and exit\n    -h, --help             print this help and exit\n\nIn the TUI: /model switches provider or model.";
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -304,6 +310,133 @@ fn chat_backend(
     }
 }
 
+/// Headless worker: runs the agent loop with no terminal. Reads prompts from
+/// the worker inbox, forwards events to `events.jsonl`, and publishes heartbeat
+/// status. Exits on a stop request. A worker may only be spawned by the parent
+/// TUI (which passes `--subagent-id`), so a missing id or link is fatal.
+async fn run_headless(
+    loaded: evrax_agent::LoadedConfig,
+    store: Option<ProjectStore>,
+) -> Result<()> {
+    let id = arg_value("--subagent-id")
+        .ok_or_else(|| anyhow::anyhow!("--headless requires --subagent-id"))?;
+    let mut link =
+        subagent_link::Link::load(&id).ok_or_else(|| anyhow::anyhow!("subagent {id} not found"))?;
+
+    // `chat_backend` needs a store rooted at the worker's workspace; a worker is
+    // always launched with `--root`, so build one if the caller had none (mock).
+    let store = store.or_else(|| ProjectStore::open(&loaded.config.root).ok());
+    let (backend, _label, _note) = chat_backend(loaded.config.clone(), store.clone(), loaded.mock);
+
+    let mut app = App::new();
+    app.session_id = id.clone();
+    let name = link.name().to_string();
+    app.titles.insert(id.clone(), name);
+    app.manual_titles.insert(id.clone());
+    link.publish_final(&app, "idle");
+
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        ticker.tick().await;
+        if link.stop_requested() {
+            break;
+        }
+        let Some(prompt) = link.take_prompt() else {
+            link.publish(&app);
+            continue;
+        };
+        run_headless_turn(&mut app, &*backend, &id, prompt, &mut link).await;
+    }
+    link.publish_final(&app, "stopped");
+    Ok(())
+}
+
+/// Runs one worker turn to completion, streaming every event to the worker's
+/// JSONL transcript. Explicit approval requests are auto-rejected: a headless
+/// worker has no terminal to answer them, and anything inside its workspace was
+/// already authorized by the backend.
+async fn run_headless_turn(
+    app: &mut App,
+    backend: &dyn AgentBackend,
+    id: &str,
+    prompt: String,
+    link: &mut subagent_link::Link,
+) {
+    let Some(prompt) = app.submit_external_prompt(prompt) else {
+        return;
+    };
+    let session = app.session_id.clone();
+    let plan_mode = app.mode == AgentMode::Plan;
+    let (decision_tx, decision_rx) = mpsc::channel::<bool>(4);
+    let request = TurnRequest {
+        prompt,
+        session,
+        plan_mode,
+    };
+    link.publish(app);
+    let mut stream = backend.run_turn(request, decision_rx);
+    while let Some(event) = stream.next().await {
+        if let AgentEvent::ApprovalRequested { .. } = event {
+            let _ = decision_tx.try_send(false);
+        }
+        let _ = evrax_agent::subagent::append_event_json(id, &event_to_json(&event));
+        app.apply_event(event);
+    }
+    // A clean TurnFinished already cleared these; a Failed stream leaves the
+    // turn busy, so clear it here without the cancel flash/tool-error sweep.
+    app.busy = false;
+    app.turn_started = None;
+    link.publish_final(app, "idle");
+}
+
+/// Serializes an `AgentEvent` (not `Serialize` in `evrax-core`) into the shape
+/// the TUI's worker-pane transcript understands. Only the variants that matter
+/// for a readable pane are mapped; anything else is dropped.
+fn event_to_json(event: &AgentEvent) -> serde_json::Value {
+    use serde_json::json;
+    match event {
+        AgentEvent::ThinkingDelta { text } => json!({"type": "thinking", "text": text}),
+        AgentEvent::TextDelta { text } => json!({"type": "delta", "text": text}),
+        AgentEvent::ToolPreparing { name, bytes } => {
+            json!({"type": "tool_preparing", "name": name, "bytes": bytes})
+        }
+        AgentEvent::ToolStarted { name, summary } => {
+            json!({"type": "tool", "name": name, "summary": summary})
+        }
+        AgentEvent::ToolFinished { name, ok, detail } => {
+            json!({"type": "tool_done", "name": name, "ok": ok, "detail": detail})
+        }
+        AgentEvent::Notice { message } => json!({"type": "notice", "message": message}),
+        AgentEvent::Failed { message } => json!({"type": "error", "message": message}),
+        AgentEvent::TurnFinished => json!({"type": "turn_finished"}),
+        AgentEvent::TitleSuggested { session, title } => {
+            json!({"type": "title", "session": session, "title": title})
+        }
+        AgentEvent::Iteration { n, max } => json!({"type": "iteration", "n": n, "max": max}),
+        AgentEvent::Retrying {
+            attempt,
+            max,
+            delay_ms,
+            reason,
+        } => {
+            json!({"type": "retrying", "attempt": attempt, "max": max, "delay_ms": delay_ms, "reason": reason})
+        }
+        AgentEvent::ThinkingFinished { seconds } => {
+            json!({"type": "thinking_done", "seconds": seconds})
+        }
+        AgentEvent::ApprovalRequested { name, summary, .. } => {
+            json!({"type": "approval", "name": name, "summary": summary})
+        }
+        AgentEvent::Diff { path, lines } => {
+            let lines: Vec<serde_json::Value> = lines
+                .iter()
+                .map(|l| json!({"kind": l.kind, "text": l.text}))
+                .collect();
+            json!({"type": "diff", "path": path, "lines": lines})
+        }
+    }
+}
+
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     loaded: evrax_agent::LoadedConfig,
@@ -394,6 +527,18 @@ async fn run(
                     app.set_flash(note);
                 }
             }
+            needs_draw = true;
+        }
+        if let Some(n) = app.take_worker_spawn_request() {
+            spawn_workers(
+                &mut app,
+                n,
+                &loaded.config.root,
+                &*backend,
+                &event_tx,
+                &mut decision_tx,
+                &mut turn_task,
+            );
             needs_draw = true;
         }
         if needs_draw {
@@ -517,6 +662,7 @@ async fn run(
                 let mode_before = app.mode;
                 app.tick();
                 app.sync_remote_mode();
+                app.poll_workers();
                 drain_remote_prompts(&mut app, &*backend, &event_tx, &mut decision_tx, &mut turn_task);
                 drain_queued_prompt(&mut app, &*backend, &event_tx, &mut decision_tx, &mut turn_task);
                 drain_remote_approvals(&mut app, &mut decision_tx);
@@ -560,6 +706,7 @@ async fn run(
                     || app.flash.is_some()
                     || app.approval.is_some()
                     || app.mode != mode_before
+                    || app.has_workers()
                     || !app.pending_kitty.is_empty()
                     || (app.messages.is_empty() && app.tick.is_multiple_of(2));
             }
@@ -813,6 +960,63 @@ fn arg_value(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn has_flag(name: &str) -> bool {
+    std::env::args().skip(1).any(|arg| arg == name)
+}
+
+/// Launches the headless worker processes backing freshly created panes. Each
+/// placeholder pane (empty id) gets one process; once launched the main agent is
+/// handed an orchestrator prompt telling it to split the work. The prompt starts
+/// a turn (or queues behind a running one) exactly like an external subagent prompt.
+#[allow(clippy::too_many_arguments)]
+fn spawn_workers(
+    app: &mut App,
+    _n: usize,
+    root: &std::path::Path,
+    backend: &dyn AgentBackend,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    decision_tx: &mut Option<mpsc::Sender<bool>>,
+    turn_task: &mut Option<JoinHandle<()>>,
+) {
+    let mut spawned: Vec<String> = Vec::new();
+    let mut last_error: Option<String> = None;
+    for pane in app.workers.iter_mut() {
+        if !pane.id.is_empty() {
+            continue;
+        }
+        match evrax_agent::subagent::spawn_worker(&pane.name, None, root) {
+            Ok(state) => {
+                pane.id = state.id.clone();
+                pane.status = "starting".to_string();
+                spawned.push(state.id);
+            }
+            Err(error) => {
+                pane.status = "failed".to_string();
+                last_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        app.set_flash(format!("worker spawn failed: {error}"));
+    }
+    if spawned.is_empty() {
+        return;
+    }
+    let prompt = App::worker_orchestrator_prompt(spawned.len());
+    if let Some(prompt) = app.submit_external_prompt(prompt) {
+        let (session, plan_mode) = (app.session_id.clone(), app.mode == AgentMode::Plan);
+        start_turn(
+            backend,
+            event_tx,
+            decision_tx,
+            turn_task,
+            prompt,
+            session,
+            plan_mode,
+        );
+    }
 }
 
 fn drain_subagent_prompt(
@@ -1523,6 +1727,45 @@ mod cli_tests {
             &tx,
         );
         assert_eq!(app.model_dialog.as_ref().unwrap().filter, "x");
+    }
+
+    #[test]
+    fn event_to_json_maps_delta_and_tool() {
+        let delta = event_to_json(&AgentEvent::TextDelta {
+            text: "hi".to_string(),
+        });
+        assert_eq!(delta["type"], "delta");
+        assert_eq!(delta["text"], "hi");
+
+        let thinking = event_to_json(&AgentEvent::ThinkingDelta {
+            text: "hmm".to_string(),
+        });
+        assert_eq!(thinking["type"], "thinking");
+        assert_eq!(thinking["text"], "hmm");
+
+        let tool = event_to_json(&AgentEvent::ToolStarted {
+            name: "read".to_string(),
+            summary: "a.rs".to_string(),
+        });
+        assert_eq!(tool["type"], "tool");
+        assert_eq!(tool["name"], "read");
+
+        let done = event_to_json(&AgentEvent::ToolFinished {
+            name: "edit".to_string(),
+            ok: false,
+            detail: "boom".to_string(),
+        });
+        assert_eq!(done["type"], "tool_done");
+        assert_eq!(done["ok"], false);
+
+        let fin = event_to_json(&AgentEvent::TurnFinished);
+        assert_eq!(fin["type"], "turn_finished");
+
+        let fail = event_to_json(&AgentEvent::Failed {
+            message: "nope".to_string(),
+        });
+        assert_eq!(fail["type"], "error");
+        assert_eq!(fail["message"], "nope");
     }
 
     #[test]

@@ -93,6 +93,8 @@ pub struct AgentConfig {
     pub api_key: Option<String>,
     pub max_iterations: usize,
     pub root: PathBuf,
+    /// Headless worker mode (`--headless`): run without a terminal UI.
+    pub headless: bool,
 }
 
 impl Default for AgentConfig {
@@ -105,6 +107,7 @@ impl Default for AgentConfig {
             api_key: None,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            headless: false,
         }
     }
 }
@@ -119,6 +122,7 @@ impl AgentConfig {
             api_key: provider.clean_key().map(str::to_string),
             max_iterations,
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            headless: false,
         }
     }
 }
@@ -273,7 +277,7 @@ fn apply_env(config: &mut AgentConfig) {
     }
 }
 
-/// Parse `--mock`, `--provider <name>`, `--model <v>`, `--base-url <v>`,
+/// Parse `--mock`, `--headless`, `--provider <name>`, `--model <v>`, `--base-url <v>`,
 /// `--api-key <v>`, `--max-iterations <v>`, `--root <v>` on top of env/file
 /// config. Provider/URL/key/model overrides are runtime-only (never saved).
 pub fn config_from_args() -> LoadedConfig {
@@ -285,10 +289,12 @@ pub fn config_from_args() -> LoadedConfig {
     let mut max_iterations: Option<usize> = None;
     let mut root: Option<PathBuf> = None;
     let mut mock = false;
+    let mut headless = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--mock" => mock = true,
+            "--headless" => headless = true,
             "--provider" => provider = args.next(),
             "--model" => model = args.next(),
             "--base-url" | "--base_url" => base_url = args.next(),
@@ -301,6 +307,7 @@ pub fn config_from_args() -> LoadedConfig {
         }
     }
     loaded.mock |= mock;
+    loaded.config.headless |= headless;
     if let Some(name) = provider
         && let Some(index) = provider_index(&loaded.providers, &name)
     {

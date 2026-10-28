@@ -26,6 +26,9 @@ satu binary kecil, hemat memori, backend LLM asli, plus web UI yang bisa dibuka 
   simbol, callers/callees, impact, dead code, dan outline file.
 - **Retry dan guardrail** — retry otomatis untuk 429/5xx/error jaringan, deteksi
   loop, dan notifikasi jelas saat langkah satu turn habis.
+- **Worker agent paralel** — `/worker 2` men-spawn worker agent headless di pane
+  split di samping transcript utama, dan main agent bertindak sebagai orkestrator
+  yang memecah tugas ke worker-worker itu.
 
 ![Pemilih tema](assets/evrax2.png)
 
@@ -130,10 +133,11 @@ Keyboard:
 | `Ctrl+C` | keluar |
 
 Slash command: `/new`, `/sessions`, `/mode`, `/copy`, `/theme`, `/model`,
-`/remote`, `/rename <judul>`, `/update`, `/exit`. `/model` menampilkan provider
-tersimpan, mengambil daftar model saat dibutuhkan, dan mengganti provider/model
-aktif tanpa restart. `/update` memeriksa rilis evrax terbaru di GitHub (evrax
-juga memeriksa sekali saat startup).
+`/remote`, `/rename <judul>`, `/worker <n>`, `/update`, `/exit`. `/model`
+menampilkan provider tersimpan, mengambil daftar model saat dibutuhkan, dan
+mengganti provider/model aktif tanpa restart. `/worker 2` men-spawn dua worker
+agent di pane split; main agent memecah tugasnya. `/update` memeriksa rilis
+evrax terbaru di GitHub (evrax juga memeriksa sekali saat startup).
 
 ## Sesi
 

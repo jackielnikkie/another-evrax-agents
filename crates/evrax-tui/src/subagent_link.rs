@@ -6,7 +6,7 @@ use crate::app::App;
 
 pub struct Link {
     state: subagent::State,
-    last_status: String,
+    last_status: subagent::WorkerStatus,
     last_reply: String,
 }
 
@@ -14,7 +14,7 @@ impl Link {
     pub fn load(id: &str) -> Option<Self> {
         let state = subagent::load(id)?;
         Some(Self {
-            last_status: state.status.clone(),
+            last_status: state.status,
             last_reply: state.last_reply.clone(),
             state,
         })
@@ -47,19 +47,19 @@ impl Link {
     fn publish_as(&mut self, app: &App, status: &str) {
         let last_reply = app.last_assistant_text().unwrap_or_default();
         let pid = std::process::id();
-        if self.state.status == status
+        if self.state.status.as_str() == status
             && self.state.pid == pid
             && self.state.last_reply == last_reply
-            && self.last_status == status
+            && self.last_status.as_str() == status
             && self.last_reply == last_reply
         {
             return;
         }
         self.state.pid = pid;
-        self.state.status = status.to_string();
+        self.state.status = subagent::WorkerStatus::parse(status);
         self.state.updated_ms = subagent::now_ms();
         self.state.last_reply = last_reply.clone();
-        self.last_status = status.to_string();
+        self.last_status = subagent::WorkerStatus::parse(status);
         self.last_reply = last_reply;
         let _ = subagent::save(&self.state);
     }

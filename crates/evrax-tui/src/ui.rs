@@ -21,6 +21,8 @@ use crate::theme::current;
 const SIDEBAR_WIDTH: u16 = 42;
 const CONTENT_PREFERRED_WIDTH: u16 = 64;
 const SIDEBAR_MIN_TOTAL_WIDTH: u16 = SIDEBAR_WIDTH + CONTENT_PREFERRED_WIDTH;
+const PANE_WIDTH: u16 = 44;
+const WORKER_MIN_TOTAL_WIDTH: u16 = 90;
 const APPROVAL_PANEL_HEIGHT: u16 = 4;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -622,6 +624,40 @@ fn header(frame: &mut Frame, area: Rect) {
 }
 
 fn body(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
+    if app.has_workers() {
+        // Worker panes take priority over the sessions sidebar. Below
+        // WORKER_MIN_TOTAL_WIDTH the panes are dropped for the hint line
+        // instead of squeezing both columns into an unreadable strip.
+        if area.width >= WORKER_MIN_TOTAL_WIDTH {
+            let columns = Layout::horizontal([Constraint::Min(0), Constraint::Length(PANE_WIDTH)])
+                .split(area);
+            let messages_rect = chat(frame, columns[0], app);
+            worker_panes(frame, columns[1], app);
+            return messages_rect;
+        }
+        let rect = chat(frame, area, app);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("workers: ", Style::default().fg(current().muted)),
+                Span::styled(
+                    app.workers.len().to_string(),
+                    Style::default().fg(current().accent),
+                ),
+                Span::styled(
+                    " (resize to see panes)",
+                    Style::default().fg(current().muted),
+                ),
+            ])),
+            Rect {
+                x: area.x,
+                y: area.bottom().saturating_sub(1),
+                width: area.width,
+                height: 1,
+            },
+        );
+        return rect;
+    }
+
     let columns = if sidebar_visible(app, area.width) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(SIDEBAR_WIDTH)]).split(area)
     } else {
@@ -633,6 +669,89 @@ fn body(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
         sidebar(frame, columns[1], app);
     }
     messages_rect
+}
+
+/// Border color for a worker pane, keyed by the state-file status string.
+fn worker_border_style(status: &str) -> Style {
+    match status {
+        "busy" | "running" => Style::default().fg(current().accent),
+        "failed" | "error" => Style::default().fg(current().error),
+        "idle" => Style::default().fg(current().border),
+        _ => Style::default().fg(current().muted),
+    }
+}
+
+/// Render the right-hand worker column: one bordered pane per worker, split
+/// vertically. `app.workers` is borrowed mutably for each pane's own cache, so
+/// the copy fields are snapshotted first to keep the borrow disjoint.
+fn worker_panes(frame: &mut Frame, area: Rect, app: &mut App) {
+    let n = app.workers.len();
+    if n == 0 || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let tick = app.tick;
+    let rev = app.content_rev;
+    let rows = Layout::vertical(vec![Constraint::Ratio(1, n as u32); n]).split(area);
+
+    for (pane, rect) in app.workers.iter_mut().zip(rows.iter()) {
+        let border = worker_border_style(&pane.status);
+        let block = WidgetBlock::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(border)
+            .title(Span::styled(
+                format!(" {} · {} ", pane.name, pane.status),
+                Style::default().fg(current().muted),
+            ))
+            .padding(Padding::horizontal(1));
+        let inner = block.inner(*rect);
+        frame.render_widget(block, *rect);
+        if inner.width == 0 || inner.height == 0 {
+            continue;
+        }
+
+        let lines = if pane.transcript.is_empty() {
+            let text = if pane.last_reply.is_empty() {
+                "(waiting…)".to_string()
+            } else {
+                truncate_to_width(&pane.last_reply.replace('\n', " "), inner.width as usize)
+            };
+            vec![Line::from(Span::styled(
+                text,
+                Style::default().fg(current().muted),
+            ))]
+        } else {
+            let all = pane.cache.sync(
+                &pane.transcript,
+                tick,
+                rev,
+                inner.width,
+                crate::theme::index(),
+            );
+            let start = all.len().saturating_sub(inner.height as usize);
+            all[start..].to_vec()
+        };
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+/// Clamp a single-line string to `width` columns, appending an ellipsis when cut.
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    let mut out = String::new();
+    for ch in text.chars() {
+        if out.width() + ch.width().unwrap_or(0) > keep {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
 }
 
 fn chat(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
@@ -3421,5 +3540,48 @@ mod tests {
         let text = render_text_with(&mut app, 100, 30);
         assert!(text.contains("Nimbus Go"), "{text}");
         assert!(text.contains("Muse Spark"), "{text}");
+    }
+
+    fn worker_pane(id: &str, name: &str, reply: &str) -> crate::app::WorkerPane {
+        crate::app::WorkerPane {
+            id: id.to_string(),
+            name: name.to_string(),
+            status: "idle".to_string(),
+            pid: 0,
+            transcript: vec![ChatEntry::Assistant(reply.to_string())],
+            last_reply: String::new(),
+            cache: TranscriptCache::default(),
+        }
+    }
+
+    #[test]
+    fn worker_pane_renders_border_and_name() {
+        let mut app = App::new();
+        app.messages.push(ChatEntry::User("hi".to_string()));
+        app.workers.push(worker_pane("sub-1", "worker 1", "hello"));
+        let text = render_text_with(&mut app, 120, 40);
+        assert!(text.contains("worker 1"), "pane name missing:\n{text}");
+        assert!(text.contains("hello"), "pane body missing:\n{text}");
+    }
+
+    #[test]
+    fn two_workers_split_the_pane_column() {
+        let mut app = App::new();
+        app.messages.push(ChatEntry::User("hi".to_string()));
+        app.workers.push(worker_pane("sub-1", "worker 1", "one"));
+        app.workers.push(worker_pane("sub-2", "worker 2", "two"));
+        let text = render_text_with(&mut app, 120, 40);
+        assert!(text.contains("worker 1"), "first pane missing:\n{text}");
+        assert!(text.contains("worker 2"), "second pane missing:\n{text}");
+    }
+
+    #[test]
+    fn workers_hidden_in_narrow_terminal() {
+        let mut app = App::new();
+        app.messages.push(ChatEntry::User("hi".to_string()));
+        app.workers.push(worker_pane("sub-1", "worker 1", "hello"));
+        let text = render_text_with(&mut app, 80, 30);
+        assert!(text.contains("hi"), "main transcript lost:\n{text}");
+        assert!(text.contains("workers: 1"), "hint missing:\n{text}");
     }
 }

@@ -110,6 +110,12 @@ pub struct App {
     title_pending: std::collections::HashSet<String>,
     /// Queued LLM title job picked up by the event loop (session, prompt, reply).
     title_job: Option<(String, String, String)>,
+    /// Worker panes rendered alongside the main transcript (`/worker N`).
+    pub workers: Vec<WorkerPane>,
+    /// Highest worker ordinal handed out (for "worker N" naming).
+    worker_seq: usize,
+    /// Pending headless-spawn count consumed by the event loop (`/worker N`).
+    worker_spawn_request: Option<usize>,
     /// True when the last requested update check should always report its result.
     update_explicit: bool,
     /// True while an update check is in flight (blocks a second spawn).
@@ -325,6 +331,7 @@ pub enum Command {
     Remote,
     Rename,
     Update,
+    Worker,
     Quit,
 }
 
@@ -395,6 +402,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         command: Command::Update,
     },
     SlashCommand {
+        name: "worker",
+        aliases: &["spawn"],
+        description: "spawn worker agents for parallel work",
+        command: Command::Worker,
+    },
+    SlashCommand {
         name: "exit",
         aliases: &["quit", "q"],
         description: "quit evrax",
@@ -432,6 +445,9 @@ pub const REMOTE_MIN_PASSWORD: usize = 8;
 
 /// Prompts allowed to wait while a turn streams (newest beyond this are dropped).
 pub const MAX_QUEUED_PROMPTS: usize = 8;
+
+/// Cap for simultaneous worker panes; beyond this they open as tabs.
+pub const MAX_WORKERS: usize = 3;
 
 /// Diff lines rendered before the "+N more" trailer while the view is quiet.
 pub const DIFF_PREVIEW_LINES: usize = 40;
@@ -528,6 +544,20 @@ pub enum ChatEntry {
     Diff { path: String, lines: Vec<DiffLine> },
 }
 
+/// One headless worker agent rendered in a pane beside the main transcript.
+/// The process itself is spawned by the event loop (`worker_spawn_request`);
+/// this struct is only the view state, refreshed from the worker's state file
+/// and `events.jsonl` on every tick.
+pub struct WorkerPane {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub pid: u32,
+    pub transcript: Vec<ChatEntry>,
+    pub last_reply: String,
+    pub cache: crate::ui::TranscriptCache,
+}
+
 pub struct Attachment {
     pub id: u32,
     pub path: String,
@@ -535,7 +565,6 @@ pub struct Attachment {
     pub width: u32,
     pub height: u32,
 }
-
 /// Stable per-session id counter for kitty graphics placement.
 static NEXT_ATTACHMENT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
@@ -975,6 +1004,9 @@ impl App {
             manual_titles: std::collections::HashSet::new(),
             title_pending: std::collections::HashSet::new(),
             title_job: None,
+            workers: Vec::new(),
+            worker_seq: 0,
+            worker_spawn_request: None,
             update_explicit: false,
             update_inflight: false,
             transcript: crate::ui::TranscriptCache::default(),
@@ -1944,6 +1976,7 @@ impl App {
     }
 
     pub fn quit(&mut self) {
+        self.clear_workers();
         self.save_current();
         self.should_quit = true;
     }
@@ -2043,6 +2076,7 @@ impl App {
             ("Provider and model".to_string(), Command::Model),
             ("Remote web".to_string(), Command::Remote),
             ("Check for updates".to_string(), Command::Update),
+            ("Spawn workers".to_string(), Command::Worker),
             ("Quit evrax".to_string(), Command::Quit),
         ]
     }
@@ -2083,6 +2117,7 @@ impl App {
             Command::Remote => self.open_remote_dialog(),
             Command::Rename => self.rename_session_title(""),
             Command::Update => self.request_update_check(),
+            Command::Worker => self.spawn_workers(1),
             Command::Quit => self.quit(),
         }
     }
@@ -2210,6 +2245,7 @@ impl App {
         self.scroll_from_bottom = 0;
         self.selection.clear();
         self.transcript.invalidate();
+        self.clear_workers();
         self.set_flash("new session".to_string());
     }
 
@@ -3146,6 +3182,21 @@ impl App {
             self.rename_session_title(arg);
             return;
         }
+        if command == Command::Worker {
+            let n = if arg.is_empty() {
+                1
+            } else {
+                match arg.trim().parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        self.set_flash("usage: /worker <1-3>".to_string());
+                        return;
+                    }
+                }
+            };
+            self.spawn_workers(n);
+            return;
+        }
         if !arg.is_empty() {
             self.set_flash(format!("/{name} takes no arguments"));
             return;
@@ -3619,6 +3670,181 @@ impl App {
 
     pub fn page(&self) -> u16 {
         self.viewport_height.saturating_sub(2).max(1)
+    }
+
+    /// Spawns `n` worker panes (clamped to `MAX_WORKERS`) and nudges the main
+    /// agent to split the work. Called by `/worker N`. The real process launch
+    /// lives in the event loop: this only records the request + placeholder
+    /// panes so the TUI can lay out the grid immediately.
+    pub fn spawn_workers(&mut self, n: usize) {
+        if self.busy {
+            self.set_flash("not available while streaming".to_string());
+            return;
+        }
+        let n = n.clamp(1, MAX_WORKERS);
+        for _ in 0..n {
+            self.worker_seq += 1;
+            self.workers.push(WorkerPane {
+                id: String::new(),
+                name: format!("worker {}", self.worker_seq),
+                status: "starting".to_string(),
+                pid: 0,
+                transcript: Vec::new(),
+                last_reply: String::new(),
+                cache: crate::ui::TranscriptCache::default(),
+            });
+        }
+        self.worker_spawn_request = Some(n);
+        self.set_flash(format!(
+            "spawning {n} worker{}…",
+            if n == 1 { "" } else { "s" }
+        ));
+    }
+
+    /// Pending spawn count consumed by the event loop (lane D).
+    pub fn take_worker_spawn_request(&mut self) -> Option<usize> {
+        self.worker_spawn_request.take()
+    }
+
+    /// Reads worker state files + event JSONL into the panes (called each tick).
+    /// Read-only: never writes state or events.
+    pub fn poll_workers(&mut self) {
+        if self.workers.is_empty() {
+            return;
+        }
+        for pane in &mut self.workers {
+            if pane.id.is_empty() {
+                continue;
+            }
+            if let Some(state) = evrax_agent::subagent::load(&pane.id) {
+                pane.name = state.name;
+                pane.pid = state.pid;
+                pane.status = state.status.as_str().to_string();
+                pane.last_reply = state.last_reply;
+            }
+            pane.transcript = events_to_transcript(&pane.id);
+            pane.cache.invalidate();
+        }
+    }
+
+    /// True when at least one worker pane exists (lane C renders the grid).
+    pub fn has_workers(&self) -> bool {
+        !self.workers.is_empty()
+    }
+
+    /// Closes/clears all worker panes (e.g. on `/new` or quit).
+    pub fn clear_workers(&mut self) {
+        self.workers.clear();
+        self.worker_spawn_request = None;
+    }
+
+    /// Message handed to the main agent so it can split work across workers.
+    pub fn worker_orchestrator_prompt(n: usize) -> String {
+        format!(
+            "{n} worker agent(s) were just spawned headless; their ids are listed by \
+`subagent action=list`. Split the current task into {n} disjoint subtask(s) — one per \
+worker — and send each with `subagent action=send id=<id> prompt=<subtask>`. Do not send \
+a new prompt to a worker whose `subagent action=status` shows it busy or queued. Once the \
+workers report back, poll `subagent action=status` for each id and synthesize their results \
+into one answer."
+        )
+    }
+}
+
+/// Rebuilds a worker's transcript from its `events.jsonl`. `AgentEvent` is not
+/// `Serialize` in `evrax-core`, so the worker writes plain JSON values; this maps
+/// the shapes defensively and ignores anything unrecognized (a malformed or
+/// future line never crashes the TUI).
+// ponytail: minimal mapping, extend when worker panes need richer rendering.
+fn events_to_transcript(id: &str) -> Vec<ChatEntry> {
+    let path = evrax_agent::subagent::events_path(id);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ChatEntry> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(entry) = event_value_to_entry(&value, &mut out) {
+            out.push(entry);
+        }
+    }
+    out
+}
+
+/// Maps one JSONL event to a `ChatEntry`, coalescing text deltas into the
+/// trailing assistant entry. Returns `None` for events that leave the
+/// transcript unchanged.
+fn event_value_to_entry(
+    value: &serde_json::Value,
+    existing: &mut [ChatEntry],
+) -> Option<ChatEntry> {
+    let kind = value
+        .get("type")
+        .or_else(|| value.get("kind"))
+        .or_else(|| value.get("event"))
+        .and_then(serde_json::Value::as_str)?;
+    let text = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| value.get(*k).and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+    };
+    match kind {
+        "TextDelta" | "text_delta" | "delta" | "assistant" => {
+            let chunk = text(&["text", "delta", "content"])?;
+            if let Some(ChatEntry::Assistant(body)) = existing.last_mut() {
+                body.push_str(&chunk);
+                None
+            } else {
+                Some(ChatEntry::Assistant(chunk))
+            }
+        }
+        "ThinkingDelta" | "thinking_delta" | "thinking" => {
+            let chunk = text(&["text", "delta", "content"])?;
+            if let Some(ChatEntry::Thinking { summary, .. }) = existing.last_mut() {
+                summary.push_str(&chunk);
+                None
+            } else {
+                Some(ChatEntry::Thinking {
+                    summary: chunk,
+                    seconds: 0.0,
+                })
+            }
+        }
+        "user" | "User" | "prompt" => {
+            let chunk = text(&["text", "content", "prompt"])?;
+            Some(ChatEntry::User(chunk))
+        }
+        "ToolStarted" | "tool_started" | "tool" => {
+            let summary = text(&["summary", "name", "message"]).unwrap_or_else(|| kind.to_string());
+            Some(ChatEntry::Tool(ToolCall {
+                name: text(&["name"]).unwrap_or_else(|| "tool".to_string()),
+                summary,
+                status: ToolStatus::Done,
+                detail: String::new(),
+                call: 0,
+            }))
+        }
+        "notice" | "Notice" => {
+            let chunk = text(&["message", "text"]).unwrap_or_default();
+            Some(ChatEntry::Assistant(chunk))
+        }
+        "Failed" | "failed" | "error" => {
+            let message = text(&["message", "error"]).unwrap_or_default();
+            Some(ChatEntry::Tool(ToolCall {
+                name: "error".to_string(),
+                summary: message,
+                status: ToolStatus::Error,
+                detail: String::new(),
+                call: 0,
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -4130,7 +4356,7 @@ mod tests {
         let mut app = app();
         app.toggle_palette();
         assert!(app.palette.is_some());
-        assert_eq!(app.filtered_commands().len(), 9);
+        assert_eq!(app.filtered_commands().len(), 10);
         for c in "plan".chars() {
             app.palette_type(c);
         }
@@ -4149,12 +4375,17 @@ mod tests {
             app.palette_type(c);
         }
         let filtered = app.filtered_commands();
+        assert!(
+            filtered
+                .iter()
+                .any(|(label, _)| label == "Switch to plan mode"),
+            "'sw' should fuzzy-match Switch mode"
+        );
         assert_eq!(
             filtered.len(),
-            1,
-            "'sw' should fuzzy-match only Switch mode"
+            2,
+            "'sw' matches Switch mode and Spawn workers"
         );
-        assert_eq!(filtered[0].0, "Switch to plan mode");
     }
 
     #[test]
@@ -4162,13 +4393,13 @@ mod tests {
         let mut app = app();
         app.toggle_palette();
         app.palette_move(-1);
-        assert_eq!(app.palette.as_ref().unwrap().selected, 8);
+        assert_eq!(app.palette.as_ref().unwrap().selected, 9);
         app.palette_move(1);
         assert_eq!(app.palette.as_ref().unwrap().selected, 0);
         app.palette_type('z');
         assert_eq!(app.filtered_commands().len(), 0);
         app.palette_backspace();
-        assert_eq!(app.filtered_commands().len(), 9);
+        assert_eq!(app.filtered_commands().len(), 10);
     }
 
     #[test]
@@ -4731,7 +4962,7 @@ mod tests {
     fn palette_page_clamps_to_bounds() {
         let mut app = app();
         app.toggle_palette();
-        // 9 commands; page size 8 → down stays on the last row.
+        // 10 commands; page size 8 → down lands on row 8.
         app.palette_page(1, 8);
         assert_eq!(app.palette.as_ref().unwrap().selected, 8);
         // Up two pages of 8 â†’ still on the first row.
@@ -5459,5 +5690,67 @@ mod tests {
                 .is_some_and(|t| !t.contains("not available while streaming")),
             "/update must work while streaming: {flash:?}"
         );
+    }
+
+    #[test]
+    fn slash_has_worker_command() {
+        let names: Vec<&str> = SLASH_COMMANDS.iter().map(|entry| entry.name).collect();
+        assert!(names.contains(&"worker"));
+        let worker = SLASH_COMMANDS
+            .iter()
+            .find(|entry| entry.name == "worker")
+            .expect("worker entry");
+        assert!(worker.aliases.contains(&"spawn"));
+    }
+
+    #[test]
+    fn spawn_workers_clamps_and_names() {
+        let mut wide = app();
+        wide.spawn_workers(5);
+        assert_eq!(wide.workers.len(), MAX_WORKERS);
+        assert!(wide.workers.iter().all(|pane| pane.name.contains("worker")));
+        assert!(wide.workers.iter().all(|pane| pane.status == "starting"));
+
+        let mut fresh = app();
+        fresh.spawn_workers(0);
+        assert_eq!(fresh.workers.len(), 1);
+    }
+
+    #[test]
+    fn spawn_workers_requests_process_spawn() {
+        let mut app = app();
+        app.spawn_workers(2);
+        assert_eq!(app.take_worker_spawn_request(), Some(2));
+        assert_eq!(app.take_worker_spawn_request(), None);
+    }
+
+    #[test]
+    fn spawn_workers_blocked_while_streaming() {
+        let mut app = app();
+        type_and_submit(&mut app, "hello");
+        assert!(app.busy);
+        app.flash = None;
+        app.spawn_workers(1);
+        assert!(app.workers.is_empty(), "no panes while streaming");
+        assert_eq!(app.take_worker_spawn_request(), None);
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert_eq!(flash.as_deref(), Some("not available while streaming"));
+    }
+
+    #[test]
+    fn new_session_clears_workers() {
+        let mut app = app();
+        app.spawn_workers(2);
+        assert!(!app.workers.is_empty());
+        app.new_session();
+        assert!(app.workers.is_empty());
+    }
+
+    #[test]
+    fn worker_orchestrator_prompt_mentions_workers() {
+        let prompt = App::worker_orchestrator_prompt(3);
+        assert!(!prompt.is_empty());
+        assert!(prompt.contains("worker"));
+        assert!(prompt.contains("subagent"));
     }
 }

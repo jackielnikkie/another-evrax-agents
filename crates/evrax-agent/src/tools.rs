@@ -358,14 +358,15 @@ pub fn specs() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "subagent",
-                "description": "Launch and control another evrax agent in a separate terminal. start returns an id; use send/status/list/stop.",
+                "description": "Launch and control another evrax agent. start opens a terminal; spawn launches N headless workers drawn in the TUI panes. Both return ids; use send/status/list/stop.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["start", "send", "status", "list", "stop"] },
-                        "id": { "type": "string", "description": "Subagent id returned by start" },
-                        "name": { "type": "string", "description": "Display name for start" },
-                        "prompt": { "type": "string", "description": "Initial or follow-up prompt" }
+                        "action": { "type": "string", "enum": ["start", "spawn", "send", "status", "list", "stop"] },
+                        "id": { "type": "string", "description": "Subagent id returned by start/spawn" },
+                        "name": { "type": "string", "description": "Display name for start/spawn" },
+                        "prompt": { "type": "string", "description": "Initial or follow-up prompt" },
+                        "count": { "type": "integer", "description": "how many workers to spawn (1-3)" }
                     },
                     "required": ["action"]
                 }
@@ -466,9 +467,15 @@ pub fn summary(name: &str, args: &Value) -> String {
             }
             parts.join(" ")
         }
-        "subagent" => format!("{} {}", field("action"), field("name"))
-            .trim()
-            .to_string(),
+        "subagent" => {
+            let action = field("action");
+            if action == "spawn" {
+                let count = args.get("count").and_then(Value::as_i64).unwrap_or(1);
+                format!("spawn {count} worker(s)")
+            } else {
+                format!("{action} {}", field("name")).trim().to_string()
+            }
+        }
         _ => String::new(),
     }
 }
@@ -990,6 +997,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         (dir, Context::new(root))
+    }
+
+    #[test]
+    fn subagent_catalog_lists_spawn() {
+        let spec = specs()
+            .into_iter()
+            .find(|s| s["function"]["name"] == "subagent")
+            .expect("subagent spec");
+        let actions = &spec["function"]["parameters"]["properties"]["action"]["enum"];
+        assert!(actions.as_array().unwrap().iter().any(|a| a == "spawn"));
+        assert!(
+            spec["function"]["parameters"]["properties"]
+                .get("count")
+                .is_some()
+        );
+        let summary = summary("subagent", &json!({"action": "spawn", "count": 2}));
+        assert_eq!(summary, "spawn 2 worker(s)");
     }
 
     #[test]

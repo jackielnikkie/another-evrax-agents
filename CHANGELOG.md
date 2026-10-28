@@ -25,6 +25,12 @@ All notable changes to evrax are documented here. The format follows
 - `/update` slash command that checks GitHub for a newer evrax release.
 - Startup update check (notification only: a passive flash when a newer
   release exists, silent otherwise).
+- `/worker N` (alias `/spawn`) spawns up to three headless worker agents
+  rendered as panes beside the main transcript.
+- Pane grid rendering for one to three workers, with the main agent acting as
+  an orchestrator that splits work across them.
+- `subagent` tool gains an `action=spawn` with a `count` argument so the agent
+  can spawn workers when a task is heavy.
 
 ### Changed
 

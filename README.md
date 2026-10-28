@@ -29,6 +29,9 @@ Indonesian: [README-IND.md](README-IND.md)
   symbol search, callers/callees, impact, dead code, and file outlines.
 - **Retries and guardrails** — automatic retry for 429/5xx/network errors, loop
   detection, and a clear notice when a turn runs out of steps.
+- **Parallel worker agents** — `/worker 2` spawns headless worker agents in
+  split panes beside the main transcript, and the main agent acts as an
+  orchestrator that splits the task across them.
 
 ![Theme picker](assets/evrax2.png)
 
@@ -133,10 +136,11 @@ Keyboard:
 | `Ctrl+C` | quit |
 
 Slash commands: `/new`, `/sessions`, `/mode`, `/copy`, `/theme`, `/model`,
-`/remote`, `/rename <title>`, `/update`, `/exit`. `/model` lists saved
-providers, fetches their models on demand, and switches the active
-provider/model without a restart. `/update` checks GitHub for a newer release
-(evrax also checks once at startup).
+`/remote`, `/rename <title>`, `/worker <n>`, `/update`, `/exit`. `/model` lists
+saved providers, fetches their models on demand, and switches the active
+provider/model without a restart. `/worker 2` spawns two worker agents in split
+panes; the main agent splits the task. `/update` checks GitHub for a newer
+release (evrax also checks once at startup).
 
 ## Sessions
 
