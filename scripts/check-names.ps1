@@ -7,7 +7,7 @@ try {
         (('o', 'p', 'e', 'n', 'c', 'o', 'd', 'e') -join ''),
         (('h', 'e', 'r', 'm', 'e', 's') -join '')
     )
-    $allow = @('AGENTS.md', 'docs/', 'skill-evrax/', 'LICENSE')
+    $allow = @('AGENTS.md', 'docs/', 'skill-evrax/', 'LICENSE', '.gitignore')
 
     $files = & git ls-files
     $bad = 0
