@@ -9,7 +9,7 @@ mod welcome;
 mod window;
 
 use std::io::Stdout;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{
@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    setup_panic_hook();
+    install_panic_hook();
     if let Some(idx) = theme::load_saved() {
         theme::set_index(idx);
     }
@@ -264,7 +264,10 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     Ok(())
 }
 
-fn setup_panic_hook() {
+/// Panic hook: restore the terminal so the message is readable, then append a
+/// crash report to a log file outside the workspace. A panic may happen before
+/// or after terminal init, so every step is best-effort and never panics again.
+fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -274,8 +277,63 @@ fn setup_panic_hook() {
             DisableMouseCapture,
             LeaveAlternateScreen
         );
+        write_panic_log(info);
         original(info);
     }));
+}
+
+/// Appends path/duration/transcript-size to the panic log. Prefers
+/// `%APPDATA%\evrax`, then `$HOME/.config/evrax`, then the current directory.
+fn write_panic_log(info: &std::panic::PanicHookInfo<'_>) {
+    use std::io::Write as _;
+
+    let Some(path) = evrax_data_dir().map(|dir| dir.join("last-panic.log")) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let location = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let payload = info
+        .payload()
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic>".to_string());
+    let backtrace = std::env::var_os("RUST_BACKTRACE")
+        .is_some()
+        .then(|| std::backtrace::Backtrace::force_capture().to_string());
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "--- panic at {stamp} ---");
+        let _ = writeln!(file, "location: {location}");
+        let _ = writeln!(file, "message: {payload}");
+        if let Some(bt) = backtrace {
+            let _ = writeln!(file, "backtrace:\n{bt}");
+        }
+    }
+}
+
+/// Best-effort per-user data directory for logs. Prefers `%APPDATA%\evrax`,
+/// then `$HOME/.config/evrax`, then the current directory.
+fn evrax_data_dir() -> Option<std::path::PathBuf> {
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        return Some(std::path::PathBuf::from(appdata).join("evrax"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(std::path::PathBuf::from(home).join(".config").join("evrax"));
+    }
+    std::env::current_dir().ok()
 }
 
 /// Builds the active backend. `mock` (or a client build failure) yields the
@@ -489,6 +547,10 @@ async fn run(
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     let debug_window = std::env::var_os("EVRAX_DEBUG_MAXIMIZED").is_some();
     let mut debug_logged = false;
+    // Optional slow-frame watchdog: only active when the env flag is set, so the
+    // normal path pays nothing beyond one `Instant::now` per repaint.
+    let slow_enabled = std::env::var_os("EVRAX_DEBUG_SLOW").is_some();
+    let slow_threshold = Duration::from_secs(1);
 
     // Repaint only when something actually changed. The old unconditional 4 Hz
     // redraw rebuilt the whole transcript twice per frame and burned ~50% of a core.
@@ -496,6 +558,10 @@ async fn run(
     let mut max_scroll = 0u16;
     let mut last_size = terminal.size()?;
     let mut input_open = true;
+    // Drag-select floods events faster than a frame; coalesce to ~60 fps. The
+    // selection still updates every event, only the repaint is throttled.
+    let drag_frame = Duration::from_millis(16);
+    let mut last_drag_paint = Instant::now();
 
     while !app.should_quit {
         while let Ok((request_id, result)) = fetch_rx.try_recv() {
@@ -542,7 +608,14 @@ async fn run(
             needs_draw = true;
         }
         if needs_draw {
+            let draw_start = Instant::now();
             terminal.draw(|frame| ui::render(frame, &mut app))?;
+            if slow_enabled {
+                let elapsed = draw_start.elapsed();
+                if elapsed > slow_threshold {
+                    log_slow_frame(elapsed, app.messages.len());
+                }
+            }
             flush_kitty(terminal, &mut app);
             let size = terminal.size()?;
             last_size = size;
@@ -579,10 +652,10 @@ async fn run(
                             // fall back to path detection, then literal text.
                             if is_paste_like(&chars) {
                                 if !app.ingest_paste(&chars) {
-                                    app.input.insert_str(&chars);
+                                    app.paste_text_input(&chars);
                                 }
                             } else {
-                                app.input.insert_str(&chars);
+                                app.paste_text_input(&chars);
                             }
                             app.slash_sync();
                         }
@@ -618,7 +691,15 @@ async fn run(
                     // events and each repaint re-wraps the whole transcript.
                     let idle_motion =
                         matches!(other, Event::Mouse(ref m) if matches!(m.kind, MouseEventKind::Moved));
-                    needs_draw |= !idle_motion;
+                    // Left-drag selection streams events far faster than a frame.
+                    // Coalesce its repaint to ~60 fps; `selection.update` below
+                    // still runs on every event so the highlight stays accurate.
+                    let dragging = matches!(other, Event::Mouse(ref m) if matches!(m.kind, MouseEventKind::Drag(MouseButton::Left)));
+                    let drag_due = !dragging || last_drag_paint.elapsed() >= drag_frame;
+                    if dragging && drag_due {
+                        last_drag_paint = Instant::now();
+                    }
+                    needs_draw |= !idle_motion && drag_due;
                     handle_event(
                         &mut app,
                         other,
@@ -749,6 +830,34 @@ fn log_window_debug(state: Option<bool>) {
         .open(path)
     {
         let _ = writeln!(file, "state={state:?} {}", window::diagnostic());
+    }
+}
+
+/// Slow-frame watchdog sink (only called when `EVRAX_DEBUG_SLOW` is set): one
+/// line per repaint that took over a second, with the transcript size.
+fn log_slow_frame(elapsed: Duration, messages: usize) {
+    use std::io::Write as _;
+
+    let path = evrax_data_dir()
+        .map(|dir| dir.join("slow-frame.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("evrax-slow-frame.log"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(
+            file,
+            "t={stamp} frame_ms={} messages={messages}",
+            elapsed.as_millis()
+        );
     }
 }
 
@@ -1248,12 +1357,10 @@ fn handle_event(
             }
         }
         Event::Paste(text) => {
-            if is_paste_like(&text) && app.ingest_paste(&text) {
-                app.slash_sync();
-            } else {
-                app.paste_text(&text);
-                app.slash_sync();
+            if !is_paste_like(&text) || !app.ingest_paste(&text) {
+                app.paste_text_input(&text);
             }
+            app.slash_sync();
         }
         Event::Resize(_, _) => {}
         Event::Key(key) if key.kind == KeyEventKind::Press => {

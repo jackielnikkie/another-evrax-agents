@@ -79,6 +79,8 @@ pub struct App {
     remote_server: Option<evrax_remote::RemoteServer>,
     last_tunnel_key: Option<String>,
     pub attachments: Vec<Attachment>,
+    /// Large multi-line pastes parked as chips; merged into the prompt at submit.
+    pub pasted_text: Vec<PastedText>,
     pub preview: Option<usize>,
     pub pending_kitty: Vec<String>,
     pub chip_rects: Vec<Rect>,
@@ -556,6 +558,8 @@ pub struct WorkerPane {
     pub transcript: Vec<ChatEntry>,
     pub last_reply: String,
     pub cache: crate::ui::TranscriptCache,
+    /// Number of `events.jsonl` lines already folded into `transcript`.
+    pub events_seen: usize,
 }
 
 pub struct Attachment {
@@ -565,6 +569,15 @@ pub struct Attachment {
     pub width: u32,
     pub height: u32,
 }
+
+/// A large text paste parked as a chip instead of living in the line editor.
+/// Keeping multi-line pastes out of `LineEditor.chars` avoids re-wrapping the
+/// whole buffer on every repaint; the body is attached to the prompt at submit.
+pub struct PastedText {
+    pub chars: usize,
+    pub body: String,
+}
+
 /// Stable per-session id counter for kitty graphics placement.
 static NEXT_ATTACHMENT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
@@ -751,6 +764,11 @@ impl AgentMode {
 pub struct LineEditor {
     chars: Vec<char>,
     cursor: usize,
+    /// Bumped on every mutation so `visual_rows` can skip rebuilding.
+    rev: u64,
+    rows_cache: Vec<String>,
+    rows_rev: u64,
+    rows_width: usize,
 }
 
 impl LineEditor {
@@ -758,6 +776,10 @@ impl LineEditor {
         Self {
             chars: Vec::new(),
             cursor: 0,
+            rev: 0,
+            rows_cache: Vec::new(),
+            rows_rev: u64::MAX,
+            rows_width: 0,
         }
     }
 
@@ -777,20 +799,26 @@ impl LineEditor {
     pub fn insert_char(&mut self, c: char) {
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
+        self.rev = self.rev.wrapping_add(1);
     }
 
     pub fn insert_str(&mut self, text: &str) {
         let chars: Vec<char> = text.chars().collect();
         self.chars.splice(self.cursor..self.cursor, chars);
         self.cursor += text.chars().count();
+        self.rev = self.rev.wrapping_add(1);
     }
 
     pub fn insert_newline(&mut self) {
         self.insert_char('\n');
     }
 
-    pub fn visual_rows(&self, width: usize) -> Vec<String> {
+    /// Rebuilds the wrapped rows only when the buffer or the width changed.
+    fn ensure_rows(&mut self, width: usize) {
         let width = width.max(1);
+        if self.rows_rev == self.rev && self.rows_width == width {
+            return;
+        }
         let text = self.text();
         let mut rows: Vec<String> = Vec::new();
         for line in text.split('\n') {
@@ -809,7 +837,15 @@ impl LineEditor {
         if rows.is_empty() {
             rows.push(String::new());
         }
-        rows
+        self.rows_cache = rows;
+        self.rows_rev = self.rev;
+        self.rows_width = width;
+    }
+
+    /// Wrapped rows, cached across repaints (only rebuilt when `rev`/width change).
+    pub fn visual_rows(&mut self, width: usize) -> &[String] {
+        self.ensure_rows(width);
+        &self.rows_cache
     }
 
     pub fn cursor_visual(&self, width: usize) -> (usize, usize) {
@@ -859,12 +895,14 @@ impl LineEditor {
         if self.cursor > 0 {
             self.cursor -= 1;
             self.chars.remove(self.cursor);
+            self.rev = self.rev.wrapping_add(1);
         }
     }
 
     pub fn delete(&mut self) {
         if self.cursor < self.chars.len() {
             self.chars.remove(self.cursor);
+            self.rev = self.rev.wrapping_add(1);
         }
     }
 
@@ -922,6 +960,7 @@ impl LineEditor {
         let text = self.text();
         self.chars.clear();
         self.cursor = 0;
+        self.rev = self.rev.wrapping_add(1);
         text
     }
 }
@@ -984,6 +1023,7 @@ impl App {
             remote_server: None,
             last_tunnel_key: None,
             attachments: Vec::new(),
+            pasted_text: Vec::new(),
             preview: None,
             pending_kitty: Vec::new(),
             chip_rects: Vec::new(),
@@ -1691,6 +1731,7 @@ impl App {
         }
         self.input.take();
         self.attachments.clear();
+        self.pasted_text.clear();
         self.asst_open = false;
         self.busy = false;
         self.turn_started = None;
@@ -2238,6 +2279,8 @@ impl App {
             self.sessions.insert(0, old);
         }
         self.input.take();
+        self.attachments.clear();
+        self.pasted_text.clear();
         self.asst_open = false;
         self.busy = false;
         self.turn_started = None;
@@ -3090,7 +3133,7 @@ impl App {
 
     pub fn submit_prompt(&mut self) -> Option<String> {
         let prompt = self.input.text().trim().to_string();
-        if prompt.is_empty() && self.attachments.is_empty() {
+        if prompt.is_empty() && self.attachments.is_empty() && self.pasted_text.is_empty() {
             return None;
         }
         if prompt.starts_with('/') && self.attachments.is_empty() {
@@ -3140,6 +3183,7 @@ impl App {
     /// Runs a prompt as a new turn: transcript, title placeholder, busy flag
     /// and the remote echo are handled here for every entry path.
     fn begin_turn(&mut self, prompt: String, echo_user: bool) -> Option<String> {
+        let prompt = self.merge_pasted_text(prompt);
         self.push_entry(ChatEntry::User(prompt.clone()));
         self.save_current();
         self.ensure_placeholder_title(&prompt);
@@ -3161,6 +3205,23 @@ impl App {
             self.emit_remote(evrax_remote::RemoteEvent::TurnStart { turn });
         }
         Some(prompt)
+    }
+
+    /// Appends each parked paste to the prompt (with a `[pasted N chars]`
+    /// marker so the transcript shows where the block came from) and clears
+    /// the chips. Returns the prompt unchanged when nothing was pasted.
+    fn merge_pasted_text(&mut self, prompt: String) -> String {
+        if self.pasted_text.is_empty() {
+            return prompt;
+        }
+        let mut merged = prompt;
+        for pasted in self.pasted_text.drain(..) {
+            if !merged.is_empty() {
+                merged.push_str("\n\n");
+            }
+            merged.push_str(&format!("[pasted {} chars]\n{}", pasted.chars, pasted.body));
+        }
+        merged
     }
 
     /// Runs a `/name [arg]` line typed into the composer (the slash menu only
@@ -3231,13 +3292,23 @@ impl App {
         self.begin_turn(prompt, echo_user)
     }
 
-    pub fn paste_text(&mut self, text: &str) {
-        let cleaned: Vec<String> = text
-            .split('\n')
-            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect();
-        self.input
-            .insert_str(cleaned.join("\n").trim_end_matches('\n'));
+    /// Routes a paste into the composer. Pastes longer than 10 lines become a
+    /// chip (`pasted_text`) so the line editor never re-wraps a huge buffer on
+    /// every repaint; returns true when handled as a chip. Short pastes go
+    /// straight into the editor.
+    pub fn paste_text_input(&mut self, text: &str) -> bool {
+        if text.lines().count() > 10 {
+            let chars = text.chars().count();
+            self.pasted_text.push(PastedText {
+                chars,
+                body: text.to_string(),
+            });
+            self.set_flash(format!("pasted {chars} chars"));
+            true
+        } else {
+            self.input.insert_str(text);
+            false
+        }
     }
 
     pub fn open_preview(&mut self, index: usize) {
@@ -3282,7 +3353,7 @@ impl App {
         false
     }
 
-    pub fn composer_height(&self, width: usize) -> u16 {
+    pub fn composer_height(&mut self, width: usize) -> u16 {
         let chips = self.attachments.len().min(7) as u16;
         let text_rows = self.input.visual_rows(width).len().clamp(1, 7) as u16;
         (chips + text_rows).clamp(1, 9) + 2
@@ -3692,6 +3763,7 @@ impl App {
                 transcript: Vec::new(),
                 last_reply: String::new(),
                 cache: crate::ui::TranscriptCache::default(),
+                events_seen: 0,
             });
         }
         self.worker_spawn_request = Some(n);
@@ -3707,7 +3779,9 @@ impl App {
     }
 
     /// Reads worker state files + event JSONL into the panes (called each tick).
-    /// Read-only: never writes state or events.
+    /// Read-only: never writes state or events. Only the new JSONL lines are
+    /// folded in (tracked by `WorkerPane.events_seen`), so an idle worker costs
+    /// no rebuild.
     pub fn poll_workers(&mut self) {
         if self.workers.is_empty() {
             return;
@@ -3722,8 +3796,9 @@ impl App {
                 pane.status = state.status.as_str().to_string();
                 pane.last_reply = state.last_reply;
             }
-            pane.transcript = events_to_transcript(&pane.id);
-            pane.cache.invalidate();
+            if append_new_events(pane) {
+                pane.cache.invalidate();
+            }
         }
     }
 
@@ -3751,18 +3826,20 @@ into one answer."
     }
 }
 
-/// Rebuilds a worker's transcript from its `events.jsonl`. `AgentEvent` is not
-/// `Serialize` in `evrax-core`, so the worker writes plain JSON values; this maps
-/// the shapes defensively and ignores anything unrecognized (a malformed or
-/// future line never crashes the TUI).
-// ponytail: minimal mapping, extend when worker panes need richer rendering.
-fn events_to_transcript(id: &str) -> Vec<ChatEntry> {
-    let path = evrax_agent::subagent::events_path(id);
+/// Folds only the JSONL lines past `pane.events_seen` into `pane.transcript`,
+/// mapping each new line with the same coalescing as a full rebuild. Returns
+/// true when at least one entry changed (so the caller invalidates its cache).
+fn append_new_events(pane: &mut WorkerPane) -> bool {
+    let path = evrax_agent::subagent::events_path(&pane.id);
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+        return false;
     };
-    let mut out: Vec<ChatEntry> = Vec::new();
-    for line in text.lines() {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= pane.events_seen {
+        return false;
+    }
+    let mut changed = false;
+    for &line in &lines[pane.events_seen..] {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -3770,16 +3847,23 @@ fn events_to_transcript(id: &str) -> Vec<ChatEntry> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if let Some(entry) = event_value_to_entry(&value, &mut out) {
-            out.push(entry);
+        // A new line either pushes an entry or coalesces into the trailing one;
+        // both change the rendered transcript, so invalidate either way.
+        if let Some(entry) = event_value_to_entry(&value, &mut pane.transcript) {
+            pane.transcript.push(entry);
         }
+        changed = true;
     }
-    out
+    pane.events_seen = lines.len();
+    changed
 }
 
 /// Maps one JSONL event to a `ChatEntry`, coalescing text deltas into the
 /// trailing assistant entry. Returns `None` for events that leave the
-/// transcript unchanged.
+/// transcript unchanged. `AgentEvent` is not `Serialize` in `evrax-core`, so the
+/// worker writes plain JSON values and this maps the shapes defensively (a
+/// malformed or future line never crashes the TUI).
+// ponytail: minimal mapping, extend when worker panes need richer rendering.
 fn event_value_to_entry(
     value: &serde_json::Value,
     existing: &mut [ChatEntry],
@@ -3855,6 +3939,11 @@ mod tests {
 
     fn app() -> App {
         App::new()
+    }
+
+    /// Wrapped rows joined with `|`, for compact literal assertions.
+    fn rows(ed: &mut LineEditor, width: usize) -> String {
+        ed.visual_rows(width).join("|")
     }
 
     fn type_and_submit(app: &mut App, text: &str) -> Option<String> {
@@ -4027,19 +4116,12 @@ mod tests {
     }
 
     #[test]
-    fn paste_preserves_newlines_and_collapses_spaces() {
-        let mut app = app();
-        app.paste_text("cargo\r\n  test   --all\r\n");
-        assert_eq!(app.input.text(), "cargo\ntest --all");
-    }
-
-    #[test]
     fn editor_supports_multiline_navigation() {
         let mut ed = LineEditor::new();
         ed.insert_str("first line");
         ed.insert_newline();
         ed.insert_str("second");
-        assert_eq!(ed.visual_rows(80), vec!["first line", "second"]);
+        assert_eq!(rows(&mut ed, 80), "first line|second");
         assert_eq!(ed.cursor_line_col(), (1, 6));
         ed.move_up();
         assert_eq!(ed.cursor_line_col(), (0, 6));
@@ -4094,11 +4176,69 @@ mod tests {
     fn visual_rows_wrap_and_track_cursor() {
         let mut ed = LineEditor::new();
         ed.insert_str("0123456789");
-        assert_eq!(ed.visual_rows(4), vec!["0123", "4567", "89"]);
+        assert_eq!(rows(&mut ed, 4), "0123|4567|89");
         ed.insert_str("\nxy");
-        assert_eq!(ed.visual_rows(4), vec!["0123", "4567", "89", "xy"]);
+        assert_eq!(rows(&mut ed, 4), "0123|4567|89|xy");
         ed.move_left();
         assert_eq!(ed.cursor_visual(4), (3, 1));
+    }
+
+    #[test]
+    fn visual_rows_cache_reuses_when_unchanged() {
+        let mut ed = LineEditor::new();
+        ed.insert_str("abc");
+        assert_eq!(rows(&mut ed, 2), "ab|c");
+        // Same width, no mutation: cache hit still returns the same rows.
+        assert_eq!(rows(&mut ed, 2), "ab|c");
+        // Mutation invalidates, and a new width re-wraps.
+        ed.insert_char('d');
+        assert_eq!(rows(&mut ed, 2), "ab|cd");
+        assert_eq!(rows(&mut ed, 1), "a|b|c|d");
+    }
+
+    #[test]
+    fn paste_over_ten_lines_becomes_chip() {
+        let mut app = app();
+        let big = "x\n".repeat(12);
+        assert!(app.paste_text_input(&big));
+        assert_eq!(app.pasted_text.len(), 1);
+        assert_eq!(app.pasted_text[0].chars, big.chars().count());
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn paste_short_goes_to_input() {
+        let mut app = app();
+        assert!(!app.paste_text_input("hello"));
+        assert_eq!(app.input.text(), "hello");
+        assert!(app.pasted_text.is_empty());
+    }
+
+    #[test]
+    fn pasted_text_is_sent_and_cleared() {
+        let mut app = app();
+        app.paste_text_input(&"x\n".repeat(12));
+        for c in "summarize".chars() {
+            app.input.insert_char(c);
+        }
+        let prompt = app.submit_prompt().expect("prompt submitted");
+        assert!(prompt.starts_with("summarize"), "prompt: {prompt}");
+        assert!(prompt.contains("[pasted 24 chars]"), "marker: {prompt}");
+        assert!(prompt.contains('x'), "body: {prompt}");
+        assert!(app.pasted_text.is_empty(), "chip cleared after submit");
+        assert!(matches!(
+            app.messages.last(),
+            Some(ChatEntry::User(text)) if text.contains("[pasted 24 chars]")
+        ));
+    }
+
+    #[test]
+    fn new_session_clears_pasted_text() {
+        let mut app = app();
+        app.paste_text_input(&"x\n".repeat(12));
+        assert_eq!(app.pasted_text.len(), 1);
+        app.new_session();
+        assert!(app.pasted_text.is_empty());
     }
 
     #[test]

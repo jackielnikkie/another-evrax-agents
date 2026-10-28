@@ -11,7 +11,7 @@ Indonesian: [README-IND.md](README-IND.md)
 ## Features
 
 - **Agent loop with tools** — `read`, `list`, `grep`, `write`, `edit`, `shell`,
-  `web_fetch`, `todo`, `git`, `ast_grep`, `evrax-graph`, `subagent`.
+  `web_fetch`, `todo`, `git`, `ast_grep`, `evrax-graph`, `subagent`, `memory`.
 - **Multi-provider** — save many endpoints (openai-compatible or native
   Anthropic), fetch their models automatically, and switch with `/model`.
 - **Plan / Build modes** — Plan mode makes every tool read-only.
@@ -21,12 +21,15 @@ Indonesian: [README-IND.md](README-IND.md)
   continue later.
 - **Nice terminal UI** — per-session transcripts, automatic titles (heuristic
   plus LLM), `/rename`, command palette, slash menu, image paste with Kitty
-  preview, seven color themes.
+  preview (large text pastes collapse to a `[pasted N chars]` chip), seven color
+  themes.
 - **Web remote** — `/remote` starts a small web UI on port 444: password login,
   bearer tokens, SSE streaming, prompts and approvals from the browser, plus a
   Cloudflare tunnel.
 - **Code graph** — `evrax-graph` indexes the repo into SQLite and answers
   symbol search, callers/callees, impact, dead code, and file outlines.
+- **Project memory** — the `memory` tool keeps durable facts and conventions in
+  `.evrax/memory.json`, upserted by key across turns and restarts.
 - **Retries and guardrails** — automatic retry for 429/5xx/network errors, loop
   detection, and a clear notice when a turn runs out of steps.
 - **Parallel worker agents** — `/worker 2` spawns headless worker agents in

@@ -3,6 +3,7 @@
 mod ast_grep;
 mod git;
 mod graph;
+mod memory;
 mod todo;
 mod web;
 
@@ -295,6 +296,25 @@ pub fn specs() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "memory",
+                "description": "Persistent per-project memory in .evrax/memory.json. Store durable facts/conventions/gotchas with add/update (add with an existing key overwrites it); consult with list/search.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "search", "add", "update", "remove", "clear"] },
+                        "id": { "type": "integer", "description": "Entry id for update/remove" },
+                        "key": { "type": "string", "description": "Stable identity; add with an existing key updates it in place" },
+                        "content": { "type": "string", "description": "The fact to store for add/update" },
+                        "tags": { "type": "array", "items": { "type": "string" } },
+                        "query": { "type": "string", "description": "Substring for search over key/content/tags" }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "git",
                 "description": "Inspect or change the workspace git repository. Read-only actions run automatically; mutating actions require approval.",
                 "parameters": {
@@ -377,7 +397,7 @@ pub fn specs() -> Vec<Value> {
 
 pub fn risk(name: &str) -> Risk {
     match name {
-        "write" | "edit" | "shell" | "todo" | "git" | "subagent" => Risk::Mutate,
+        "write" | "edit" | "shell" | "todo" | "memory" | "git" | "subagent" => Risk::Mutate,
         _ => Risk::Read,
     }
 }
@@ -391,6 +411,7 @@ pub fn is_mutating(name: &str, args: Option<&Value>) -> bool {
     match name {
         "write" | "edit" | "shell" => true,
         "todo" => action != "list",
+        "memory" => action != "list" && action != "search",
         "git" => match action.as_str() {
             "status" | "diff" | "log" | "show" => false,
             "branch" => args.is_some_and(|a| a.get("name").is_some()),
@@ -439,6 +460,9 @@ pub fn summary(name: &str, args: &Value) -> String {
                 .unwrap_or_else(|| field("content"));
             format!("{action} {id}").trim().to_string()
         }
+        "memory" => format!("{} {}", field("action"), field("key"))
+            .trim()
+            .to_string(),
         "git" => {
             let mut parts = vec![field("action")];
             for key in ["path", "ref", "name", "message", "remote", "branch"] {
@@ -490,6 +514,7 @@ pub async fn run(name: &str, args: &Value, ctx: &Context) -> Result<ToolOutcome,
         "shell" => shell(args, ctx).await,
         "web_fetch" => web::run(args).await,
         "todo" => todo::run(args, ctx),
+        "memory" => memory::run(args, ctx),
         "git" => git::run(args, ctx).await,
         "ast_grep" => ast_grep::run(args, ctx).await,
         "evrax-graph" => graph::run(args, ctx),

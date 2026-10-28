@@ -280,6 +280,7 @@ mod tests {
                 "shell",
                 "web_fetch",
                 "todo",
+                "memory",
                 "git",
                 "ast_grep",
                 "evrax-graph",

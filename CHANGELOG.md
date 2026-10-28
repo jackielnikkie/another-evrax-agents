@@ -31,6 +31,8 @@ All notable changes to evrax are documented here. The format follows
   an orchestrator that splits work across them.
 - `subagent` tool gains an `action=spawn` with a `count` argument so the agent
   can spawn workers when a task is heavy.
+- `memory` tool: persistent per-project memory in `.evrax/memory.json`, upserted
+  by key, so notes survive across turns and restarts.
 
 ### Changed
 
@@ -41,6 +43,8 @@ All notable changes to evrax are documented here. The format follows
   same tool stay separate rows and finishing events update the right one.
 - Web remote keeps the scroll position while the user reads history, and the
   chat view no longer overflows the viewport on mobile.
+- Panic details (time, location, message, optional backtrace) are written to
+  `%APPDATA%\evrax\last-panic.log`; the terminal is still restored first.
 
 ### Fixed
 
@@ -62,6 +66,11 @@ All notable changes to evrax are documented here. The format follows
 - Session list order is stable across polls; the web UI is served with
   `Cache-Control: no-store` so an upgrade is never masked by a cached page.
 - Request bodies are capped at 256 KiB.
+- Large multi-line pastes become a `[pasted N chars]` chip instead of a heavy
+  composer buffer.
+- Drag-select repaints are throttled to ~60 fps while the highlight still
+  updates on every event; worker panes poll their event log incrementally
+  instead of re-reading the whole file each frame.
 
 ### Security
 

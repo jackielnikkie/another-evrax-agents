@@ -290,7 +290,7 @@ mod tests {
         let text = screen(&app(), 120, 40);
         assert!(text.contains("skills 30"), "skills count missing:\n{text}");
         assert!(text.contains("mcp 2"), "mcp count missing:\n{text}");
-        assert!(text.contains("tools 12"), "tools count missing:\n{text}");
+        assert!(text.contains("tools 13"), "tools count missing:\n{text}");
         assert!(text.contains("serena"), "mcp name missing:\n{text}");
         assert!(text.contains("read"), "tool name missing:\n{text}");
         assert!(text.contains("FAUST55"), "signature missing:\n{text}");

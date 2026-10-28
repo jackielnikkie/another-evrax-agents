@@ -8,7 +8,7 @@ satu binary kecil, hemat memori, backend LLM asli, plus web UI yang bisa dibuka 
 ## Fitur
 
 - **Agent loop dengan tools** — `read`, `list`, `grep`, `write`, `edit`, `shell`,
-  `web_fetch`, `todo`, `git`, `ast_grep`, `evrax-graph`, `subagent`.
+  `web_fetch`, `todo`, `git`, `ast_grep`, `evrax-graph`, `subagent`, `memory`.
 - **Multi-provider** — simpan banyak endpoint (openai-compatible atau Anthropic
   native), daftar model diambil otomatis, ganti provider/model lewat `/model`.
 - **Mode Plan / Build** — Plan membuat semua tool jadi read-only.
@@ -17,13 +17,15 @@ satu binary kecil, hemat memori, backend LLM asli, plus web UI yang bisa dibuka 
 - **Sesi tersimpan di disk** — tiap project punya store sendiri, jadi bisa
   keluar lalu lanjut lagi kapan saja.
 - **UI terminal nyaman** — transcript per sesi, judul otomatis (heuristik + LLM),
-  `/rename`, command palette, slash menu, paste gambar dengan preview Kitty,
-  tujuh tema warna.
+  `/rename`, command palette, slash menu, paste gambar dengan preview Kitty
+  (paste teks besar jadi chip `[pasted N chars]`), tujuh tema warna.
 - **Web remote** — `/remote` menyalakan web UI kecil di port 444: login password,
   token bearer, streaming SSE, prompt dan approval dari browser, plus tunnel
   Cloudflare.
 - **Code graph** — `evrax-graph` meng-index repo ke SQLite dan menjawab pencarian
   simbol, callers/callees, impact, dead code, dan outline file.
+- **Memori project** — tool `memory` menyimpan fakta dan konvensi penting di
+  `.evrax/memory.json`, di-upsert per key lintas turn dan restart.
 - **Retry dan guardrail** — retry otomatis untuk 429/5xx/error jaringan, deteksi
   loop, dan notifikasi jelas saat langkah satu turn habis.
 - **Worker agent paralel** — `/worker 2` men-spawn worker agent headless di pane

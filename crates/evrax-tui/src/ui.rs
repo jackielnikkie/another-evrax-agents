@@ -1489,8 +1489,8 @@ fn input(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let width = text_area.width as usize;
     let max_rows = text_area.height as usize;
-    let rows = app.input.visual_rows(width);
     let (cursor_row, cursor_col) = app.input.cursor_visual(width);
+    let rows = app.input.visual_rows(width);
     let first = if cursor_row >= max_rows {
         cursor_row + 1 - max_rows
     } else {
@@ -3551,6 +3551,7 @@ mod tests {
             transcript: vec![ChatEntry::Assistant(reply.to_string())],
             last_reply: String::new(),
             cache: TranscriptCache::default(),
+            events_seen: 0,
         }
     }
 

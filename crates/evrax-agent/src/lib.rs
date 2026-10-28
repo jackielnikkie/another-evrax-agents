@@ -1616,6 +1616,7 @@ fn tool_specs(plan_mode: bool) -> Vec<Value> {
         "grep",
         "web_fetch",
         "todo",
+        "memory",
         "git",
         "ast_grep",
         "evrax-graph",
@@ -1635,7 +1636,7 @@ fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
         "You are evrax, a coding agent running in a terminal TUI.\n\
          Workspace: {} · Platform: {} — the shell tool runs PowerShell.\n\
          Inspect code with read/list/grep before changing anything. Make minimal, precise edits.\n\
-         Use todo for multi-step work, evrax-graph for code-graph queries (index/search/callers/impact/outline), git for repo inspection/mutations, web_fetch for docs, ast_grep for structural code search, and subagent to launch/control another evrax terminal agent.\n\
+         Use todo for multi-step work, memory to persist project facts/conventions/gotchas (add with a stable key updates it in place; consult with list/search instead of re-deriving), evrax-graph for code-graph queries (index/search/callers/impact/outline), git for repo inspection/mutations, web_fetch for docs, ast_grep for structural code search, and subagent to launch/control another evrax terminal agent.\n\
          After code changes, verify with `cargo test` (and `cargo clippy` when asked).\n\
          File tools run automatically inside the workspace (read AND write/edit). Any path outside the workspace needs explicit user approval, so ask before touching files elsewhere. Never write outside the workspace unless the user asked for it.\n\
          Keep replies concise. When the task is done, answer with plain text and no tool calls.\n\
@@ -1644,7 +1645,7 @@ fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
         std::env::consts::OS
     );
     if plan_mode {
-        prompt.push_str("\nPLAN MODE: read-only and workspace-only. Read-only web_fetch, todo list, git status/diff/log/show, ast_grep search, and evrax-graph queries/index are allowed; never attempt write/edit/shell or mutating todo/git/ast-grep/subagent actions, and never read files outside the workspace; investigate and present a plan.");
+        prompt.push_str("\nPLAN MODE: read-only and workspace-only. Read-only web_fetch, todo list, memory list/search, git status/diff/log/show, ast_grep search, and evrax-graph queries/index are allowed; never attempt write/edit/shell or mutating todo/memory/git/ast-grep/subagent actions, and never read files outside the workspace; investigate and present a plan.");
     }
     prompt
 }
@@ -2497,7 +2498,7 @@ mod tests {
     #[test]
     fn plan_mode_specs_are_read_only() {
         let specs = tool_specs(true);
-        assert_eq!(specs.len(), 8);
+        assert_eq!(specs.len(), 9);
         let names: Vec<&str> = specs
             .iter()
             .map(|s| s.pointer("/function/name").and_then(Value::as_str).unwrap())
@@ -2510,6 +2511,7 @@ mod tests {
                 "grep",
                 "web_fetch",
                 "todo",
+                "memory",
                 "git",
                 "ast_grep",
                 "evrax-graph"
