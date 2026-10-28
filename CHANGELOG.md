@@ -6,6 +6,8 @@ All notable changes to evrax are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-10-28
+
 ### Added
 
 - `ToolPreparing` progress event with throttled updates (4 KB / 200 ms) while
@@ -71,6 +73,10 @@ All notable changes to evrax are documented here. The format follows
 - Drag-select repaints are throttled to ~60 fps while the highlight still
   updates on every event; worker panes poll their event log incrementally
   instead of re-reading the whole file each frame.
+- Update checks no longer fail with `HTTP 403` when the GitHub API's anonymous
+  per-IP rate limit (60/hour) is exhausted. `check_update` tries the API first
+  and falls back to the `/releases/latest` web redirect, which has no rate
+  limit and needs no token.
 
 ### Security
 
