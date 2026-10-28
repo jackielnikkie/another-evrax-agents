@@ -30,7 +30,7 @@ function Test-Admin {
 function Assert-NotRunning {
     $proc = Get-Process -Name 'evrax' -ErrorAction SilentlyContinue
     if ($null -ne $proc) {
-        Fail "evrax sedang berjalan (PID $($proc.Id -join ', ')). Tutup dulu (Ctrl+C), lalu ulangi."
+        Fail "evrax is running (PID $($proc.Id -join ', ')). Close it first (Ctrl+C) and retry."
     }
 }
 
@@ -43,7 +43,7 @@ function Add-PathEntry([string]$Dir) {
     if ($NoPath) { return }
     $scope = Get-PathScope
     if ($scope -eq 'Machine' -and -not (Test-Admin)) {
-        Fail '-System butuh PowerShell sebagai Administrator (atau pakai -NoPath).'
+        Fail '-System requires PowerShell running as Administrator (or use -NoPath).'
     }
     $current = [Environment]::GetEnvironmentVariable('Path', $scope)
     if ($null -eq $current) { $current = '' }
@@ -73,6 +73,35 @@ function Remove-PathEntry([string]$Dir) {
     }
 }
 
+# Resolves the latest tag without depending on the GitHub API alone: the REST
+# endpoint enforces a 60/hour anonymous per-IP rate limit (shared behind NAT,
+# VPN or a proxy), so a 403 there must not abort the install. The
+# /releases/latest web endpoint redirects to /releases/tag/<tag> with no rate
+# limit and falls back cleanly.
+function Resolve-LatestVersion {
+    try {
+        $release = Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent' = 'evrax' } `
+            -Uri "https://api.github.com/repos/$Repo/releases/latest"
+        if ($release.tag_name) { return $release.tag_name }
+    } catch {
+        Write-Host 'api.github.com is rate-limited or unavailable; using the web redirect...' -ForegroundColor DarkGray
+    }
+    $location = ""
+    try {
+        $req = [System.Net.HttpWebRequest]::Create("https://github.com/$Repo/releases/latest")
+        $req.AllowAutoRedirect = $false
+        $req.Method = 'GET'
+        $req.UserAgent = 'evrax'
+        $resp = $req.GetResponse()
+        $location = $resp.Headers['Location']
+    } catch [System.Net.WebException] {
+        $resp = $_.Exception.Response
+        if ($resp) { $location = $resp.Headers['Location'] }
+    }
+    if ($location -and ($location -match '/releases/tag/([^/?#]+)')) { return $Matches[1] }
+    return ""
+}
+
 if (-not $InstallDir) {
     if ($System) {
         $InstallDir = Join-Path $env:ProgramFiles 'evrax\bin'
@@ -86,9 +115,9 @@ if ($Uninstall) {
     $exe = Join-Path $InstallDir $ExeName
     if (Test-Path -LiteralPath $exe) {
         Remove-Item -LiteralPath $exe -Force
-        Write-Host "dihapus: $exe"
+        Write-Host "removed: $exe"
     } else {
-        Write-Host "tidak ada binary di $exe"
+        Write-Host "no binary at $exe"
     }
     Remove-PathEntry $InstallDir
     if ((Test-Path -LiteralPath $InstallDir) -and -not (Get-ChildItem -LiteralPath $InstallDir -Force)) {
@@ -98,11 +127,11 @@ if ($Uninstall) {
         foreach ($dir in @((Join-Path $env:APPDATA 'evrax'), (Join-Path $env:LOCALAPPDATA 'evrax'))) {
             if (Test-Path -LiteralPath $dir) {
                 Remove-Item -LiteralPath $dir -Recurse -Force
-                Write-Host "dihapus: $dir"
+                Write-Host "removed: $dir"
             }
         }
     }
-    Write-Host 'evrax di-uninstall.'
+    Write-Host 'evrax uninstalled.'
     exit 0
 }
 
@@ -115,20 +144,22 @@ try {
     $zip = ""
     if ($LocalZip) {
         $zip = (Resolve-Path -LiteralPath $LocalZip).Path
-        if (-not (Test-Path -LiteralPath $zip)) { Fail "ZIP tidak ditemukan: $LocalZip" }
-        Write-Host "pakai ZIP lokal: $zip"
+        if (-not (Test-Path -LiteralPath $zip)) { Fail "ZIP not found: $LocalZip" }
+        Write-Host "using local ZIP: $zip"
     } else {
         if (-not $Version) {
-            Write-Host 'mengambil rilis terbaru...'
-            $release = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$Repo/releases/latest"
-            $Version = $release.tag_name
+            Write-Host 'resolving the latest release...'
+            $Version = Resolve-LatestVersion
+            if (-not $Version) {
+                Fail "could not resolve the latest release (GitHub API rate-limited and the web redirect failed). Retry later or pin a version, e.g. -Version 0.1.5."
+            }
         }
         if ($Version -notmatch '^v') { $Version = "v$Version" }
         $asset = "evrax-$Version-x86_64-pc-windows-msvc.zip"
         $base = "https://github.com/$Repo/releases/download/$Version"
         $zip = Join-Path $tmp $asset
         $sums = Join-Path $tmp 'SHA256SUMS'
-        Write-Host "mengunduh $asset ..."
+        Write-Host "downloading $asset ..."
         Invoke-WebRequest -UseBasicParsing -Uri "$base/$asset" -OutFile $zip
         Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS" -OutFile $sums
 
@@ -137,25 +168,25 @@ try {
             $parts = $line.Trim() -split '\s+'
             if ($parts.Count -ge 2 -and $parts[1] -eq $asset) { $expected = $parts[0].ToLower() }
         }
-        if (-not $expected) { Fail "SHA256 untuk $asset tidak ada di SHA256SUMS" }
+        if (-not $expected) { Fail "SHA256 for $asset is missing from SHA256SUMS" }
         $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
-        if ($actual -ne $expected) { Fail "SHA-256 tidak cocok (dapat $actual, harus $expected)" }
+        if ($actual -ne $expected) { Fail "SHA-256 mismatch (got $actual, expected $expected)" }
         Write-Host 'SHA-256 OK'
     }
 
     $extract = Join-Path $tmp 'extract'
     Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
     $found = Get-ChildItem -LiteralPath $extract -Recurse -Filter $ExeName | Select-Object -First 1
-    if ($null -eq $found) { Fail "binary $ExeName tidak ada di dalam ZIP" }
+    if ($null -eq $found) { Fail "binary $ExeName is missing from the ZIP" }
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     $target = Join-Path $InstallDir $ExeName
     Copy-Item -LiteralPath $found.FullName -Destination $target -Force
-    Write-Host "terpasang: $target"
+    Write-Host "installed: $target"
 
     Add-PathEntry $InstallDir
     Write-Host ''
-    Write-Host 'Selesai. Buka terminal baru lalu jalankan: evrax --version'
+    Write-Host 'Done. Open a new terminal and run: evrax --version'
 } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }
