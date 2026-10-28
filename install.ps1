@@ -18,7 +18,10 @@ $ExeName = 'evrax.exe'
 
 function Fail([string]$Message) {
     Write-Host "evrax install: $Message" -ForegroundColor Red
-    exit 1
+    # Throw instead of exit: this script is commonly run via `irm ... | iex`,
+    # where `exit` tears down the whole PowerShell window and the user never
+    # sees the reason.
+    throw "evrax install failed: $Message"
 }
 
 function Test-Admin {
@@ -132,7 +135,7 @@ if ($Uninstall) {
         }
     }
     Write-Host 'evrax uninstalled.'
-    exit 0
+    return
 }
 
 Assert-NotRunning
