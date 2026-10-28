@@ -5,5 +5,6 @@
 .serena/
 *.log
 .evrax/
+.opencode/
 evrax-graph/evrax-graph/target/
 skill-evrax/**/bin/
