@@ -3131,6 +3131,20 @@ impl App {
         false
     }
 
+    /// True when the composer may accept typing while a turn streams: busy,
+    /// with no overlay/dialog stealing the keyboard.
+    pub fn stream_input_open(&self) -> bool {
+        self.busy
+            && self.approval.is_none()
+            && self.palette.is_none()
+            && self.session_dialog.is_none()
+            && self.theme_dialog.is_none()
+            && self.remote_dialog.is_none()
+            && self.preview.is_none()
+            && self.wizard.is_none()
+            && !self.model_dialog_open()
+    }
+
     pub fn submit_prompt(&mut self) -> Option<String> {
         let prompt = self.input.text().trim().to_string();
         if prompt.is_empty() && self.attachments.is_empty() && self.pasted_text.is_empty() {
@@ -3812,18 +3826,6 @@ impl App {
         self.workers.clear();
         self.worker_spawn_request = None;
     }
-
-    /// Message handed to the main agent so it can split work across workers.
-    pub fn worker_orchestrator_prompt(n: usize) -> String {
-        format!(
-            "{n} worker agent(s) were just spawned headless; their ids are listed by \
-`subagent action=list`. Split the current task into {n} disjoint subtask(s) — one per \
-worker — and send each with `subagent action=send id=<id> prompt=<subtask>`. Do not send \
-a new prompt to a worker whose `subagent action=status` shows it busy or queued. Once the \
-workers report back, poll `subagent action=status` for each id and synthesize their results \
-into one answer."
-        )
-    }
 }
 
 /// Folds only the JSONL lines past `pane.events_seen` into `pane.transcript`,
@@ -4066,6 +4068,50 @@ mod tests {
         }
         app.submit_prompt();
         assert_ne!(app.mode, mode_before);
+    }
+
+    #[test]
+    fn stream_input_open_true_only_while_busy_without_overlay() {
+        let mut app = app();
+        assert!(!app.stream_input_open(), "idle composer is not stream-open");
+        type_and_submit(&mut app, "hi");
+        assert!(app.busy);
+        assert!(
+            app.stream_input_open(),
+            "busy with no overlay is stream-open"
+        );
+        app.approval = Some(Approval {
+            name: "shell".to_string(),
+            summary: "ls".to_string(),
+            key: "shell".to_string(),
+            selected: 0,
+            id: 1,
+        });
+        assert!(!app.stream_input_open(), "an approval overlay closes it");
+    }
+
+    #[test]
+    fn slash_runs_while_streaming() {
+        let mut app = app();
+        type_and_submit(&mut app, "first");
+        assert!(app.busy);
+        let mode_before = app.mode;
+        for c in "/mode".chars() {
+            app.input.insert_char(c);
+        }
+        app.submit_prompt();
+        assert_ne!(app.mode, mode_before, "/mode executes while streaming");
+        assert!(app.queued.is_empty(), "a slash line is never queued");
+    }
+
+    #[test]
+    fn text_queues_while_streaming() {
+        let mut app = app();
+        type_and_submit(&mut app, "first");
+        assert!(app.busy);
+        type_and_submit(&mut app, "hi");
+        assert_eq!(app.queued.len(), 1);
+        assert_eq!(app.queued.front().map(String::as_str), Some("hi"));
     }
 
     #[test]
@@ -5884,13 +5930,5 @@ mod tests {
         assert!(!app.workers.is_empty());
         app.new_session();
         assert!(app.workers.is_empty());
-    }
-
-    #[test]
-    fn worker_orchestrator_prompt_mentions_workers() {
-        let prompt = App::worker_orchestrator_prompt(3);
-        assert!(!prompt.is_empty());
-        assert!(prompt.contains("worker"));
-        assert!(prompt.contains("subagent"));
     }
 }

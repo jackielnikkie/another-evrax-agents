@@ -4,6 +4,7 @@ mod ast_grep;
 mod git;
 mod graph;
 mod memory;
+mod skills;
 mod todo;
 mod web;
 
@@ -278,6 +279,20 @@ pub fn specs() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "web_search",
+                "description": "Search the web and return the top results (title, URL, snippet).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Search query" }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "todo",
                 "description": "Maintain a workspace todo list in .evrax/todos.json. Use list/add/update/remove/clear.",
                 "parameters": {
@@ -392,6 +407,32 @@ pub fn specs() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "skills_list",
+                "description": "List the available skills (specialized playbooks).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "skill_view",
+                "description": "Read a skill's full instructions by name; use skills_list first.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Skill name (case-insensitive)" }
+                    },
+                    "required": ["name"]
+                }
+            }
+        }),
     ]
 }
 
@@ -451,6 +492,9 @@ pub fn summary(name: &str, args: &Value) -> String {
         "grep" => field("pattern"),
         "shell" => field("command"),
         "web_fetch" => field("url"),
+        "web_search" => format!("search {}", field("query")).trim().to_string(),
+        "skills_list" => "list skills".into(),
+        "skill_view" => format!("view {}", field("name")).trim().to_string(),
         "todo" => {
             let action = field("action");
             let id = args
@@ -513,6 +557,9 @@ pub async fn run(name: &str, args: &Value, ctx: &Context) -> Result<ToolOutcome,
         "edit" => edit(args, ctx),
         "shell" => shell(args, ctx).await,
         "web_fetch" => web::run(args).await,
+        "web_search" => web::search(args).await,
+        "skills_list" => skills::list(ctx),
+        "skill_view" => skills::view(args, ctx),
         "todo" => todo::run(args, ctx),
         "memory" => memory::run(args, ctx),
         "git" => git::run(args, ctx).await,
@@ -1192,6 +1239,41 @@ mod tests {
         assert_eq!(risk("write"), Risk::Mutate);
         assert_eq!(risk("shell"), Risk::Mutate);
         assert_eq!(risk("read"), Risk::Read);
+    }
+
+    #[test]
+    fn web_search_and_skills_are_read_only() {
+        assert_eq!(risk("web_search"), Risk::Read);
+        assert_eq!(risk("skills_list"), Risk::Read);
+        assert_eq!(risk("skill_view"), Risk::Read);
+        assert!(!is_mutating("web_search", None));
+        assert!(!is_mutating("skills_list", None));
+        assert!(!is_mutating("skill_view", None));
+        assert!(!requires_approval("skills_list", None));
+    }
+
+    #[test]
+    fn new_specs_are_registered() {
+        let names: Vec<String> = specs()
+            .into_iter()
+            .filter_map(|s| s["function"]["name"].as_str().map(|n| n.to_string()))
+            .collect();
+        for expected in ["web_search", "skills_list", "skill_view"] {
+            assert!(names.iter().any(|n| n == expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn new_tool_summaries() {
+        assert_eq!(
+            summary("web_search", &json!({"query": "rust"})),
+            "search rust"
+        );
+        assert_eq!(summary("skills_list", &json!({})), "list skills");
+        assert_eq!(
+            summary("skill_view", &json!({"name": "humanizer"})),
+            "view humanizer"
+        );
     }
 
     #[tokio::test]

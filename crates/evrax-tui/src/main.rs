@@ -596,15 +596,7 @@ async fn run(
             needs_draw = true;
         }
         if let Some(n) = app.take_worker_spawn_request() {
-            spawn_workers(
-                &mut app,
-                n,
-                &loaded.config.root,
-                &*backend,
-                &event_tx,
-                &mut decision_tx,
-                &mut turn_task,
-            );
+            spawn_workers(&mut app, n, &loaded.config.root);
             needs_draw = true;
         }
         if needs_draw {
@@ -876,7 +868,7 @@ fn is_batchable(app: &App, key: &crossterm::event::KeyEvent) -> bool {
         && app.preview.is_none()
         && app.wizard.is_none()
         && !app.model_dialog_open()
-        && !app.busy
+        && (!app.busy || app.stream_input_open())
 }
 
 async fn drain_burst(events: &mut EventStream, first: char) -> (String, Option<Event>) {
@@ -1076,19 +1068,10 @@ fn has_flag(name: &str) -> bool {
 }
 
 /// Launches the headless worker processes backing freshly created panes. Each
-/// placeholder pane (empty id) gets one process; once launched the main agent is
-/// handed an orchestrator prompt telling it to split the work. The prompt starts
-/// a turn (or queues behind a running one) exactly like an external subagent prompt.
-#[allow(clippy::too_many_arguments)]
-fn spawn_workers(
-    app: &mut App,
-    _n: usize,
-    root: &std::path::Path,
-    backend: &dyn AgentBackend,
-    event_tx: &mpsc::Sender<AgentEvent>,
-    decision_tx: &mut Option<mpsc::Sender<bool>>,
-    turn_task: &mut Option<JoinHandle<()>>,
-) {
+/// placeholder pane (empty id) gets one process. Spawning only readies the
+/// panes: the user orchestrates explicitly (subagent send or a normal prompt),
+/// so `/worker N` never spends a turn on its own.
+fn spawn_workers(app: &mut App, _n: usize, root: &std::path::Path) {
     let mut spawned: Vec<String> = Vec::new();
     let mut last_error: Option<String> = None;
     for pane in app.workers.iter_mut() {
@@ -1113,19 +1096,10 @@ fn spawn_workers(
     if spawned.is_empty() {
         return;
     }
-    let prompt = App::worker_orchestrator_prompt(spawned.len());
-    if let Some(prompt) = app.submit_external_prompt(prompt) {
-        let (session, plan_mode) = (app.session_id.clone(), app.mode == AgentMode::Plan);
-        start_turn(
-            backend,
-            event_tx,
-            decision_tx,
-            turn_task,
-            prompt,
-            session,
-            plan_mode,
-        );
-    }
+    app.set_flash(format!(
+        "workers ready: {} (orchestrate with subagent send)",
+        spawned.len()
+    ));
 }
 
 fn drain_subagent_prompt(
@@ -1873,6 +1847,17 @@ mod cli_tests {
         });
         assert_eq!(fail["type"], "error");
         assert_eq!(fail["message"], "nope");
+    }
+
+    #[test]
+    fn batchable_input_open_while_busy_streaming() {
+        let key = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let mut app = App::new();
+        assert!(is_batchable(&app, &key));
+        app.busy = true;
+        assert!(is_batchable(&app, &key));
+        app.preview = Some(0);
+        assert!(!is_batchable(&app, &key));
     }
 
     #[test]

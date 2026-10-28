@@ -761,7 +761,7 @@ fn chat(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
         0
     };
     let composer = if app.busy {
-        3
+        4
     } else {
         app.composer_height(area.width.saturating_sub(4) as usize)
     };
@@ -1448,7 +1448,12 @@ fn input(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    if app.busy {
+    // While streaming the composer stays typeable: a spinner header is drawn
+    // above the normal body (chips + text + cursor) instead of replacing it.
+    let body = if app.busy {
+        if inner.height == 0 {
+            return;
+        }
         let line = Line::from(vec![
             Span::styled(
                 format!("{} ", spinner(app.tick)),
@@ -1459,17 +1464,26 @@ fn input(frame: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(current().muted),
             ),
         ]);
-        frame.render_widget(Paragraph::new(line), inner);
+        frame.render_widget(Paragraph::new(line), Rect { height: 1, ..inner });
+        Rect {
+            y: inner.y + 1,
+            height: inner.height.saturating_sub(1),
+            ..inner
+        }
+    } else {
+        inner
+    };
+    if body.height == 0 {
         return;
     }
 
     // Attachment chips (pasted screenshot paths) render above the text.
-    let chip_rows = render_attachment_chips(frame, inner, app);
+    let chip_rows = render_attachment_chips(frame, body, app);
     let text_area = Rect {
-        x: inner.x,
-        y: inner.y + chip_rows,
-        width: inner.width,
-        height: inner.height.saturating_sub(chip_rows),
+        x: body.x,
+        y: body.y + chip_rows,
+        width: body.width,
+        height: body.height.saturating_sub(chip_rows),
     };
     if text_area.height == 0 {
         return;
@@ -2465,6 +2479,24 @@ mod tests {
         );
         assert!(text.contains("Ask anything"), "input missing:\n{text}");
         assert!(text.contains("quit"), "footer hint missing:\n{text}");
+    }
+
+    #[test]
+    fn composer_shows_typed_text_while_streaming() {
+        let mut app = App::new();
+        app.busy = true;
+        for c in "hello".chars() {
+            app.input.insert_char(c);
+        }
+        let text = render_text_with(&mut app, 100, 30);
+        assert!(
+            text.contains("hello"),
+            "streaming composer must still render typed text:\n{text}"
+        );
+        assert!(
+            text.contains("streaming"),
+            "streaming spinner header missing:\n{text}"
+        );
     }
 
     #[test]

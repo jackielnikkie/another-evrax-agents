@@ -279,12 +279,15 @@ mod tests {
                 "edit",
                 "shell",
                 "web_fetch",
+                "web_search",
                 "todo",
                 "memory",
                 "git",
                 "ast_grep",
                 "evrax-graph",
-                "subagent"
+                "subagent",
+                "skills_list",
+                "skill_view"
             ]
         );
         assert_eq!(tools[0].risk, crate::tools::Risk::Read);

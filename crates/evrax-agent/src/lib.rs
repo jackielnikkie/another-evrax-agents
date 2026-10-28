@@ -9,6 +9,7 @@ pub mod sse;
 pub mod subagent;
 pub mod tools;
 pub mod update;
+pub mod workspace;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1615,11 +1616,14 @@ fn tool_specs(plan_mode: bool) -> Vec<Value> {
         "list",
         "grep",
         "web_fetch",
+        "web_search",
         "todo",
         "memory",
         "git",
         "ast_grep",
         "evrax-graph",
+        "skills_list",
+        "skill_view",
     ];
     tools::specs()
         .into_iter()
@@ -1633,19 +1637,47 @@ fn tool_specs(plan_mode: bool) -> Vec<Value> {
 
 fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
     let mut prompt = format!(
-        "You are evrax, a coding agent running in a terminal TUI.\n\
-         Workspace: {} · Platform: {} — the shell tool runs PowerShell.\n\
-         Inspect code with read/list/grep before changing anything. Make minimal, precise edits.\n\
-         Use todo for multi-step work, memory to persist project facts/conventions/gotchas (add with a stable key updates it in place; consult with list/search instead of re-deriving), evrax-graph for code-graph queries (index/search/callers/impact/outline), git for repo inspection/mutations, web_fetch for docs, ast_grep for structural code search, and subagent to launch/control another evrax terminal agent.\n\
-         After code changes, verify with `cargo test` (and `cargo clippy` when asked).\n\
-         File tools run automatically inside the workspace (read AND write/edit). Any path outside the workspace needs explicit user approval, so ask before touching files elsewhere. Never write outside the workspace unless the user asked for it.\n\
-         Keep replies concise. When the task is done, answer with plain text and no tool calls.\n\
+        "You are evrax, a coding agent pairing with the user inside their workspace, running in a terminal TUI.\n\
+         Workspace: {root} · Platform: {os} — the shell tool runs PowerShell.\n\
+         \n\
+         Gather context first:\n\
+         - Read the relevant files with read/list/grep before changing anything. Trace a symbol to its definition and usages instead of guessing its shape.\n\
+         - Batch independent lookups: when several reads/searches don't depend on each other, issue them together in one turn.\n\
+         - Never invent files, symbols, APIs, or imports. If you haven't seen it in the repo, go look. Check the project manifest before assuming a library is available.\n\
+         \n\
+         Make changes through the tools, not the chat:\n\
+         - Edit with write/edit. Do not print whole files to the user; reference code as path:line.\n\
+         \n\
+         Verify, and know when to stop:\n\
+         - Run the relevant tests/linter/build and confirm they pass before claiming the task is done.\n\
+         - Fix root causes, not symptoms; when you find a bug, check sibling call paths for the same flaw.\n\
+         - When fixing the same file fails about three times, stop and ask the user instead of looping.\n\
+         - Track multi-step work with `todo`. Reference code as path:line.\n\
+         \n\
+         Respect the user's repo:\n\
+         - Don't commit, push, or rewrite history unless asked. Never read, print, or commit secrets; leave .env and credential files alone unless explicitly asked.\n\
+         \n\
+         Tools: read/list/grep/write/edit/shell, web_fetch/web_search (docs + web search), todo, memory (persist project facts; add with a stable key updates in place, consult with list/search), git, ast_grep, evrax-graph, skills_list/skill_view (specialized playbooks — consult them for search, debugging, TDD, etc.), and subagent.\n\
+         \n\
+         Workers: the user can spawn headless worker agents that appear as panes (/worker N). You are the orchestrator: when the user asks to split a task, use `subagent action=list` to see the workers, break the work into disjoint subtasks, and send each with `subagent action=send id=<id> prompt=...`. Never send a new prompt to a worker that `subagent action=status` shows busy or queued. Poll `subagent action=status` and synthesize the results.\n\
+         \n\
+         Keep replies concise; when the task is done, answer with plain text and no tool calls.\n\
          Write your reply in the language the user writes in: Indonesian replies to Indonesian, English to English; never switch languages on your own. Keep code, identifiers, file paths, commands and error strings in their original form, and keep strings that render inside the evrax UI in English.",
-        cfg.root.display(),
-        std::env::consts::OS
+        root = cfg.root.display(),
+        os = std::env::consts::OS
     );
+
+    let snapshot = workspace::snapshot(&cfg.root);
+    if !snapshot.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&snapshot);
+    }
+    if let Some((name, content)) = workspace::context_file(&cfg.root) {
+        prompt.push_str(&format!("\n\n## {name}\n{content}"));
+    }
+
     if plan_mode {
-        prompt.push_str("\nPLAN MODE: read-only and workspace-only. Read-only web_fetch, todo list, memory list/search, git status/diff/log/show, ast_grep search, and evrax-graph queries/index are allowed; never attempt write/edit/shell or mutating todo/memory/git/ast-grep/subagent actions, and never read files outside the workspace; investigate and present a plan.");
+        prompt.push_str("\nPLAN MODE: read-only and workspace-only. Read-only web_fetch/web_search, skills_list/skill_view, todo list, memory list/search, git status/diff/log/show, ast_grep search, and evrax-graph queries/index are allowed; never attempt write/edit/shell or mutating todo/memory/git/ast-grep/subagent actions, and never read files outside the workspace; investigate and present a plan.");
     }
     prompt
 }
@@ -1681,6 +1713,62 @@ mod language_tests {
         let prompt = system_prompt(&cfg(), true);
         assert!(prompt.contains("PLAN MODE"));
         assert!(prompt.contains("never attempt write/edit/shell"));
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    fn cfg() -> AgentConfig {
+        AgentConfig {
+            root: std::env::temp_dir(),
+            ..AgentConfig::default()
+        }
+    }
+
+    #[test]
+    fn workspace_snapshot_reports_git_and_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+
+        let git_ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .arg("init")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+
+        let snap = workspace::snapshot(dir.path());
+        assert!(snap.contains("Workspace:"), "snapshot:\n{snap}");
+        assert!(snap.contains("Cargo.toml"), "snapshot:\n{snap}");
+        assert!(snap.contains("Verify: cargo test"), "snapshot:\n{snap}");
+        if git_ok {
+            // A fresh `git init` has no commits, so there is a Status line but
+            // no Branch line; commit once to exercise the branch path.
+            assert!(snap.contains("Status:"), "snapshot:\n{snap}");
+        }
+    }
+
+    #[test]
+    fn context_file_prefers_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(workspace::context_file(dir.path()), None);
+
+        std::fs::write(dir.path().join("AGENTS.md"), "hello agents").unwrap();
+        let (name, content) = workspace::context_file(dir.path()).unwrap();
+        assert_eq!(name, "AGENTS.md");
+        assert_eq!(content, "hello agents");
+    }
+
+    #[test]
+    fn system_prompt_has_engineering_brief() {
+        let prompt = system_prompt(&cfg(), false);
+        assert!(prompt.contains("Gather context first"), "prompt:\n{prompt}");
+        assert!(prompt.contains("Never invent"), "prompt:\n{prompt}");
+        assert!(prompt.contains("Worker"), "prompt:\n{prompt}");
+        assert!(prompt.contains("subagent"), "prompt:\n{prompt}");
     }
 }
 
@@ -2498,7 +2586,7 @@ mod tests {
     #[test]
     fn plan_mode_specs_are_read_only() {
         let specs = tool_specs(true);
-        assert_eq!(specs.len(), 9);
+        assert_eq!(specs.len(), 12);
         let names: Vec<&str> = specs
             .iter()
             .map(|s| s.pointer("/function/name").and_then(Value::as_str).unwrap())
@@ -2510,11 +2598,14 @@ mod tests {
                 "list",
                 "grep",
                 "web_fetch",
+                "web_search",
                 "todo",
                 "memory",
                 "git",
                 "ast_grep",
-                "evrax-graph"
+                "evrax-graph",
+                "skills_list",
+                "skill_view"
             ]
         );
     }
