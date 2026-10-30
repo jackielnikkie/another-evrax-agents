@@ -60,16 +60,50 @@ scope/cleanup worker yang bocor antar proyek/sesi.
 ## P5 — docs
 - Ganti `subagent` → `worker` di `README.md`, `README-IND.md`, `AGENTS.md`, `CHANGELOG.md`, `docs/`.
 
+## P7 — approval `shell` di worker (BUG, prioritas 1)
+- **Gejala**: worker headless menolak SEMUA command `shell` — bahkan `echo hi` di-reject.
+  Ini bukan policy per-command; gate-nya menolak sebelum command dievaluasi.
+- **Kandidat akar**: worker dijalankan tanpa handle approval ke TUI (pane tak punya jalur
+  jawab approval) → default **deny**, atau approval timeout auto-deny. Cek apakah
+  worker/pane memakai jalur approval yang SAMA dengan orchestrator (`authorize_and_run`)
+  atau punya gate sendiri yang men-default-deny.
+- **Repro**: spawn worker → minta `echo hi` → lihat layer mana yang memotong (gate TUI?
+  headless run? policy?).
+- **Arah fix**: worker headless harus punya policy approval otonom (mis. auto-allow di
+  dalam workspace seperti agent utama; di luar workspace → reject). Jangan default-deny.
+
+## P8 — `read` cache collision (BUG, prioritas 2)
+- **Gejala**: `read` mengembalikan isi file yang SALAH (mis. habis `git status` — "clean,
+  nothing to commit" — lalu `read` file lain mengembalikan entri lama).
+- **Kandidat akar**: kunci cache `read` bukan `(path, window)` melainkan sesuatu yang
+  shared — slot/kapasitas-ke-N, atau hash yang di-reset per turn → tabrakan antar file.
+- **Deteksi**: log key + hash payload tiap `read`, ulangi skenario, lihat tabrakan.
+- **Test regresi (wajib)**: `read a.rs` → `read b.rs` → `read a.rs` lagi harus balikin isi
+  `a.rs`, bukan hasil pemanggilan sebelumnya.
+
+## P9 — injeksi bukti verifikasi (akar "gak bisa bilang 76 passed")
+- **Masalah**: tiga worker menulis kode tapi tak ada satu pun yang bisa menyatakan
+  "76 passed" — hasil verifikasi tak kembali ke orchestrator sebagai bukti.
+- **Arah**: mekanisme worker menyetor **bukti** (command + output) yang bisa dibaca main
+  agent saat sintesis (mis. `last_reply` diperkaya, atau `worker status` menampilkan
+  verified-command + ringkasan output). Setelah P7 beres ini sebagian sembuh sendiri.
+- **Catatan**: P7 → P8 → P9 urutan prioritas (paling murah dulu).
+
 ## Kontrak beku (untuk multi-worker)
 ```rust
 evrax_agent::worker::{run, load, list_for, spawn_worker, State, WorkerStatus, events_path}
 ```
 
 ## Lane (sekali jalan)
-- **K1** `crates/evrax-agent/src/worker.rs` + `crates/evrax-agent/src/lib.rs` — P1 core, P2, P3.
-- **K2** `crates/evrax-agent/src/tools.rs` + `crates/evrax-agent/src/catalog.rs` — P1 tool rename.
+- **K1** `crates/evrax-agent/src/worker.rs` + `crates/evrax-agent/src/lib.rs` — P1 core, P2, P3, **P7** (approval worker).
+- **K2** `crates/evrax-agent/src/tools.rs` + `crates/evrax-agent/src/catalog.rs` — P1 tool rename, **P8** (`read` cache), **P9** (bukti verifikasi).
 - **K3** `crates/evrax-tui/src/main.rs` + `app.rs` + `worker_link.rs` — P1 TUI, P4, P6 (standby non-blocking).
 - **K4** docs — P5.
+
+## Prioritas (paling murah → mahal)
+1. **P7** approval `shell` worker (impact terbesar).
+2. **P8** `read` cache collision.
+3. **P9** injeksi bukti verifikasi (sebagian sembuh setelah P7).
 
 ## Gate (serial, orkestrator)
 `cargo fmt --all` · `cargo clippy --workspace --all-targets -- -D warnings` ·
