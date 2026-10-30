@@ -1,14 +1,22 @@
-# Todofix v0.1.8 — worker unification + auto-orchestration + bugfix batch
+# Todofix v0.1.8 — worker unification + auto-orchestration + bugfix + prompt ala hermes
 
 Batch setelah `v0.1.7`. **Belum dieksekusi** — rencana dikunci, pengerjaan mulai besok.
 Tujuan: satukan `subagent` → `worker`, worker otomatis saat tugas berat, perbaiki
-scope/cleanup worker, approval shell (workspace auto / luar allow), chip paste besar,
-format chat + todolist ala opencode, delegasi wajib ke worker.
+scope/cleanup worker (+ perintah `/workers`), approval shell (workspace auto / luar allow),
+chip paste besar, format chat + todolist ala opencode, delegasi wajib ke worker, dan
+identitas `SOUL.md` + prompt ala hermes (thinking/planning/delegating).
 
 ## Konteks bug (terkonfirmasi)
 - `subagent::list()` (`crates/evrax-agent/src/subagent.rs:119`) membaca SEMUA direktori
   di `%APPDATA%\evrax\subagents\` tanpa filter → worker dari proyek/sesi lain ikut terbaca.
   Bukti: pane TUI menampilkan 2 worker, tapi agent (`subagent list`) melapor 6.
+- **Bukti tambahan (2026-10-28)**: `worker list` lapor **18 worker** dari **5 sesi berbeda**
+  menumpuk (hanya worker 1–5 milik sesi ini; sisanya yatim, termasuk 3 berstatus `stopped`
+  yang direktorinya tetap tersisa). Konfirmasi P3 (tanpa filter root) + prune yatim.
+  `stop` hanya menulis flag, direktori state tidak dihapus → `subagents\` menumpuk.
+- **Blocker kerja**: `read`/`shell` gagal semua — `read` balikin isi salah ("clean, nothing
+  to commit" untuk file `.rs` → P8), `shell` "rejected by user" (P7). Tanpa ini agent/worker
+  tak bisa membaca file untuk mulai kerja → harus diperbaiki lebih dulu.
 - Worker yatim tak pernah dibersihkan: `stop` hanya menulis file flag `stop`, direktori
   state tidak dihapus → `subagents\` menumpuk selamanya.
 - `subagent` vs `worker` = satu sistem, dua nama. Disatukan jadi **`worker`**.
@@ -37,12 +45,18 @@ format chat + todolist ala opencode, delegasi wajib ke worker.
   `worker send`. Batas: jangan spawn untuk tugas kecil. Pane tetap (`idle`) setelah selesai.
 - Nudge agar agent memakai `worker list`/`status` untuk cek worker proyek ini dulu.
 
-## P3 — scope + cleanup (fix bug 2 vs 6)
-- `worker::list_for(root)` — filter `state.root == ctx.root` (per-proyek).
-- Tool `worker list` (agent) hanya menampilkan worker proyek ini; tambah baris
-  `(+K hidden)` bila ada worker proyek lain.
-- Prune yatim: hapus state yang `!is_alive` (heartbeat mati) + status terminal
-  (stopped/failed) — saat **startup** dan saat **stop**.
+## P3 — scope + cleanup (fix "18 worker dari 5 sesi")
+- `worker::list_for(root)` — filter `state.root == ctx.root` (per-proyek); jangan tampilkan
+  worker sesi/proyek lain.
+- `worker list` (agent) hanya proyek ini; baris `(+K hidden)` bila ada worker proyek lain.
+- **Prune yatim**: hapus state `!is_alive` (heartbeat mati) + status terminal (stopped/failed)
+  saat **startup** dan saat **stop** (sekarang `stop` cuma tulis flag, direktori tak dihapus).
+- **Perintah user (TUI) — WAJIB ada**:
+  - `/workers` — **list** worker (jumlah + status + id, per-proyek).
+  - `/workers clear` — hapus **semua** worker proyek ini.
+  - `/workers kill <id>` — hapus satu worker.
+  - (tool: `worker action=list` sama; `worker action=stop` menerima `all` untuk bersih-bersih.)
+- File: `worker.rs` (prune + list_for), `app.rs`/`main.rs` (slash `/workers`), `tools.rs` (disp).
 
 ## P4 — TUI
 - `/worker N` (sudah ada) + pane grid (sudah ada). Pastikan pane tetap idle setelah selesai.
@@ -118,13 +132,17 @@ format chat + todolist ala opencode, delegasi wajib ke worker.
 - **Target**: nudge keras di `system_prompt` (`lib.rs`) + (opsional) guard.
 - File: `lib.rs`.
 
-## P14 — `evrax-graph status` belum-index jangan tampil ✗ merah
+## P14 — `evrax-graph status` belum-index jangan langsung ✗ merah
 - Saat `.evrax/graph.db` belum ada, `status` mengembalikan `ok:false` → TUI render `✗` merah
-  → user/agent menyangka error.
-- **Target**: belum-index = **bukan error** → status netral (mis. `ok:true` + pesan
-  "graph not indexed yet · run evrax-graph action=index"), tanpa glyph `✗`/merah.
-  `✗` hanya untuk kegagalan nyata (DB korup/IO error).
-- File: `tools/graph.rs` + mapping status→glyph di `ui.rs` bila perlu.
+  → user/agent menyangka error padahal cuma belum di-index.
+- **Target (dua tingkat)**:
+  1. **Belum di-index** = **info, bukan error**: pesan jelas
+     `graph belum di-index · jalankan evrax-graph action=index`, **tanpa** `✗`/merah
+     (mis. `ok:true` + status netral, atau glyph info `·`/`○`).
+  2. `✗` merah **hanya** untuk kegagalan nyata (DB korup, IO error, gagal baca).
+- Aturan umum: tool yang "belum siap" (belum index/konfigurasi) → **beri tahu dulu**, jangan
+  langsung tanda gagal.
+- File: `tools/graph.rs` (status handler) + mapping status→glyph di `ui.rs` bila perlu.
 
 ## P16 — chip paste besar (ala opencode) [PRIORITAS TINGGI]
 - **Gejala**: paste > 10 baris cuma memunculkan **flash** `pasted 2621 chars`; tak ada chip
@@ -144,15 +162,46 @@ format chat + todolist ala opencode, delegasi wajib ke worker.
 - Kalau belum ada index & user minta status/search → jalankan index otomatis. Berat untuk
   repo besar. Usul: **jangan auto**, cukup pesan jelas (bagian dari P14).
 
+## P17 — baca `SOUL.md` + `AGENTS.md` (identitas + konteks)
+- `workspace.rs::context_file` diperluas:
+  - **`SOUL.md`**: identitas/persona. Cari di **`%APPDATA%\evrax\SOUL.md`** (global user)
+    dulu, lalu **workspace root**. (Tanpa `%APPDATA%`, fallback home.)
+  - **`AGENTS.md`**: chain dari git-root turun ke cwd (`AGENTS.override.md` menang per dir),
+    bukan cuma 1 file.
+- **JANGAN baca `CLAUDE.md` / `.cursorrules`** — evrax tak memakai konvensi Claude (keputusan
+  user). Hanya `SOUL.md` + `AGENTS.md`.
+- Cap tiap file (~8 KB) + tanda `[... truncated ...]`.
+- File: `workspace.rs` + `lib.rs` (inject ke prompt).
+- Test: `soul_md_loaded_from_appdata_then_workspace`, `agents_md_chain_root_to_cwd`,
+  `claude_and_cursorrules_are_ignored`.
+
+## P18 — system prompt ala hermes (3 slot)
+- Susun `system_prompt` (lib.rs) jadi blok berurutan seperti hermes:
+  1. **stable**: `SOUL.md` (atau default identity) → coding brief (senior-engineer) →
+     platform/env hints.
+  2. **context**: workspace snapshot + `AGENTS.md` chain.
+  3. **volatile**: skills index (ringkas) + memory + baris tanggal.
+- Tujuan: luwes/persona-driven, mudah diarahkan lewat `SOUL.md`/`AGENTS.md` (bukan dinding
+  larangan). Pertahankan aturan bahasa user + UI-English + plan-mode caveat.
+- File: `lib.rs` (`system_prompt`), `workspace.rs`.
+
+## P19 — thinking + planning + delegating
+- **Thinking**: pastikan `ThinkingDelta`/`ThinkingFinished` dipakai; prompt mengizinkan
+  berpikir dulu sebelum bertindak (reasoning step eksplisit).
+- **Planning (grok sebelum bertindak)**: guidance "pahami dulu keseluruhan sebelum mengubah"
+  (gather context → rencana → eksekusi).
+- **Delegating**: worker (lihat P13) — bagi tugas lewat `worker send`, standby (P6).
+- File: `lib.rs` (brief).
+
 ## Kontrak beku (untuk multi-worker)
 ```rust
 evrax_agent::worker::{run, load, list_for, spawn_worker, State, WorkerStatus, events_path}
 ```
 
 ## Lane (sekali jalan)
-- **K1** `crates/evrax-agent/src/worker.rs` + `crates/evrax-agent/src/lib.rs` — P1 core, P2, P3, P7 (approval worker), P10 (approval shell), P13 (delegasi wajib).
+- **K1** `crates/evrax-agent/src/worker.rs` + `crates/evrax-agent/src/workspace.rs` + `lib.rs` — P1 core, P2, P3 (list_for+prune), P7 (approval worker), P10 (approval shell), P13 (delegasi), P17 (SOUL+AGENTS), P18 (prompt hermes), P19 (thinking/planning).
 - **K2** `crates/evrax-agent/src/tools.rs` + `catalog.rs` + `tools/todo.rs` + `tools/graph.rs` — P1 tool rename, P8 (`read` cache), P9 (bukti), P10 (requires_approval), P12 (todo render), P14 (graph status).
-- **K3** `crates/evrax-tui/src/main.rs` + `app.rs` + `worker_link.rs` + `ui.rs` — P1 TUI, P4, P6 (standby), P11 (chat format), P16 (chip paste).
+- **K3** `crates/evrax-tui/src/main.rs` + `app.rs` + `worker_link.rs` + `ui.rs` — P1 TUI, P3 (`/workers` list/clear/kill), P4, P6 (standby), P11 (chat format), P16 (chip paste).
 - **K4** docs — P5.
 
 ## Prioritas (paling murah → mahal)
@@ -160,10 +209,13 @@ evrax_agent::worker::{run, load, list_for, spawn_worker, State, WorkerStatus, ev
 2. **P16** chip paste besar + backspace (kerja sering gagal karena prompt panjang tak terlihat).
 3. **P8** `read` cache collision.
 4. **P10** shell workspace auto / luar approval.
-5. **P13** delegasi wajib ke worker.
-6. **P9** bukti verifikasi (sebagian sembuh setelah P7).
-7. **P11** format chat · **P12** todolist · **P14** graph status netral.
-8. P1 rename `subagent`→`worker`, P2/P3/P4/P6, P5 docs.
+5. **P3** worker numpuk: scope + prune + `/workers` list/clear/kill.
+6. **P13** delegasi wajib ke worker.
+7. **P9** bukti verifikasi (sebagian sembuh setelah P7).
+8. **P14** graph status netral (info dulu, merah hanya kalau gagal).
+9. **P11** format chat · **P12** todolist.
+10. **P17/P18/P19** SOUL.md + prompt hermes + thinking/planning/delegating.
+11. P1 rename `subagent`→`worker`, P2/P4/P6, P5 docs.
 
 ## Gate (serial, orkestrator)
 `cargo fmt --all` · `cargo clippy --workspace --all-targets -- -D warnings` ·
