@@ -47,6 +47,16 @@ scope/cleanup worker yang bocor antar proyek/sesi.
 - `/worker N` (sudah ada) + pane grid (sudah ada). Pastikan pane tetap idle setelah selesai.
 - Opsional: `/workers` untuk kelola (list/stop).
 
+## P6 — main agent standby saat worker kerja (keluhan user)
+- Saat worker menjalankan tugas, main agent **tetap standby** (TIDAK ikut mengerjakan tugas
+  yang sama / tidak diam terkunci). Setelah worker selesai, main agent melanjutkan:
+  baca hasil worker, validasi, gabung, lanjut langkah berikutnya.
+- Artinya: turn main agent tidak "menunggu mati" — ia bisa mengirim tugas ke worker,
+  mengecek `worker status`, dan tetap responsif (menerima prompt user / interupsi) selama
+  worker bekerja.
+- Implikasi teknis: orkestrasi **non-blocking** — `worker send` tidak memblokir turn main;
+  main agent poll `worker status`/`list` saat perlu, bukan busy-wait.
+
 ## P5 — docs
 - Ganti `subagent` → `worker` di `README.md`, `README-IND.md`, `AGENTS.md`, `CHANGELOG.md`, `docs/`.
 
@@ -58,7 +68,7 @@ evrax_agent::worker::{run, load, list_for, spawn_worker, State, WorkerStatus, ev
 ## Lane (sekali jalan)
 - **K1** `crates/evrax-agent/src/worker.rs` + `crates/evrax-agent/src/lib.rs` — P1 core, P2, P3.
 - **K2** `crates/evrax-agent/src/tools.rs` + `crates/evrax-agent/src/catalog.rs` — P1 tool rename.
-- **K3** `crates/evrax-tui/src/main.rs` + `app.rs` + `worker_link.rs` — P1 TUI, P4.
+- **K3** `crates/evrax-tui/src/main.rs` + `app.rs` + `worker_link.rs` — P1 TUI, P4, P6 (standby non-blocking).
 - **K4** docs — P5.
 
 ## Gate (serial, orkestrator)
