@@ -145,12 +145,23 @@ fn render(items: &[Item]) -> String {
         .filter(|item| item.status != "completed")
         .count();
     let mut lines = vec![format!("todos: {open} open / {} total", items.len())];
-    for item in items {
-        let marker = if item.status == "completed" { "x" } else { " " };
-        lines.push(format!(
-            "[{marker}] #{} ({}, {}) {}",
-            item.id, item.status, item.priority, item.content
-        ));
+    // Grouped by status: in-progress first, then pending, then done.
+    for (status, glyph, label) in [
+        ("in_progress", "◐", "In progress"),
+        ("pending", "◻", "Pending"),
+        ("completed", "✔", "Done"),
+    ] {
+        let group: Vec<&Item> = items.iter().filter(|item| item.status == status).collect();
+        if group.is_empty() {
+            continue;
+        }
+        lines.push(format!("{glyph} {label}"));
+        for item in group {
+            lines.push(format!(
+                "  {} [{}] {}",
+                item.id, item.priority, item.content
+            ));
+        }
     }
     lines.join("\n")
 }
@@ -189,9 +200,49 @@ mod tests {
             &ctx,
         )
         .unwrap();
-        assert!(updated.detail.contains("completed"));
+        assert!(updated.detail.contains("Done"));
         let removed = run(&serde_json::json!({"action":"remove","id":1}), &ctx).unwrap();
         assert!(removed.detail.contains("removed"));
         assert!(run(&serde_json::json!({"action":"remove","id":1}), &ctx).is_err());
+    }
+
+    #[test]
+    fn render_groups_items_by_status_with_glyphs() {
+        let items = vec![
+            Item {
+                id: 1,
+                content: "pending one".into(),
+                status: "pending".into(),
+                priority: "low".into(),
+            },
+            Item {
+                id: 2,
+                content: "doing".into(),
+                status: "in_progress".into(),
+                priority: "high".into(),
+            },
+            Item {
+                id: 3,
+                content: "done".into(),
+                status: "completed".into(),
+                priority: "medium".into(),
+            },
+            Item {
+                id: 4,
+                content: "pending two".into(),
+                status: "pending".into(),
+                priority: "medium".into(),
+            },
+        ];
+        let out = render(&items);
+        let in_progress = out.find("◐ In progress").expect("in-progress group");
+        let pending = out.find("◻ Pending").expect("pending group");
+        let done = out.find("✔ Done").expect("done group");
+        assert!(in_progress < pending && pending < done, "{out}");
+        assert!(out.contains("2 [high] doing"), "{out}");
+        assert!(out.contains("1 [low] pending one"), "{out}");
+        assert!(out.contains("4 [medium] pending two"), "{out}");
+        assert!(out.contains("3 [medium] done"), "{out}");
+        assert!(!out.contains("[x]"), "no flat markers: {out}");
     }
 }

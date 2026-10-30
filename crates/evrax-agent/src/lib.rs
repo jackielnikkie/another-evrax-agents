@@ -6,9 +6,9 @@ pub mod diff;
 mod guardrails;
 mod retry;
 pub mod sse;
-pub mod subagent;
 pub mod tools;
 pub mod update;
+pub mod worker;
 pub mod workspace;
 
 use std::collections::HashMap;
@@ -1257,9 +1257,8 @@ async fn authorize_and_run(
             ));
         }
     }
-    // shell always needs approval (system-wide scope); mutating git actions
-    // need approval; write/edit/todo/ast-grep inside the workspace run
-    // automatically; any external path needs approval.
+    // shell, mutating git, and any external path need approval; write/edit/
+    // todo/ast-grep and shell inside the workspace run automatically.
     let needs_approval = tools::requires_approval(name, args.as_ref().ok()) || outside.is_some();
     if needs_approval {
         let key = tools::approval_key_for(name, args.as_ref().ok(), outside.as_deref());
@@ -1670,11 +1669,22 @@ fn tool_specs(plan_mode: bool) -> Vec<Value> {
 }
 
 fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
-    let mut prompt = format!(
-        "You are evrax, a coding agent pairing with the user inside their workspace, running in a terminal TUI.\n\
-         Workspace: {root} · Platform: {os} — the shell tool runs PowerShell.\n\
+    // Slot 1 — stable: identity (SOUL.md or default) + coding brief + env.
+    let identity = workspace::soul_file(&cfg.root)
+        .map(|(_, content)| content.trim().to_string())
+        .filter(|content| !content.is_empty());
+    let mut prompt = String::from(
+        "You are evrax, a coding agent pairing with the user inside their workspace, running in a terminal TUI.\n",
+    );
+    if let Some(identity) = &identity {
+        prompt.push_str(identity);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str(&format!(
+        "Workspace: {root} · Platform: {os} — the shell tool runs PowerShell.\n\
          \n\
-         Gather context first:\n\
+         Think first, then act:\n\
+         - Reason about the problem before touching code: gather context, form a plan, then execute. Understand the whole shape before you change any part.\n\
          - Read the relevant files with read/list/grep before changing anything. Trace a symbol to its definition and usages instead of guessing its shape.\n\
          - Batch independent lookups: when several reads/searches don't depend on each other, issue them together in one turn.\n\
          - Never invent files, symbols, APIs, or imports. If you haven't seen it in the repo, go look. Check the project manifest before assuming a library is available.\n\
@@ -1683,7 +1693,7 @@ fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
          - Edit with write/edit. Do not print whole files to the user; reference code as path:line.\n\
          \n\
          Verify, and know when to stop:\n\
-         - Run the relevant tests/linter/build and confirm they pass before claiming the task is done.\n\
+         - Run the relevant tests/linter/build and confirm they pass before claiming the task is done. Quote the actual result (e.g. \"76 passed\"), never a claim you did not observe.\n\
          - Fix root causes, not symptoms; when you find a bug, check sibling call paths for the same flaw.\n\
          - When fixing the same file fails about three times, stop and ask the user instead of looping.\n\
          - Track multi-step work with `todo`. Reference code as path:line.\n\
@@ -1691,29 +1701,79 @@ fn system_prompt(cfg: &AgentConfig, plan_mode: bool) -> String {
          Respect the user's repo:\n\
          - Don't commit, push, or rewrite history unless asked. Never read, print, or commit secrets; leave .env and credential files alone unless explicitly asked.\n\
          \n\
-         Tools: read/list/grep/write/edit/shell, web_fetch/web_search (docs + web search), todo, memory (persist project facts; add with a stable key updates in place, consult with list/search), git, ast_grep, evrax-graph, skills_list/skill_view (specialized playbooks — consult them for search, debugging, TDD, etc.), and subagent.\n\
+         Tools: read/list/grep/write/edit/shell, web_fetch/web_search (docs + web search), todo, memory (persist project facts; add with a stable key updates in place, consult with list/search), git, ast_grep, evrax-graph, skills_list/skill_view (specialized playbooks — consult them for search, debugging, TDD, etc.), and worker.\n\
          \n\
-         Workers: the user can spawn headless worker agents that appear as panes (/worker N). You are the orchestrator: when the user asks to split a task, use `subagent action=list` to see the workers, break the work into disjoint subtasks, and send each with `subagent action=send id=<id> prompt=...`. Never send a new prompt to a worker that `subagent action=status` shows busy or queued. Poll `subagent action=status` and synthesize the results.\n\
+         Workers — delegate, do not do everything yourself:\n\
+         - Prefer delegating substantial or multi-part work to workers over doing it all in the main thread. Before starting heavy work, check `worker action=list` (scoped to this project).\n\
+         - If no worker exists and the task is large or splittable, spawn one (or a few) yourself, then send work with `worker action=send id=<id> prompt=...`.\n\
+         - If a worker already exists, split the task into disjoint subtasks and dispatch them via `worker send`.\n\
+         - You MUST delegate when a worker is available; only do a task yourself when it is small or a single quick edit. Never send a new prompt to a worker that `worker action=status` shows busy or queued.\n\
+         - While workers run, stay available: do not busy-wait. Use `worker action=status`/`list` when you need to, keep the main turn responsive, then validate and merge the workers' results yourself.\n\
+         - Do not spawn workers for trivial tasks.\n\
          \n\
          Keep replies concise; when the task is done, answer with plain text and no tool calls.\n\
          Write your reply in the language the user writes in: Indonesian replies to Indonesian, English to English; never switch languages on your own. Keep code, identifiers, file paths, commands and error strings in their original form, and keep strings that render inside the evrax UI in English.",
         root = cfg.root.display(),
         os = std::env::consts::OS
-    );
+    ));
 
+    // Slot 2 — context: workspace snapshot + AGENTS.md chain.
     let snapshot = workspace::snapshot(&cfg.root);
     if !snapshot.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&snapshot);
     }
-    if let Some((name, content)) = workspace::context_file(&cfg.root) {
-        prompt.push_str(&format!("\n\n## {name}\n{content}"));
+    if let Some((_name, content)) = workspace::agents_md_chain(&cfg.root) {
+        prompt.push_str("\n\nProject instructions (AGENTS.md):\n");
+        prompt.push_str(&content);
     }
 
+    // Slot 3 — volatile: skills index + memory + date line.
+    let skills = catalog::Catalog::load().skills;
+    if !skills.is_empty() {
+        let mut names: Vec<String> = skills.iter().map(|skill| skill.name.clone()).collect();
+        names.sort();
+        names.truncate(48);
+        prompt.push_str(&format!(
+            "\n\nSkills available via skills_list/skill_view: {}",
+            names.join(", ")
+        ));
+    }
+    prompt.push_str(
+        "\n\nProject memory (`.evrax/memory.json`) holds facts you saved earlier; consult it with `memory list`/`memory search` when it may be relevant.",
+    );
+    prompt.push_str(&format!("\n\nSession context: {}", today_line()));
+
     if plan_mode {
-        prompt.push_str("\nPLAN MODE: read-only and workspace-only. Read-only web_fetch/web_search, skills_list/skill_view, todo list, memory list/search, git status/diff/log/show, ast_grep search, and evrax-graph queries/index are allowed; never attempt write/edit/shell or mutating todo/memory/git/ast-grep/subagent actions, and never read files outside the workspace; investigate and present a plan.");
+        prompt.push_str("\nPLAN MODE: read-only and workspace-only. Read-only web_fetch/web_search, skills_list/skill_view, todo list, memory list/search, git status/diff/log/show, ast_grep search, and evrax-graph queries/index are allowed; never attempt write/edit/shell or mutating todo/memory/git/ast-grep/worker actions, and never read files outside the workspace; investigate and present a plan.");
     }
     prompt
+}
+
+/// Volatile date line for the prompt; local date without pulling in a crate.
+fn today_line() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Whole days since the Unix epoch → civil date (Howard Hinnant's algorithm).
+    let days = (secs / 86_400) as i64;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
 }
 
 #[cfg(test)]
@@ -1799,10 +1859,54 @@ mod workspace_tests {
     #[test]
     fn system_prompt_has_engineering_brief() {
         let prompt = system_prompt(&cfg(), false);
-        assert!(prompt.contains("Gather context first"), "prompt:\n{prompt}");
+        assert!(
+            prompt.contains("Think first, then act"),
+            "prompt:\n{prompt}"
+        );
         assert!(prompt.contains("Never invent"), "prompt:\n{prompt}");
         assert!(prompt.contains("Worker"), "prompt:\n{prompt}");
-        assert!(prompt.contains("subagent"), "prompt:\n{prompt}");
+        assert!(prompt.contains("worker"), "prompt:\n{prompt}");
+    }
+
+    #[test]
+    fn system_prompt_strengthens_worker_delegation() {
+        let prompt = system_prompt(&cfg(), false);
+        assert!(
+            prompt.contains("You MUST delegate when a worker is available"),
+            "missing hard delegation nudge:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Do not spawn workers for trivial tasks"),
+            "missing small-task guardrail:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("worker action=list"),
+            "missing per-project worker listing hint:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("spawn one"),
+            "missing proactive-spawn nudge:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_has_context_and_skills_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        let local_cfg = AgentConfig {
+            root: dir.path().to_path_buf(),
+            ..AgentConfig::default()
+        };
+        let prompt = system_prompt(&local_cfg, false);
+        assert!(prompt.contains("Workspace:"), "missing snapshot:\n{prompt}");
+        assert!(
+            prompt.contains("Skills available via skills_list/skill_view"),
+            "missing skills slot:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Session context:"),
+            "missing volatile date line:\n{prompt}"
+        );
     }
 }
 
@@ -2128,7 +2232,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_always_requires_approval_with_shell_key() {
+    async fn shell_inside_workspace_runs_without_approval() {
         let dir = tempfile::tempdir().unwrap();
         let call = sse(&[
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"shell","arguments":"{\"command\":\"echo hi\"}"}}]}}]}"#,
@@ -2155,15 +2259,18 @@ mod tests {
             },
             decide_rx,
         );
-        let mut key = None;
+        let mut saw_approval = false;
+        let mut ran = false;
         while let Some(event) = stream.next().await {
-            if let AgentEvent::ApprovalRequested { name, key: k, .. } = event {
-                assert_eq!(name, "shell");
-                key = Some(k);
-                decide_tx.send(true).await.unwrap();
+            match event {
+                AgentEvent::ApprovalRequested { .. } => saw_approval = true,
+                AgentEvent::ToolFinished { name, .. } if name == "shell" => ran = true,
+                _ => {}
             }
         }
-        assert_eq!(key.as_deref(), Some("shell"));
+        assert!(!saw_approval, "shell in the workspace must not ask");
+        assert!(ran, "shell should have executed");
+        drop(decide_tx);
     }
 
     #[tokio::test]

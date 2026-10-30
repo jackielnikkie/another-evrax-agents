@@ -1,18 +1,18 @@
 use std::fs;
 
-use evrax_agent::subagent;
+use evrax_agent::worker;
 
 use crate::app::App;
 
 pub struct Link {
-    state: subagent::State,
-    last_status: subagent::WorkerStatus,
+    state: worker::State,
+    last_status: worker::WorkerStatus,
     last_reply: String,
 }
 
 impl Link {
     pub fn load(id: &str) -> Option<Self> {
-        let state = subagent::load(id)?;
+        let state = worker::load(id)?;
         Some(Self {
             last_status: state.status,
             last_reply: state.last_reply.clone(),
@@ -25,7 +25,7 @@ impl Link {
     }
 
     pub fn take_prompt(&self) -> Option<String> {
-        let path = subagent::inbox_path(&self.state.id);
+        let path = worker::inbox_path(&self.state.id);
         let text = fs::read_to_string(&path).ok()?;
         let _ = fs::remove_file(&path);
         let text = text.trim().to_string();
@@ -33,7 +33,7 @@ impl Link {
     }
 
     pub fn stop_requested(&self) -> bool {
-        subagent::stop_path(&self.state.id).exists()
+        worker::stop_path(&self.state.id).exists()
     }
 
     pub fn publish(&mut self, app: &App) {
@@ -56,11 +56,11 @@ impl Link {
             return;
         }
         self.state.pid = pid;
-        self.state.status = subagent::WorkerStatus::parse(status);
-        self.state.updated_ms = subagent::now_ms();
+        self.state.status = worker::WorkerStatus::parse(status);
+        self.state.updated_ms = worker::now_ms();
         self.state.last_reply = last_reply.clone();
-        self.last_status = subagent::WorkerStatus::parse(status);
+        self.last_status = worker::WorkerStatus::parse(status);
         self.last_reply = last_reply;
-        let _ = subagent::save(&self.state);
+        let _ = worker::save(&self.state);
     }
 }

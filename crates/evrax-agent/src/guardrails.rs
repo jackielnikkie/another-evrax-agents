@@ -6,6 +6,10 @@ use std::collections::{HashMap, HashSet};
 
 const DUPLICATE_STUB_MIN_CHARS: usize = 512;
 const IDENTICAL_NOTICE_STREAK: u32 = 3;
+/// Read-only deterministic tools: their content is always complete, so it must
+/// never be replaced by the identical-result stub (a stub here reads like an
+/// empty/wrong file; the hash+streak notice still fires).
+const STUB_EXEMPT_TOOLS: [&str; 4] = ["read", "list", "grep", "glob"];
 const FAILURE_BLOCK_THRESHOLD: u32 = 3;
 const RECENT_LIMIT: usize = 16;
 const CYCLE_MIN: usize = 2;
@@ -56,7 +60,7 @@ impl Guard {
         let hash = fnv1a(result.as_bytes());
 
         let mut stub = None;
-        if result.len() >= DUPLICATE_STUB_MIN_CHARS {
+        if result.len() >= DUPLICATE_STUB_MIN_CHARS && !STUB_EXEMPT_TOOLS.contains(&name) {
             if let Some(seen) = self.seen.get(&signature)
                 && seen.hash == hash
                 && seen.len == result.len()
@@ -155,13 +159,51 @@ mod tests {
         let result = "x".repeat(600);
         assert!(
             guard
-                .observe("read", r#"{"path":"a.txt"}"#, true, &result)
+                .observe("shell", r#"{"command":"a"}"#, true, &result)
                 .is_none()
         );
         let stub = guard
-            .observe("read", r#"{ "path": "a.txt" }"#, true, &result)
+            .observe("shell", r#"{ "command": "a" }"#, true, &result)
             .expect("second identical result should be stubbed");
         assert!(stub.contains("panggilan #1"), "{stub}");
+    }
+
+    #[test]
+    fn read_only_tools_are_never_stubbed() {
+        let mut guard = Guard::default();
+        let content = "y".repeat(600);
+        for name in STUB_EXEMPT_TOOLS {
+            assert!(
+                guard
+                    .observe(name, r#"{"path":"a.rs"}"#, true, &content)
+                    .is_none(),
+                "{name} must not stub on the first call"
+            );
+            let second = guard.observe(name, r#"{"path":"a.rs"}"#, true, &content);
+            assert!(
+                second.is_none(),
+                "{name} returned a stub for identical read-only content: {second:?}"
+            );
+        }
+        // Regression: read a.rs -> read b.rs -> read a.rs keeps returning a.rs.
+        let mut guard = Guard::default();
+        let a = "a".repeat(600);
+        let b = "b".repeat(600);
+        assert!(
+            guard
+                .observe("read", r#"{"path":"a.rs"}"#, true, &a)
+                .is_none()
+        );
+        assert!(
+            guard
+                .observe("read", r#"{"path":"b.rs"}"#, true, &b)
+                .is_none()
+        );
+        assert!(
+            guard
+                .observe("read", r#"{"path":"a.rs"}"#, true, &a)
+                .is_none()
+        );
     }
 
     #[test]

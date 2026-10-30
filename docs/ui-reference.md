@@ -17,7 +17,7 @@ Catatan desain untuk implementasi TUI evrax. Referensi provenance: TUI proyek la
   - `footer.tsx`: Getting-started onboarding card ("OpenCode includes free models...", connect 75+ providers) shown when height >= 22 and no provider connected; dismissible.
 - Layout helpers: `ui/layout.ts`, `ui/pane-resize.ts` + `component/pane-resize-handle.tsx` (mouse-drag pane resizing), `ui/border.ts`.
 - Toggle sidebar: `<leader>b` (`session.sidebar.toggle`). Focus left/right pane: `<leader>left` / `<leader>right`.
-- Worker panes (evrax): `/worker N` (alias `/spawn`) men-spawn hingga tiga worker agent headless yang transcript-nya dirender sebagai pane di samping transcript utama (`main`). Layout: **1 worker = split kanan**; **2 = kiri-kanan**; **3 = grid**; **lebih dari 3 = tab**. Main agent bertindak sebagai orkestrator (di-nudge untuk memecah tugas jadi N subtask dan mengirim via tool `subagent action=send`).
+- Worker panes (evrax): `/worker N` (alias `/spawn`) men-spawn hingga tiga worker agent headless yang transcript-nya dirender sebagai pane di samping transcript utama (`main`). Layout: **1 worker = split kanan**; **2 = kiri-kanan**; **3 = grid**; **lebih dari 3 = tab**. Main agent bertindak sebagai orkestrator (di-nudge untuk memecah tugas jadi N subtask dan mengirim via tool `worker action=send`).
 
 ## 2. Default Keybinds (config/keybind.ts)
 

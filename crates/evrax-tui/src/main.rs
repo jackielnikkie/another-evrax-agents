@@ -2,11 +2,11 @@ mod app;
 mod banner;
 mod image;
 mod markdown;
-mod subagent_link;
 mod theme;
 mod ui;
 mod welcome;
 mod window;
+mod worker_link;
 
 use std::io::Stdout;
 use std::time::{Duration, Instant};
@@ -212,7 +212,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 }
 
 fn cli_info_flag() -> bool {
-    const HELP: &str = "USAGE:\n    evrax [OPTIONS]\n\nOPTIONS:\n    -c, --continue         resume the most recent session\n    -s, --session <spec>   resume by id, unique prefix, or title\n    -l, --list             list saved sessions and exit\n        --setup            open the provider setup wizard\n        --no-save          do not persist sessions\n        --mock             run with the built-in mock backend\n        --provider <name>  use a saved provider for this run\n        --model <name>     model id\n        --base-url <url>   openai-compatible base URL\n        --api-key <key>    API key (else agent.json / EVRAX_API_KEY)\n        --max-iterations <n>  tool rounds per turn (default 500)\n        --root <path>      workspace root\n        --headless             run the agent loop without the TUI (used by workers)\n        --subagent-id <id>     internal: run as a named worker\n    -V, --version          print version and exit\n    -h, --help             print this help and exit\n\nIn the TUI: /model switches provider or model.";
+    const HELP: &str = "USAGE:\n    evrax [OPTIONS]\n\nOPTIONS:\n    -c, --continue         resume the most recent session\n    -s, --session <spec>   resume by id, unique prefix, or title\n    -l, --list             list saved sessions and exit\n        --setup            open the provider setup wizard\n        --no-save          do not persist sessions\n        --mock             run with the built-in mock backend\n        --provider <name>  use a saved provider for this run\n        --model <name>     model id\n        --base-url <url>   openai-compatible base URL\n        --api-key <key>    API key (else agent.json / EVRAX_API_KEY)\n        --max-iterations <n>  tool rounds per turn (default 500)\n        --root <path>      workspace root\n        --headless             run the agent loop without the TUI (used by workers)\n        --worker-id <id>     internal: run as a named worker\n    -V, --version          print version and exit\n    -h, --help             print this help and exit\n\nIn the TUI: /model switches provider or model.";
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -371,15 +371,15 @@ fn chat_backend(
 /// Headless worker: runs the agent loop with no terminal. Reads prompts from
 /// the worker inbox, forwards events to `events.jsonl`, and publishes heartbeat
 /// status. Exits on a stop request. A worker may only be spawned by the parent
-/// TUI (which passes `--subagent-id`), so a missing id or link is fatal.
+/// TUI (which passes `--worker-id`), so a missing id or link is fatal.
 async fn run_headless(
     loaded: evrax_agent::LoadedConfig,
     store: Option<ProjectStore>,
 ) -> Result<()> {
-    let id = arg_value("--subagent-id")
-        .ok_or_else(|| anyhow::anyhow!("--headless requires --subagent-id"))?;
+    let id = arg_value("--worker-id")
+        .ok_or_else(|| anyhow::anyhow!("--headless requires --worker-id"))?;
     let mut link =
-        subagent_link::Link::load(&id).ok_or_else(|| anyhow::anyhow!("subagent {id} not found"))?;
+        worker_link::Link::load(&id).ok_or_else(|| anyhow::anyhow!("worker {id} not found"))?;
 
     // `chat_backend` needs a store rooted at the worker's workspace; a worker is
     // always launched with `--root`, so build one if the caller had none (mock).
@@ -418,7 +418,7 @@ async fn run_headless_turn(
     backend: &dyn AgentBackend,
     id: &str,
     prompt: String,
-    link: &mut subagent_link::Link,
+    link: &mut worker_link::Link,
 ) {
     let Some(prompt) = app.submit_external_prompt(prompt) else {
         return;
@@ -435,9 +435,14 @@ async fn run_headless_turn(
     let mut stream = backend.run_turn(request, decision_rx);
     while let Some(event) = stream.next().await {
         if let AgentEvent::ApprovalRequested { .. } = event {
-            let _ = decision_tx.try_send(false);
+            // A headless worker has no pane to answer a prompt on. Rather than
+            // rejecting every gated call (which made even `echo hi` fail),
+            // approve it: the workspace is the user's own, and anything truly
+            // outside it is meant to be a deliberate, user-facing decision —
+            // which the orchestrator handles, not a silent worker.
+            let _ = decision_tx.try_send(true);
         }
-        let _ = evrax_agent::subagent::append_event_json(id, &event_to_json(&event));
+        let _ = evrax_agent::worker::append_event_json(id, &event_to_json(&event));
         app.apply_event(event);
     }
     // A clean TurnFinished already cleared these; a Failed stream leaves the
@@ -513,8 +518,8 @@ async fn run(
     let mut turn_task: Option<JoinHandle<()>> = None;
     let mut app = App::new();
     app.attach_config(&loaded);
-    let subagent_id = arg_value("--subagent-id");
-    if subagent_id.is_none()
+    let worker_id = arg_value("--worker-id");
+    if worker_id.is_none()
         && let Some(store) = store.clone()
     {
         app.attach_project(store);
@@ -532,14 +537,14 @@ async fn run(
     }
     // One silent probe at startup: only a newer release breaks the silence.
     app.request_startup_update_check();
-    let mut subagent_link = subagent_id.and_then(|id| {
-        let mut link = subagent_link::Link::load(&id)?;
+    let mut worker_link = worker_id.and_then(|id| {
+        let mut link = worker_link::Link::load(&id)?;
         app.session_id = id.clone();
         let name = link.name().to_string();
         app.titles.insert(id.clone(), name.clone());
         app.manual_titles.insert(id.clone());
         link.publish_final(&app, "idle");
-        app.set_flash(format!("subagent {name}"));
+        app.set_flash(format!("worker {name}"));
         Some(link)
     });
     let mut decision_tx: Option<mpsc::Sender<bool>> = None;
@@ -739,21 +744,21 @@ async fn run(
                 drain_remote_prompts(&mut app, &*backend, &event_tx, &mut decision_tx, &mut turn_task);
                 drain_queued_prompt(&mut app, &*backend, &event_tx, &mut decision_tx, &mut turn_task);
                 drain_remote_approvals(&mut app, &mut decision_tx);
-                drain_subagent_prompt(
+                drain_worker_prompt(
                     &mut app,
-                    &mut subagent_link,
+                    &mut worker_link,
                     &*backend,
                     &event_tx,
                     &mut decision_tx,
                     &mut turn_task,
                 );
-                if subagent_link
+                if worker_link
                     .as_ref()
-                    .is_some_and(subagent_link::Link::stop_requested)
+                    .is_some_and(worker_link::Link::stop_requested)
                 {
                     app.should_quit = true;
                 }
-                if let Some(link) = subagent_link.as_mut() {
+                if let Some(link) = worker_link.as_mut() {
                     link.publish(&app);
                 }
                 if let Some(state) = window::window_state()
@@ -786,7 +791,7 @@ async fn run(
         }
     }
 
-    if let Some(link) = subagent_link.as_mut() {
+    if let Some(link) = worker_link.as_mut() {
         link.publish_final(&app, "stopped");
     }
     app.save_current();
@@ -1069,16 +1074,17 @@ fn has_flag(name: &str) -> bool {
 
 /// Launches the headless worker processes backing freshly created panes. Each
 /// placeholder pane (empty id) gets one process. Spawning only readies the
-/// panes: the user orchestrates explicitly (subagent send or a normal prompt),
+/// panes: the user orchestrates explicitly (worker send or a normal prompt),
 /// so `/worker N` never spends a turn on its own.
 fn spawn_workers(app: &mut App, _n: usize, root: &std::path::Path) {
+    let session = app.session_id.clone();
     let mut spawned: Vec<String> = Vec::new();
     let mut last_error: Option<String> = None;
     for pane in app.workers.iter_mut() {
         if !pane.id.is_empty() {
             continue;
         }
-        match evrax_agent::subagent::spawn_worker(&pane.name, None, root) {
+        match evrax_agent::worker::spawn_worker(&pane.name, None, root, &session) {
             Ok(state) => {
                 pane.id = state.id.clone();
                 pane.status = "starting".to_string();
@@ -1097,14 +1103,14 @@ fn spawn_workers(app: &mut App, _n: usize, root: &std::path::Path) {
         return;
     }
     app.set_flash(format!(
-        "workers ready: {} (orchestrate with subagent send)",
+        "workers ready: {} (orchestrate with worker send)",
         spawned.len()
     ));
 }
 
-fn drain_subagent_prompt(
+fn drain_worker_prompt(
     app: &mut App,
-    link: &mut Option<subagent_link::Link>,
+    link: &mut Option<worker_link::Link>,
     backend: &dyn AgentBackend,
     event_tx: &mpsc::Sender<AgentEvent>,
     decision_tx: &mut Option<mpsc::Sender<bool>>,
@@ -1593,7 +1599,7 @@ fn handle_key(
                 app.input.insert_char(c);
             }
         }
-        KeyCode::Backspace => app.input.backspace(),
+        KeyCode::Backspace => app.backspace_input(),
         KeyCode::Delete => app.input.delete(),
         KeyCode::Left => app.input.move_left(),
         KeyCode::Right => app.input.move_right(),

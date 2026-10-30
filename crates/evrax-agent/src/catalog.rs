@@ -285,7 +285,7 @@ mod tests {
                 "git",
                 "ast_grep",
                 "evrax-graph",
-                "subagent",
+                "worker",
                 "skills_list",
                 "skill_view"
             ]

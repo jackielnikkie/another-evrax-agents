@@ -19,23 +19,23 @@ Di-refresh 2026-10-21. **Jangan pakai nomor baris** — kode sering geser; cari 
 - `retry.rs` — retry 429/5xx/408/transport/`x-should-retry`, tanpa retry 4xx lain.
 - `guardrails.rs` — deteksi streak/siklus tool-call identik.
 - `diff.rs` — diff `similar`.
-- `tools.rs` — `specs()` 12 tool (`read list grep write edit shell web_fetch todo git ast_grep evrax-graph subagent`), `Context::classify()`, `outside_target()`, `approval_key()`, `is_mutating/requires_approval/approval_key_for`, plan mode read-only.
+- `tools.rs` — `specs()` 12 tool (`read list grep write edit shell web_fetch todo git ast_grep evrax-graph worker`), `Context::classify()`, `outside_target()`, `approval_key()`, `is_mutating/requires_approval/approval_key_for`, plan mode read-only.
 - `tools/{web,todo,git,ast_grep,graph}.rs` — implementasi tool non-core.
 - `catalog.rs` — `Catalog::load()`: tools + skills (scan `skill-evrax/` + `%APPDATA%\evrax\skills`, override `EVRAX_SKILLS_DIR`) + MCP (`%APPDATA%\evrax\mcp.json`, override `EVRAX_MCP_CONFIG`).
-- `subagent.rs` — state `%APPDATA%\evrax\subagents\<id>\` (inbox `prompt.txt`, `stop`).
+- `worker.rs` — state `%APPDATA%\evrax\workers\<id>\` (inbox `prompt.txt`, `stop`).
 
 ### evrax-remote
 - `lib.rs` — `RemoteConfig{password,bind,port,public_url}`, `Permit`, `Session`, `RemoteEvent` (termasuk `Approval`/`ApprovalResolved`), token bearer + expiry 24 h, rate-limit `/login`, `spawn_stream` SSE flush per frame + heartbeat, endpoint `/api/session/{id}/{prompt,mode,approval}`, `rename_session`, `take_pending_prompt/approval`, web UI Vue 3 CDN single HTML (`include_str!`).
 - `tunnel.rs` — `TunnelManager` quick tunnel + `start_domain()` (cloudflared login/create/route dns), `generation` counter anti-orphan.
 
 ### evrax-tui
-- `main.rs` — event loop, pilih backend real/mock, polling remote + subagent, drain prompt/approval web, spawn job judul LLM, arg parsing.
+- `main.rs` — event loop, pilih backend real/mock, polling remote + worker, drain prompt/approval web, spawn job judul LLM, arg parsing.
 - `app.rs` — `App`: transcript per sesi, composer/`LineEditor`, slash command + palette, dialog (session/theme/remote/tunnel/approval/preview/model), wizard `WizardStep` + `ModelDialog` (fetch `/models` async via `FetchResult`), `TranscriptCache`, retensi sesi, `titles`/`manual_titles`, `backend_label`, iteration footer, `providers`/`active_provider` + `apply_settings`.
 - `ui.rs` — render: header/transcript/composer/footer, modal (`dialog_window` + PgUp/PgDn), diff wrap, click target sebagian (tunnel URL copy).
 - `banner.rs` + `banner_wide.txt`/`banner_compact.txt` — sprite half-block truecolor, glow, bob, blink, wordmark `E V R A X`, signature `FAUST55`.
 - `welcome.rs` — empty state 3 kolom: skills | banner | MCP + tools.
 - `theme.rs` — 7 tema (`evrax`, `spectrum`, catppuccin, dracula, gruvbox, nord, tokyonight), simpan pilihan ke `%APPDATA%\evrax\theme`.
-- `markdown.rs`, `image.rs` (paste + preview kitty), `window.rs` (maximized/resize), `subagent_link.rs` (poll inbox 250 ms).
+- `markdown.rs`, `image.rs` (paste + preview kitty), `window.rs` (maximized/resize), `worker_link.rs` (poll inbox 250 ms).
 
 ### evrax-graph
 `schema.rs`/`extract.rs`/`lang.rs`/`resolve.rs`/`index.rs`/`store.rs`/`query.rs` + `main.rs` (CLI). DB `<root>/.evrax/graph.db`; indexer skip `agent-reference`, `skill-evrax`, `.serena`, `.codebase-memory`. Catatan desain (hasil bedah tool graph lain) ada di `docs/evrax-graph-notes.md`.

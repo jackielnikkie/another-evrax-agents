@@ -106,6 +106,7 @@ pub fn outside_target(name: &str, args: &Value, ctx: &Context) -> Option<PathBuf
     let key = match name {
         "read" | "write" | "edit" | "git" => "path",
         "list" => "pattern",
+        "shell" => return shell_outside_target(args, ctx),
         _ => return None,
     };
     let raw = args.get(key)?.as_str()?;
@@ -115,6 +116,62 @@ pub fn outside_target(name: &str, args: &Value, ctx: &Context) -> Option<PathBuf
     } else {
         None
     }
+}
+
+/// Scans a shell command for path-like tokens that resolve outside the
+/// workspace. A command that only touches the workspace (or nothing path-like)
+/// returns `None`, so shell runs without approval there; a token that escapes
+/// the workspace yields its resolved path so approval is requested for it.
+fn shell_outside_target(args: &Value, ctx: &Context) -> Option<PathBuf> {
+    let command = args.get("command")?.as_str()?;
+    for token in shell_path_tokens(command) {
+        if let Ok(resolved) = ctx.classify(&token)
+            && resolved.outside
+        {
+            return Some(resolved.path);
+        }
+    }
+    None
+}
+
+/// Splits a command into candidate path tokens: whitespace/quote/operator
+/// separated pieces that look like a path (drive letter, rooted `/` or `\`,
+/// an explicit `..`, `~`, or a `.\`/`../` prefix). Cheap and deliberately
+/// conservative: false negatives just mean an unapproved command may run
+/// inside the workspace, never that a workspace command is blocked.
+fn shell_path_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let flush = |current: &mut String, tokens: &mut Vec<String>| {
+        if !current.is_empty() {
+            tokens.push(std::mem::take(current));
+        }
+    };
+    for ch in command.chars() {
+        match ch {
+            ' ' | '\t' | '\n' | '\r' | '"' | '\'' | ';' | '|' | '&' | '(' | ')' | ',' | '='
+            | '<' | '>' => flush(&mut current, &mut tokens),
+            _ => current.push(ch),
+        }
+    }
+    flush(&mut current, &mut tokens);
+    tokens
+        .into_iter()
+        .filter(|token| looks_like_path(token))
+        .collect()
+}
+
+fn looks_like_path(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/');
+    drive
+        || token.starts_with('/')
+        || token.starts_with("\\\\")
+        || token.starts_with("..")
+        || token.starts_with('~')
 }
 
 /// Approval identity: `<tool>:<canonical parent dir>` for an external target,
@@ -392,14 +449,14 @@ pub fn specs() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
-                "name": "subagent",
-                "description": "Launch and control another evrax agent. start opens a terminal; spawn launches N headless workers drawn in the TUI panes. Both return ids; use send/status/list/stop.",
+                "name": "worker",
+                "description": "Launch and control background worker agents drawn as TUI panes. spawn launches N headless workers; use send/status/list/stop to orchestrate them.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["start", "spawn", "send", "status", "list", "stop"] },
-                        "id": { "type": "string", "description": "Subagent id returned by start/spawn" },
-                        "name": { "type": "string", "description": "Display name for start/spawn" },
+                        "action": { "type": "string", "enum": ["spawn", "send", "status", "list", "stop"] },
+                        "id": { "type": "string", "description": "Worker id returned by spawn" },
+                        "name": { "type": "string", "description": "Display name for spawn" },
                         "prompt": { "type": "string", "description": "Initial or follow-up prompt" },
                         "count": { "type": "integer", "description": "how many workers to spawn (1-3)" }
                     },
@@ -438,7 +495,7 @@ pub fn specs() -> Vec<Value> {
 
 pub fn risk(name: &str) -> Risk {
     match name {
-        "write" | "edit" | "shell" | "todo" | "memory" | "git" | "subagent" => Risk::Mutate,
+        "write" | "edit" | "shell" | "todo" | "memory" | "git" | "worker" => Risk::Mutate,
         _ => Risk::Read,
     }
 }
@@ -462,13 +519,17 @@ pub fn is_mutating(name: &str, args: Option<&Value>) -> bool {
             action == "replace"
                 && args.is_some_and(|a| a.get("apply").and_then(Value::as_bool).unwrap_or(false))
         }
-        "subagent" => action != "status" && action != "list",
+        "worker" => action != "status" && action != "list",
         _ => false,
     }
 }
 
 pub fn requires_approval(name: &str, args: Option<&Value>) -> bool {
-    name == "shell" || (name == "git" && is_mutating(name, args))
+    // shell and mutating git no longer blanket-ask: the authorize layer asks
+    // only when the call targets a path outside the workspace (see
+    // `outside_target`). `write`/`edit` inside the workspace already run
+    // automatically, so this keeps the shell consistent with them.
+    name == "git" && is_mutating(name, args)
 }
 
 /// Short human-readable label for the TUI tool card.
@@ -535,7 +596,7 @@ pub fn summary(name: &str, args: &Value) -> String {
             }
             parts.join(" ")
         }
-        "subagent" => {
+        "worker" => {
             let action = field("action");
             if action == "spawn" {
                 let count = args.get("count").and_then(Value::as_i64).unwrap_or(1);
@@ -565,7 +626,7 @@ pub async fn run(name: &str, args: &Value, ctx: &Context) -> Result<ToolOutcome,
         "git" => git::run(args, ctx).await,
         "ast_grep" => ast_grep::run(args, ctx).await,
         "evrax-graph" => graph::run(args, ctx),
-        "subagent" => crate::subagent::run(args, ctx),
+        "worker" => crate::worker::run(args, ctx),
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -1072,11 +1133,11 @@ mod tests {
     }
 
     #[test]
-    fn subagent_catalog_lists_spawn() {
+    fn worker_catalog_lists_spawn() {
         let spec = specs()
             .into_iter()
-            .find(|s| s["function"]["name"] == "subagent")
-            .expect("subagent spec");
+            .find(|s| s["function"]["name"] == "worker")
+            .expect("worker spec");
         let actions = &spec["function"]["parameters"]["properties"]["action"]["enum"];
         assert!(actions.as_array().unwrap().iter().any(|a| a == "spawn"));
         assert!(
@@ -1084,7 +1145,7 @@ mod tests {
                 .get("count")
                 .is_some()
         );
-        let summary = summary("subagent", &json!({"action": "spawn", "count": 2}));
+        let summary = summary("worker", &json!({"action": "spawn", "count": 2}));
         assert_eq!(summary, "spawn 2 worker(s)");
     }
 
@@ -1119,6 +1180,25 @@ mod tests {
             "key drops the file name: {key}"
         );
         assert_eq!(approval_key("shell", None), "shell");
+    }
+
+    #[test]
+    fn shell_command_outside_workspace_is_flagged() {
+        let (_d, c) = ctx();
+        // A plain workspace command has no root-escaping path token.
+        assert!(outside_target("shell", &json!({"command": "echo hi"}), &c).is_none());
+        assert!(
+            outside_target("shell", &json!({"command": "cargo test --workspace"}), &c).is_none()
+        );
+        // A path token that resolves outside the workspace is flagged, and its
+        // approval key is scoped to the target's parent directory.
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("secret.txt");
+        let command = format!("type \"{}\"", target.to_string_lossy());
+        let hit = outside_target("shell", &json!({ "command": command }), &c)
+            .expect("an external path must be flagged");
+        let key = approval_key("shell", Some(&hit));
+        assert!(key.starts_with("shell:"), "key: {key}");
     }
 
     #[test]

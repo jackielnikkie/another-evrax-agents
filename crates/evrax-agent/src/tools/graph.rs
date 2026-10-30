@@ -29,6 +29,19 @@ pub(super) fn run(args: &Value, ctx: &Context) -> Result<ToolOutcome, String> {
         });
     }
     if !db.is_file() {
+        // Not being indexed yet is informational, not a failure: a red `✗`
+        // here reads like a real error. Real failures (corrupt DB, IO) still
+        // surface as `ok:false` below when the store cannot be opened/read.
+        if action == "status" {
+            return Ok(ToolOutcome {
+                ok: true,
+                detail: format!(
+                    "graph belum di-index · jalankan evrax-graph action=index\nproject: {project}\ndb: {}",
+                    db.display()
+                ),
+                diff: None,
+            });
+        }
         return Err(format!(
             "graph not indexed for {project}; run action=index first ({})",
             db.display()
@@ -240,5 +253,30 @@ mod tests {
         let (_dir, ctx) = ctx();
         let error = run(&json!({"action":"search","pattern":"x"}), &ctx).unwrap_err();
         assert!(error.contains("action=index"), "{error}");
+    }
+
+    #[test]
+    fn status_before_index_is_info_not_error() {
+        let (_dir, ctx) = ctx();
+        let status = run(&json!({"action":"status"}), &ctx).unwrap();
+        assert!(status.ok, "unindexed status must not be ok:false");
+        assert!(
+            status.detail.contains("belum di-index"),
+            "{}",
+            status.detail
+        );
+        assert!(status.detail.contains("action=index"), "{}", status.detail);
+    }
+
+    #[test]
+    fn status_on_corrupt_db_is_error() {
+        let (_dir, ctx) = ctx();
+        let db = default_db_path(&ctx.root);
+        if let Some(parent) = db.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&db, b"not a sqlite database").unwrap();
+        let err = run(&json!({"action":"status"}), &ctx).unwrap_err();
+        assert!(!err.is_empty(), "{err}");
     }
 }

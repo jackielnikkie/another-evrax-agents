@@ -6,6 +6,37 @@ All notable changes to evrax are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-10-30
+
+### Added
+
+- SOUL.md identity file loaded into the system prompt, chained with `AGENTS.md`
+  (CLAUDE.md and .cursorrules are no longer consulted).
+- Chat rendering and the today list now use a grouped, labelled layout.
+- Large text pastes collapse to a `[pasted N chars]` chip.
+- `/workers` lists, clears, or kills this project's workers (`/workers clear`,
+  `/workers kill <id>`).
+
+### Changed
+
+- Worker unification: the `subagent` tool is now `worker` (spawn/send/status/
+  list/stop), and headless worker panes use the same system. State lives under
+  `%APPDATA%\evrax\workers\<id>\` (`EVRAX_WORKERS_DIR` overrides the base), and
+  the internal flag is `--worker-id`.
+- Workers are scoped per project and pruned, so stale workers from other
+  projects or finished sessions no longer pile up or show up in `worker list`.
+- Workers persist across sessions: resuming a session reconnects its worker
+  panes instead of starting empty.
+- Shell approval now matches files: a `shell` call inside the workspace runs
+  without a prompt, while a call outside the workspace asks first.
+- Worker (headless) sessions may run shell, instead of refusing every shell
+  call.
+
+### Fixed
+
+- Guardrail duplicate-result stub no longer misfires on `read` calls that
+  legitimately return identical content.
+
 ## [0.1.7] - 2026-10-28
 
 ### Fixed

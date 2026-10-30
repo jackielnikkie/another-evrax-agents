@@ -28,6 +28,8 @@ pub struct App {
     pub should_quit: bool,
     pub tick: u64,
     pub cwd: String,
+    /// Project root workers are scoped to (set from the loaded config).
+    pub root: std::path::PathBuf,
     pub messages: Vec<ChatEntry>,
     pub input: LineEditor,
     pub busy: bool,
@@ -334,6 +336,7 @@ pub enum Command {
     Rename,
     Update,
     Worker,
+    Workers,
     Quit,
 }
 
@@ -408,6 +411,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         aliases: &["spawn"],
         description: "spawn worker agents for parallel work",
         command: Command::Worker,
+    },
+    SlashCommand {
+        name: "workers",
+        aliases: &[],
+        description: "list/clear/kill this project's workers",
+        command: Command::Workers,
     },
     SlashCommand {
         name: "exit",
@@ -987,6 +996,7 @@ impl App {
             cwd: std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "~".to_string()),
+            root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             messages: Vec::new(),
             input: LineEditor::new(),
             busy: false,
@@ -1062,6 +1072,7 @@ impl App {
         self.active_provider = loaded.active.clone();
         self.max_iterations = loaded.max_iterations;
         self.config_mock = loaded.mock;
+        self.root = loaded.config.root.clone();
     }
 
     fn next_fetch_id(&mut self) -> u64 {
@@ -1738,6 +1749,7 @@ impl App {
         self.queued.clear();
         self.scroll_from_bottom = 0;
         self.transcript.invalidate();
+        self.restore_worker_panes(id);
         true
     }
 
@@ -2118,6 +2130,7 @@ impl App {
             ("Remote web".to_string(), Command::Remote),
             ("Check for updates".to_string(), Command::Update),
             ("Spawn workers".to_string(), Command::Worker),
+            ("Workers (list/clear/kill)".to_string(), Command::Workers),
             ("Quit evrax".to_string(), Command::Quit),
         ]
     }
@@ -2159,6 +2172,7 @@ impl App {
             Command::Rename => self.rename_session_title(""),
             Command::Update => self.request_update_check(),
             Command::Worker => self.spawn_workers(1),
+            Command::Workers => self.workers_command(""),
             Command::Quit => self.quit(),
         }
     }
@@ -3272,6 +3286,10 @@ impl App {
             self.spawn_workers(n);
             return;
         }
+        if command == Command::Workers {
+            self.workers_command(arg);
+            return;
+        }
         if !arg.is_empty() {
             self.set_flash(format!("/{name} takes no arguments"));
             return;
@@ -3279,7 +3297,7 @@ impl App {
         self.execute_command(command);
     }
 
-    /// Submit a prompt that originated from an external inbox (subagent).
+    /// Submit a prompt that originated from an external inbox (worker).
     /// Mirrors `submit_prompt` but uses the given text instead of the
     /// composer, so external prompts run under the current TUI mode and surface
     /// tool approvals in the terminal as usual.
@@ -3317,12 +3335,22 @@ impl App {
                 chars,
                 body: text.to_string(),
             });
-            self.set_flash(format!("pasted {chars} chars"));
+            self.set_flash(format!("pasted {chars} chars · chip added"));
             true
         } else {
             self.input.insert_str(text);
             false
         }
+    }
+
+    /// Backspace in the composer: edits a character, or — when the editor is
+    /// already empty — drops the most recent paste chip as one unit (P16).
+    pub fn backspace_input(&mut self) {
+        if self.input.is_empty() && !self.pasted_text.is_empty() {
+            self.pasted_text.pop();
+            return;
+        }
+        self.input.backspace();
     }
 
     pub fn open_preview(&mut self, index: usize) {
@@ -3369,8 +3397,9 @@ impl App {
 
     pub fn composer_height(&mut self, width: usize) -> u16 {
         let chips = self.attachments.len().min(7) as u16;
+        let paste_chips = self.pasted_text.len().min(4) as u16;
         let text_rows = self.input.visual_rows(width).len().clamp(1, 7) as u16;
-        (chips + text_rows).clamp(1, 9) + 2
+        (chips + paste_chips + text_rows).clamp(1, 11) + 2
     }
 
     pub fn last_assistant_text(&self) -> Option<String> {
@@ -3804,7 +3833,7 @@ impl App {
             if pane.id.is_empty() {
                 continue;
             }
-            if let Some(state) = evrax_agent::subagent::load(&pane.id) {
+            if let Some(state) = evrax_agent::worker::load(&pane.id) {
                 pane.name = state.name;
                 pane.pid = state.pid;
                 pane.status = state.status.as_str().to_string();
@@ -3826,13 +3855,107 @@ impl App {
         self.workers.clear();
         self.worker_spawn_request = None;
     }
+
+    /// `/workers [clear|kill <id>]` — manage this project's workers.
+    /// No argument lists them; `clear` removes every worker of the project;
+    /// `kill <id>` removes one. Pane view state is dropped to match.
+    pub fn workers_command(&mut self, arg: &str) {
+        let mut parts = arg.split_whitespace();
+        match parts.next() {
+            None => {
+                let states = evrax_agent::worker::list_for(&self.root);
+                if states.is_empty() {
+                    self.set_flash("no workers in this project".to_string());
+                    return;
+                }
+                let summary = states
+                    .iter()
+                    .map(|state| format!("{} [{}]", state.id, state.status))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                self.set_flash(format!("{} worker(s): {summary}", states.len()));
+            }
+            Some("clear") => {
+                let states = evrax_agent::worker::list_for(&self.root);
+                let mut removed = 0;
+                for state in &states {
+                    if remove_worker_dir(&state.id) {
+                        removed += 1;
+                    }
+                }
+                self.workers.clear();
+                if removed == 0 && states.is_empty() {
+                    self.set_flash("no workers to clear".to_string());
+                } else {
+                    self.set_flash(format!("cleared {removed} worker(s)"));
+                }
+            }
+            Some("kill") => {
+                let Some(id) = parts.next() else {
+                    self.set_flash("usage: /workers kill <id>".to_string());
+                    return;
+                };
+                if remove_worker_dir(id) {
+                    self.workers.retain(|pane| pane.id != id);
+                    self.set_flash(format!("killed {id}"));
+                } else {
+                    self.set_flash(format!("worker {id} not found"));
+                }
+            }
+            Some(other) => {
+                self.set_flash(format!("unknown /workers argument: {other}"));
+            }
+        }
+    }
+
+    /// Rebuilds worker panes from disk for a resumed session (P20). Live workers
+    /// reconnect; workers whose heartbeat is gone still show as `stopped`.
+    fn restore_worker_panes(&mut self, session: &str) {
+        self.workers.clear();
+        self.worker_spawn_request = None;
+        self.workers =
+            worker_panes_from(evrax_agent::worker::list_for_session(session, &self.root));
+    }
+}
+
+/// Builds pane view state from worker `State` records (resume/P20). Split out
+/// from the disk lookup so it can be tested without global worker-dir env.
+fn worker_panes_from(states: Vec<evrax_agent::worker::State>) -> Vec<WorkerPane> {
+    states
+        .into_iter()
+        .map(|state| WorkerPane {
+            id: state.id,
+            name: state.name,
+            status: state.status.as_str().to_string(),
+            pid: state.pid,
+            transcript: Vec::new(),
+            last_reply: state.last_reply,
+            cache: crate::ui::TranscriptCache::default(),
+            events_seen: 0,
+        })
+        .collect()
+}
+
+/// Removes one worker's state directory. Returns true when it existed.
+/// Preference would be a `worker::remove` from the agent crate; until that
+/// exists this derives the directory from `worker::state_path` (defensive:
+/// a missing file is not an error).
+fn remove_worker_dir(id: &str) -> bool {
+    let state = evrax_agent::worker::state_path(id);
+    let Some(dir) = state.parent() else {
+        return false;
+    };
+    if !dir.is_dir() {
+        return false;
+    }
+    std::fs::remove_dir_all(dir).is_ok()
 }
 
 /// Folds only the JSONL lines past `pane.events_seen` into `pane.transcript`,
 /// mapping each new line with the same coalescing as a full rebuild. Returns
 /// true when at least one entry changed (so the caller invalidates its cache).
 fn append_new_events(pane: &mut WorkerPane) -> bool {
-    let path = evrax_agent::subagent::events_path(&pane.id);
+    let path = evrax_agent::worker::events_path(&pane.id);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return false;
     };
@@ -4288,6 +4411,50 @@ mod tests {
     }
 
     #[test]
+    fn large_paste_shows_a_chip() {
+        let mut app = app();
+        let base = app.composer_height(40);
+        app.paste_text_input(&"x\n".repeat(12));
+        assert_eq!(app.pasted_text.len(), 1, "one chip");
+        assert_eq!(app.pasted_text[0].chars, 24);
+        assert!(
+            app.composer_height(40) > base,
+            "composer grows to fit the paste chip"
+        );
+    }
+
+    #[test]
+    fn backspace_removes_paste_chip() {
+        let mut app = app();
+        app.paste_text_input(&"x\n".repeat(12));
+        app.paste_text_input(&"y\n".repeat(12));
+        assert_eq!(app.pasted_text.len(), 2);
+        // Editor empty → backspace drops the last chip as one unit.
+        app.backspace_input();
+        assert_eq!(app.pasted_text.len(), 1, "last chip removed");
+        assert_eq!(app.pasted_text[0].chars, 24, "first chip kept");
+        app.backspace_input();
+        assert!(app.pasted_text.is_empty());
+        // With no chips left, backspace is a no-op on an empty editor.
+        app.backspace_input();
+        assert!(app.input.is_empty());
+        assert!(app.pasted_text.is_empty());
+    }
+
+    #[test]
+    fn paste_chip_content_is_sent() {
+        let mut app = app();
+        app.paste_text_input(&"x\n".repeat(12));
+        for c in "summarize".chars() {
+            app.input.insert_char(c);
+        }
+        let prompt = app.submit_prompt().expect("prompt submitted");
+        assert!(prompt.contains("[pasted 24 chars]"), "marker: {prompt}");
+        assert!(prompt.contains('x'), "body: {prompt}");
+        assert!(app.pasted_text.is_empty(), "chip consumed on submit");
+    }
+
+    #[test]
     fn preview_opens_and_closes_within_bounds() {
         let mut app = app();
         assert!(app.preview.is_none());
@@ -4542,7 +4709,7 @@ mod tests {
         let mut app = app();
         app.toggle_palette();
         assert!(app.palette.is_some());
-        assert_eq!(app.filtered_commands().len(), 10);
+        assert_eq!(app.filtered_commands().len(), 11);
         for c in "plan".chars() {
             app.palette_type(c);
         }
@@ -4579,13 +4746,13 @@ mod tests {
         let mut app = app();
         app.toggle_palette();
         app.palette_move(-1);
-        assert_eq!(app.palette.as_ref().unwrap().selected, 9);
+        assert_eq!(app.palette.as_ref().unwrap().selected, 10);
         app.palette_move(1);
         assert_eq!(app.palette.as_ref().unwrap().selected, 0);
         app.palette_type('z');
         assert_eq!(app.filtered_commands().len(), 0);
         app.palette_backspace();
-        assert_eq!(app.filtered_commands().len(), 10);
+        assert_eq!(app.filtered_commands().len(), 11);
     }
 
     #[test]
@@ -4860,7 +5027,7 @@ mod tests {
         assert_eq!(
             kinds,
             vec!["user", "turn_start"],
-            "subagent prompts are echoed only by the TUI"
+            "worker prompts are echoed only by the TUI"
         );
     }
 
@@ -5930,5 +6097,99 @@ mod tests {
         assert!(!app.workers.is_empty());
         app.new_session();
         assert!(app.workers.is_empty());
+    }
+
+    #[test]
+    fn slash_has_workers_command() {
+        let names: Vec<&str> = SLASH_COMMANDS.iter().map(|entry| entry.name).collect();
+        assert!(names.contains(&"workers"), "slash menu must offer /workers");
+    }
+
+    #[test]
+    fn workers_command_reports_empty_project() {
+        let mut app = app();
+        app.flash = None;
+        app.workers_command("");
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert!(
+            flash.as_deref().is_some_and(|t| t.contains("no workers")),
+            "empty project should say so: {flash:?}"
+        );
+    }
+
+    #[test]
+    fn workers_command_rejects_unknown_argument() {
+        let mut app = app();
+        app.flash = None;
+        app.workers_command("bogus");
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert!(
+            flash.as_deref().is_some_and(|t| t.contains("unknown")),
+            "unknown arg should flash: {flash:?}"
+        );
+    }
+
+    #[test]
+    fn workers_kill_requires_id() {
+        let mut app = app();
+        app.flash = None;
+        app.workers_command("kill");
+        let flash = app.flash.as_ref().map(|(text, _)| text.clone());
+        assert!(
+            flash.as_deref().is_some_and(|t| t.contains("usage")),
+            "kill without id should show usage: {flash:?}"
+        );
+    }
+
+    #[test]
+    fn resume_rebuilds_worker_panes() {
+        use evrax_agent::worker::{State, WorkerStatus};
+        let states = vec![
+            State {
+                id: "worker-1".into(),
+                name: "one".into(),
+                pid: 42,
+                status: WorkerStatus::Busy,
+                root: "/proj".into(),
+                session: "session-a".into(),
+                updated_ms: 1234,
+                last_reply: "done".into(),
+            },
+            State {
+                id: "worker-2".into(),
+                name: "two".into(),
+                pid: 0,
+                status: WorkerStatus::Stopped,
+                root: "/proj".into(),
+                session: "session-a".into(),
+                updated_ms: 1234,
+                last_reply: String::new(),
+            },
+        ];
+        let panes = worker_panes_from(states);
+        assert_eq!(panes.len(), 2, "both workers rebuilt as panes");
+        assert_eq!(panes[0].id, "worker-1");
+        assert_eq!(panes[0].status, "busy");
+        assert_eq!(panes[0].pid, 42);
+        assert_eq!(panes[0].last_reply, "done");
+        assert_eq!(panes[1].status, "stopped", "dead worker shows stopped");
+
+        // Wiring: resume() rebuilds from the same mapping.
+        let mut app = app();
+        app.workers.push(WorkerPane {
+            id: "stale".into(),
+            name: "stale".into(),
+            status: "idle".into(),
+            pid: 0,
+            transcript: Vec::new(),
+            last_reply: String::new(),
+            cache: crate::ui::TranscriptCache::default(),
+            events_seen: 0,
+        });
+        app.restore_worker_panes("session-a");
+        assert!(
+            app.workers.is_empty(),
+            "resume drops panes not backed by this session's state on disk"
+        );
     }
 }

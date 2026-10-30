@@ -12,7 +12,7 @@ Indonesian: [README-IND.md](README-IND.md)
 
 - **Agent loop with tools** — `read`, `list`, `grep`, `write`, `edit`, `shell`,
   `web_fetch`, `web_search`, `todo`, `memory`, `git`, `ast_grep`, `evrax-graph`,
-  `subagent`, `skills_list`, `skill_view`.
+  `worker`, `skills_list`, `skill_view`.
 - **Multi-provider** — save many endpoints (openai-compatible or native
   Anthropic), fetch their models automatically, and switch with `/model`.
 - **Plan / Build modes** — Plan mode makes every tool read-only.
@@ -140,7 +140,8 @@ Keyboard:
 | `Ctrl+C` | quit |
 
 Slash commands: `/new`, `/sessions`, `/mode`, `/copy`, `/theme`, `/model`,
-`/remote`, `/rename <title>`, `/worker <n>`, `/update`, `/exit`. `/model` lists
+`/remote`, `/rename <title>`, `/worker <n>`, `/workers`, `/update`, `/exit`.
+`/model` lists
 saved providers, fetches their models on demand, and switches the active
 provider/model without a restart. `/worker 2` spawns two worker agents in split
 panes; the main agent splits the task. `/update` checks GitHub for a newer

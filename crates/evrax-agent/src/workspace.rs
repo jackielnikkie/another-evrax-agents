@@ -31,7 +31,9 @@ const LOCKFILES: [(&str, &str); 8] = [
     ("poetry.lock", "poetry"),
 ];
 
-const CONTEXT_NAMES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];
+const AGENTS_FILE: &str = "AGENTS.md";
+const AGENTS_OVERRIDE: &str = "AGENTS.override.md";
+const SOUL_FILE: &str = "SOUL.md";
 const CONTEXT_CAP: usize = 8192;
 const CONTEXT_MAX_LEVELS: usize = 6;
 
@@ -67,14 +69,93 @@ pub fn snapshot(root: &Path) -> String {
     if !verify.is_empty() {
         out.push_str(&format!("- Verify: {}\n", verify.join("; ")));
     }
-    if let Some((name, _)) = context_file(root) {
+    if let Some((name, _)) = agents_md_chain(root) {
         out.push_str(&format!("- Context files: {name}\n"));
     }
     out
 }
 
-/// Contents of the project's context file (AGENTS.md, else CLAUDE.md, else
-/// .cursorrules) found at `root` or a parent (nearest first), capped.
+/// Identity file: `%APPDATA%\evrax\SOUL.md` (global user) first, else
+/// `<root>/SOUL.md`. Capped like the other context files.
+pub fn soul_file(root: &Path) -> Option<(String, String)> {
+    let appdata = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    soul_file_in(appdata.as_deref(), root)
+}
+
+fn soul_file_in(appdata: Option<&Path>, root: &Path) -> Option<(String, String)> {
+    if let Some(path) = appdata.map(|dir| dir.join("evrax").join(SOUL_FILE))
+        && path.is_file()
+    {
+        return read_capped(SOUL_FILE, &path);
+    }
+    let local = root.join(SOUL_FILE);
+    if local.is_file() {
+        return read_capped(SOUL_FILE, &local);
+    }
+    None
+}
+
+/// `AGENTS.md` chain from the git root down to `root` (`AGENTS.override.md`
+/// wins per directory). CLAUDE.md and .cursorrules are deliberately ignored:
+/// evrax does not use the Claude conventions. The chain is concatenated, each
+/// file capped, with a `## <path>` heading so the model can tell them apart.
+pub fn agents_md_chain(root: &Path) -> Option<(String, String)> {
+    let base = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(root)
+    };
+    let start = git_root(&base).unwrap_or_else(|| base.clone());
+
+    // Collect the chain root → base, then read top-down.
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut dir = Some(base.as_path());
+    while let Some(current) = dir {
+        dirs.push(current.to_path_buf());
+        if same_dir(current, &start) {
+            break;
+        }
+        dir = current.parent();
+    }
+    dirs.reverse();
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let chain_root = dirs.first().cloned().unwrap_or_else(|| base.clone());
+    for d in &dirs {
+        let file = if d.join(AGENTS_OVERRIDE).is_file() {
+            AGENTS_OVERRIDE
+        } else if d.join(AGENTS_FILE).is_file() {
+            AGENTS_FILE
+        } else {
+            continue;
+        };
+        let path = d.join(file);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut content = raw;
+        if content.len() > CONTEXT_CAP {
+            truncate_at(&mut content, CONTEXT_CAP);
+            content.push_str("\n\n[... truncated ...]");
+        }
+        let rel = path
+            .strip_prefix(&chain_root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| file.to_string());
+        names.push(rel.clone());
+        parts.push(format!("## {rel}\n{content}"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some((names.join(", "), parts.join("\n\n")))
+}
+
+/// Nearest `AGENTS.md` walking up from `root` (nearest first), capped. Kept for
+/// callers that want a single file rather than the full chain.
 pub fn context_file(root: &Path) -> Option<(String, String)> {
     let base = if root.is_absolute() {
         root.to_path_buf()
@@ -88,16 +169,9 @@ pub fn context_file(root: &Path) -> Option<(String, String)> {
 
     let mut dir = base;
     for _ in 0..CONTEXT_MAX_LEVELS {
-        for name in CONTEXT_NAMES {
-            let path = dir.join(name);
-            if path.is_file() {
-                let mut content = std::fs::read_to_string(&path).ok()?;
-                if content.len() > CONTEXT_CAP {
-                    truncate_at(&mut content, CONTEXT_CAP);
-                    content.push_str("\n\n[... truncated to fit ...]");
-                }
-                return Some((name.to_string(), content));
-            }
+        let path = dir.join(AGENTS_FILE);
+        if path.is_file() {
+            return read_capped(AGENTS_FILE, &path);
         }
         let Some(parent) = dir.parent() else { break };
         if is_home_or_temp(parent, home.as_deref(), &temp) {
@@ -106,6 +180,25 @@ pub fn context_file(root: &Path) -> Option<(String, String)> {
         dir = parent.to_path_buf();
     }
     None
+}
+
+fn read_capped(name: &str, path: &Path) -> Option<(String, String)> {
+    let mut content = std::fs::read_to_string(path).ok()?;
+    if content.len() > CONTEXT_CAP {
+        truncate_at(&mut content, CONTEXT_CAP);
+        content.push_str("\n\n[... truncated ...]");
+    }
+    Some((name.to_string(), content))
+}
+
+/// Git top-level of `root`, or `None` when `root` is not inside a repo.
+fn git_root(root: &Path) -> Option<PathBuf> {
+    let out = run_git(root, &["rev-parse", "--show-toplevel"])?;
+    let line = out.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(line))
 }
 
 fn is_home_or_temp(dir: &Path, home: Option<&Path>, temp: &Path) -> bool {
@@ -339,5 +432,98 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
             }
             Err(_) => return None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git_init(dir: &Path) {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .arg("init")
+            .output();
+    }
+
+    #[test]
+    fn soul_md_loaded_from_appdata_then_workspace() {
+        let appdata = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(appdata.path().join("evrax")).unwrap();
+        std::fs::write(appdata.path().join("evrax").join("SOUL.md"), "global soul").unwrap();
+        std::fs::write(workspace.path().join("SOUL.md"), "local soul").unwrap();
+
+        // AppData wins when present.
+        let (name, content) = soul_file_in(Some(appdata.path()), workspace.path()).unwrap();
+        assert_eq!(name, "SOUL.md");
+        assert_eq!(content, "global soul");
+
+        // Without the AppData copy, the workspace file is used.
+        let (_, content) = soul_file_in(None, workspace.path()).unwrap();
+        assert_eq!(content, "local soul");
+
+        // Neither → None.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(soul_file_in(None, empty.path()), None);
+    }
+
+    #[test]
+    fn agents_md_chain_root_to_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        git_init(root.path());
+        let nested = root.path().join("crates").join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "root agents").unwrap();
+        std::fs::write(nested.join("AGENTS.md"), "nested agents").unwrap();
+
+        let (_name, content) = agents_md_chain(&nested).unwrap();
+        let root_pos = content.find("root agents").expect("root file in chain");
+        let nested_pos = content.find("nested agents").expect("nested file in chain");
+        assert!(
+            root_pos < nested_pos,
+            "root must come before the child:\n{content}"
+        );
+    }
+
+    #[test]
+    fn agents_override_wins_per_directory() {
+        let root = tempfile::tempdir().unwrap();
+        git_init(root.path());
+        std::fs::write(root.path().join("AGENTS.md"), "base").unwrap();
+        std::fs::write(root.path().join("AGENTS.override.md"), "override wins").unwrap();
+
+        let (_name, content) = agents_md_chain(root.path()).unwrap();
+        assert!(content.contains("override wins"), "{content}");
+        assert!(!content.contains("## AGENTS.md"), "{content}");
+    }
+
+    #[test]
+    fn claude_and_cursorrules_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("CLAUDE.md"), "claude rules").unwrap();
+        std::fs::write(dir.path().join(".cursorrules"), "cursor rules").unwrap();
+        assert_eq!(agents_md_chain(dir.path()), None);
+        assert_eq!(context_file(dir.path()), None);
+
+        std::fs::write(dir.path().join("AGENTS.md"), "agents rules").unwrap();
+        let (_name, content) = agents_md_chain(dir.path()).unwrap();
+        assert!(content.contains("agents rules"));
+        assert!(!content.contains("claude rules"));
+        assert!(!content.contains("cursor rules"));
+    }
+
+    #[test]
+    fn context_files_are_capped_with_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = "x".repeat(CONTEXT_CAP + 50);
+        std::fs::write(dir.path().join("AGENTS.md"), &big).unwrap();
+        let (_name, content) = context_file(dir.path()).unwrap();
+        assert!(
+            content.ends_with("[... truncated ...]"),
+            "len {}",
+            content.len()
+        );
     }
 }

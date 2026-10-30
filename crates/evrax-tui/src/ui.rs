@@ -953,6 +953,12 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize, expanded: bool) -> Ve
     {
         match entry {
             ChatEntry::User(text) => {
+                lines.push(Line::from(Span::styled(
+                    "▌ you",
+                    Style::default()
+                        .fg(current().accent)
+                        .add_modifier(Modifier::BOLD),
+                )));
                 for raw in wrap_text(text, width.saturating_sub(4)) {
                     lines.push(Line::from(vec![
                         Span::styled("  ▌ ", Style::default().fg(current().accent)),
@@ -961,6 +967,12 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize, expanded: bool) -> Ve
                 }
             }
             ChatEntry::Assistant(text) => {
+                lines.push(Line::from(Span::styled(
+                    "✳ evrax",
+                    Style::default()
+                        .fg(current().interactive)
+                        .add_modifier(Modifier::BOLD),
+                )));
                 lines.extend(markdown_lines(text, width));
             }
             ChatEntry::Thinking { summary, seconds } => {
@@ -1005,13 +1017,14 @@ fn entry_lines(entry: &ChatEntry, tick: u64, width: usize, expanded: bool) -> Ve
                     ToolStatus::Error => ("✗", current().error),
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("   {glyph} "), Style::default().fg(color)),
+                    Span::styled(format!("  {glyph} "), Style::default().fg(color)),
                     Span::styled(
-                        format!("{}  ", tool.name),
+                        tool.name.clone(),
                         Style::default()
                             .fg(current().text)
                             .add_modifier(Modifier::BOLD),
                     ),
+                    Span::styled("  ", Style::default()),
                     Span::styled(tool.summary.clone(), Style::default().fg(current().muted)),
                 ]));
                 // Quiet mode keeps one row per call: no body for a finished
@@ -1479,11 +1492,20 @@ fn input(frame: &mut Frame, area: Rect, app: &mut App) {
 
     // Attachment chips (pasted screenshot paths) render above the text.
     let chip_rows = render_attachment_chips(frame, body, app);
+    let paste_rows = render_paste_chips(
+        frame,
+        Rect {
+            y: body.y + chip_rows,
+            height: body.height.saturating_sub(chip_rows),
+            ..body
+        },
+        app,
+    );
     let text_area = Rect {
         x: body.x,
-        y: body.y + chip_rows,
+        y: body.y + chip_rows + paste_rows,
         width: body.width,
-        height: body.height.saturating_sub(chip_rows),
+        height: body.height.saturating_sub(chip_rows + paste_rows),
     };
     if text_area.height == 0 {
         return;
@@ -1612,6 +1634,37 @@ fn render_attachment_chips(frame: &mut Frame, inner: Rect, app: &mut App) -> u16
         });
     }
     max_chips as u16
+}
+
+/// Renders one `[pasted N chars]` chip per parked paste above the composer.
+/// Returns the number of rows consumed (0 when nothing is parked).
+fn render_paste_chips(frame: &mut Frame, inner: Rect, app: &App) -> u16 {
+    if app.pasted_text.is_empty() || inner.height == 0 || inner.width < 8 {
+        return 0;
+    }
+    let shown = (inner.height as usize).min(app.pasted_text.len());
+    for (i, pasted) in app.pasted_text.iter().take(shown).enumerate() {
+        let row = Rect {
+            x: inner.x,
+            y: inner.y + i as u16,
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(Clear, row);
+        let label = format!("[pasted {} chars]", pasted.chars);
+        let style = Style::default()
+            .fg(current().interactive)
+            .bg(current().raised);
+        let pad = (inner.width as usize).saturating_sub(label.width() + 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {label}{}", " ".repeat(pad)),
+                style,
+            ))),
+            row,
+        );
+    }
+    shown as u16
 }
 
 fn metadata(frame: &mut Frame, area: Rect, app: &App) {
@@ -3170,8 +3223,8 @@ mod tests {
         let mut app = App::new();
         app.messages.clear();
         app.messages.push(ChatEntry::User("hello world".into()));
-        app.selection.begin((4, 2));
-        app.selection.update((8, 2));
+        app.selection.begin((4, 3));
+        app.selection.update((8, 3));
         app.selection.finish();
         let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -3189,8 +3242,8 @@ mod tests {
         app.maximized = Some(true);
         app.messages.clear();
         app.messages.push(ChatEntry::User("hello world".into()));
-        app.selection.begin((2, 2));
-        app.selection.update((139, 2));
+        app.selection.begin((2, 3));
+        app.selection.update((139, 3));
         app.selection.finish();
         let mut terminal = Terminal::new(TestBackend::new(140, 28)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();

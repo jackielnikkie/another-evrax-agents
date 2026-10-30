@@ -3,10 +3,13 @@
 Verbatim dari blok Completed AGENTS.md (2026-10-20). AGENTS.md cuma nyimpen ringkasan.
 
 ## Completed (detail penuh)
+- **Batch v0.1.8 (unifikasi worker + fix worker/approval/scope/persist)**.
+  - Rename `subagent` → `worker` (spec tool, `worker.rs`, `worker_link.rs`), state `%APPDATA%\evrax\workers\<id>\` (override `EVRAX_WORKERS_DIR`), flag `--worker-id`.
+  - `worker::list()` di-scope per project + prune; worker reconnect pane saat session resume; `shell` dalam workspace auto (luar wajib izin); worker headless boleh shell; paste besar → chip `[pasted N chars]`; chat + todolist ala opencode; `SOUL.md` + chain `AGENTS.md` (tanpa CLAUDE.md/.cursorrules); guardrail stub tidak lagi salah pada `read`. **Belum ditag.**
 - **Batch tools + evrax-graph (2026-10-21)**.
   - `evrax-graph/evrax-graph` masuk workspace member dan dependency `evrax-agent`. API langsung: `index_project`, `Store`, `query::{search_symbols,callers,callees,impact,dead_code,file_outline}`; DB `<root>/.evrax/graph.db`. Indexer diubah skip `agent-reference`, `skill-evrax`, `.serena`, `.codebase-memory` supaya tidak nyedot referensi/skill.
   - Tool `evrax-graph`: action `index|status|search|callers|callees|impact|dead_code|outline`; `index` tulis stats (files/nodes/edges), query sebelum index error actionable, `symbol` pendek di-resolve via `search_symbols` (prefer exact name lalu qn terpendek), `outline` path wajib dalam workspace, `depth` default 3 max 10, `limit` default 50 max 200, project default nama folder root.
-  - Tools lain: `web_fetch` (reqwest, http(s) only, cap 1 MiB, HTML-to-text), `todo` (`.evrax/todos.json`), `git` (read auto; mutating approval `git:<action>`; path/ref divalidasi), `ast_grep` (search/rewrite; `sg.exe 0.45.0` di folder skill), `subagent` (state `%APPDATA%\evrax\subagents\<id>`, inbox/stop file, spawn `wt.exe` fallback PowerShell; TUI `subagent_link.rs` poll 250ms).
+  - Tools lain: `web_fetch` (reqwest, http(s) only, cap 1 MiB, HTML-to-text), `todo` (`.evrax/todos.json`), `git` (read auto; mutating approval `git:<action>`; path/ref divalidasi), `ast_grep` (search/rewrite; `sg.exe 0.45.0` di folder skill), `worker` (state `%APPDATA%\evrax\workers\<id>`, inbox/stop file, spawn `wt.exe` fallback PowerShell; TUI `worker_link.rs` poll 250ms).
   - Policy: `tools::is_mutating/requires_approval/approval_key_for` dinamis. Plan mode read-only: `read/list/grep/web_fetch/todo/git/ast_grep/evrax-graph`; `graph index` diizinkan karena hanya cache `.evrax`. `.gitignore` + `.evrax/`.
   - Test: web (HTML strip/scheme/fetch local), todo, git (mutating rules/ref/path/status temp repo), ast-grep (mutating/search), evrax-graph (index/search/outline/callers + query-before-index), subagent (quote/render), catalog/plan specs. **240 tests hijau (72 agent + 5 core + 5 graph unit + 1 graph e2e + 29 remote + 128 tui); clippy 0.**
 - **Batch banner + welcome (2026-10-21)**.

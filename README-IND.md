@@ -9,7 +9,7 @@ satu binary kecil, hemat memori, backend LLM asli, plus web UI yang bisa dibuka 
 
 - **Agent loop dengan tools** — `read`, `list`, `grep`, `write`, `edit`, `shell`,
   `web_fetch`, `web_search`, `todo`, `memory`, `git`, `ast_grep`, `evrax-graph`,
-  `subagent`, `skills_list`, `skill_view`.
+  `worker`, `skills_list`, `skill_view`.
 - **Multi-provider** — simpan banyak endpoint (openai-compatible atau Anthropic
   native), daftar model diambil otomatis, ganti provider/model lewat `/model`.
 - **Mode Plan / Build** — Plan membuat semua tool jadi read-only.
@@ -136,7 +136,8 @@ Keyboard:
 | `Ctrl+C` | keluar |
 
 Slash command: `/new`, `/sessions`, `/mode`, `/copy`, `/theme`, `/model`,
-`/remote`, `/rename <judul>`, `/worker <n>`, `/update`, `/exit`. `/model`
+`/remote`, `/rename <judul>`, `/worker <n>`, `/workers`, `/update`, `/exit`.
+`/model`
 menampilkan provider tersimpan, mengambil daftar model saat dibutuhkan, dan
 mengganti provider/model aktif tanpa restart. `/worker 2` men-spawn dua worker
 agent di pane split; main agent memecah tugasnya. `/update` memeriksa rilis
