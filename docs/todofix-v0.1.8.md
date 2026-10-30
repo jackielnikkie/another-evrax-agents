@@ -193,15 +193,32 @@ identitas `SOUL.md` + prompt ala hermes (thinking/planning/delegating).
 - **Delegating**: worker (lihat P13) — bagi tugas lewat `worker send`, standby (P6).
 - File: `lib.rs` (brief).
 
+## P20 — worker persist antar-session (keluhan user)
+- **Gejala**: `/worker` di sesi A → tutup evrax → lanjut sesi A → **pane worker hilang**.
+- **Akar**: `State` worker tak punya field `session`; pane (`App.workers`) hanya di RAM;
+  tak ada restore saat resume. (State file memang bertahan di disk, tapi tak terikat sesi.)
+- **Target (reconnect dari state file)**:
+  1. `State` (worker) tambah field **`session: String`** (id sesi induk). `spawn_worker` terima
+     `session` → simpan. (`root` sudah ada = proyek.)
+  2. Saat App **resume sesi** (`app.rs::resume` / startup `-c`): panggil
+     `worker::list_for_session(session, root)` → bangun ulang `App.workers` (pane).
+  3. Worker proses **hidup terus** saat evrax induk ditutup (jangan mati karena parent);
+     buka sesi A → pane restore + sambung ke worker hidup.
+  4. Worker yang sudah mati (crash/reboot) → pane tampil `stopped` + aksi spawn ulang.
+  5. Prune (P3) hanya hapus worker **terminal/mati**, jangan worker hidup.
+- File: `worker.rs` (`State.session`, `list_for_session`), `app.rs`/`main.rs` (restore saat resume).
+- Test: `worker_state_records_session`, `resume_rebuilds_worker_panes`,
+  `prune_keeps_live_workers`.
+
 ## Kontrak beku (untuk multi-worker)
 ```rust
 evrax_agent::worker::{run, load, list_for, spawn_worker, State, WorkerStatus, events_path}
 ```
 
 ## Lane (sekali jalan)
-- **K1** `crates/evrax-agent/src/worker.rs` + `crates/evrax-agent/src/workspace.rs` + `lib.rs` — P1 core, P2, P3 (list_for+prune), P7 (approval worker), P10 (approval shell), P13 (delegasi), P17 (SOUL+AGENTS), P18 (prompt hermes), P19 (thinking/planning).
+- **K1** `crates/evrax-agent/src/worker.rs` + `crates/evrax-agent/src/workspace.rs` + `lib.rs` — P1 core, P2, P3 (list_for+prune), P7 (approval worker), P10 (approval shell), P13 (delegasi), P17 (SOUL+AGENTS), P18 (prompt hermes), P19 (thinking/planning), P20 (`session` + `list_for_session`).
 - **K2** `crates/evrax-agent/src/tools.rs` + `catalog.rs` + `tools/todo.rs` + `tools/graph.rs` — P1 tool rename, P8 (`read` cache), P9 (bukti), P10 (requires_approval), P12 (todo render), P14 (graph status).
-- **K3** `crates/evrax-tui/src/main.rs` + `app.rs` + `worker_link.rs` + `ui.rs` — P1 TUI, P3 (`/workers` list/clear/kill), P4, P6 (standby), P11 (chat format), P16 (chip paste).
+- **K3** `crates/evrax-tui/src/main.rs` + `app.rs` + `worker_link.rs` + `ui.rs` — P1 TUI, P3 (`/workers` list/clear/kill), P4, P6 (standby), P11 (chat format), P16 (chip paste), P20 (restore pane saat resume).
 - **K4** docs — P5.
 
 ## Prioritas (paling murah → mahal)
@@ -210,12 +227,13 @@ evrax_agent::worker::{run, load, list_for, spawn_worker, State, WorkerStatus, ev
 3. **P8** `read` cache collision.
 4. **P10** shell workspace auto / luar approval.
 5. **P3** worker numpuk: scope + prune + `/workers` list/clear/kill.
-6. **P13** delegasi wajib ke worker.
-7. **P9** bukti verifikasi (sebagian sembuh setelah P7).
-8. **P14** graph status netral (info dulu, merah hanya kalau gagal).
-9. **P11** format chat · **P12** todolist.
-10. **P17/P18/P19** SOUL.md + prompt hermes + thinking/planning/delegating.
-11. P1 rename `subagent`→`worker`, P2/P4/P6, P5 docs.
+6. **P20** worker persist antar-session (reconnect pane saat resume).
+7. **P13** delegasi wajib ke worker.
+8. **P9** bukti verifikasi (sebagian sembuh setelah P7).
+9. **P14** graph status netral (info dulu, merah hanya kalau gagal).
+10. **P11** format chat · **P12** todolist.
+11. **P17/P18/P19** SOUL.md + prompt hermes + thinking/planning/delegating.
+12. P1 rename `subagent`→`worker`, P2/P4/P6, P5 docs.
 
 ## Gate (serial, orkestrator)
 `cargo fmt --all` · `cargo clippy --workspace --all-targets -- -D warnings` ·
