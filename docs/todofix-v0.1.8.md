@@ -1,8 +1,9 @@
-# Todofix v0.1.8 — worker unification + auto-orchestration + scope fix
+# Todofix v0.1.8 — worker unification + auto-orchestration + bugfix batch
 
 Batch setelah `v0.1.7`. **Belum dieksekusi** — rencana dikunci, pengerjaan mulai besok.
-Tujuan: satukan `subagent` → `worker`, worker otomatis saat tugas berat, dan perbaiki
-scope/cleanup worker yang bocor antar proyek/sesi.
+Tujuan: satukan `subagent` → `worker`, worker otomatis saat tugas berat, perbaiki
+scope/cleanup worker, approval shell (workspace auto / luar allow), chip paste besar,
+format chat + todolist ala opencode, delegasi wajib ke worker.
 
 ## Konteks bug (terkonfirmasi)
 - `subagent::list()` (`crates/evrax-agent/src/subagent.rs:119`) membaca SEMUA direktori
@@ -89,21 +90,80 @@ scope/cleanup worker yang bocor antar proyek/sesi.
   verified-command + ringkasan output). Setelah P7 beres ini sebagian sembuh sendiri.
 - **Catatan**: P7 → P8 → P9 urutan prioritas (paling murah dulu).
 
+## P10 — approval shell: workspace auto, luar workspace minta allow (keluhan user)
+- Saat ini `tools.rs::requires_approval` → `name == "shell"` SELALU minta approval
+  (`lib.rs:1260` "shell always needs approval (system-wide scope)").
+- **Target**: shell **di dalam workspace** jalan otomatis (seperti write/edit); approval
+  HANYA kalau command menyentuh path di luar workspace.
+- Deteksi "path luar": parse path absolut di command vs `ctx.root`; kalau ada yang keluar
+  root → approval (`key = "shell:<dir>"`). Selain itu auto.
+- File: `tools.rs` (`requires_approval`/`outside_target` untuk shell) + `lib.rs` (authorize).
+
+## P11 — format chat kurang jelas (ala opencode)
+- `ui.rs::entry_lines` user bubble cuma `▌ ` + teks; assistant = markdown polos; tool row
+  minim. Tak ada label/nama + jarak antar turn.
+- **Target**: header label (`▌ you` / `✳ evrax`), separator/jarak antar turn, tool row lebih
+  terbaca — mengikuti gaya opencode.
+- File: `ui.rs`.
+
+## P12 — todolist susah dipahami (ala opencode)
+- `tools/todo.rs::render` → `[x] #1 (pending, medium) <text>` datar, ada id noise.
+- **Target**: grup by status (`◐ In progress`, `◻ Pending`, `✔ Done`), glyph + nomor tanpa
+  noise; lebih mudah dibaca.
+- File: `tools/todo.rs` + render TUI bila perlu.
+
+## P13 — delegasi wajib ke worker kalau ada (keluhan user)
+- Kalau worker tersedia, agent **WAJIB** mendelegasikan; kerja sendiri hanya untuk tugas
+  **ringan**.
+- **Target**: nudge keras di `system_prompt` (`lib.rs`) + (opsional) guard.
+- File: `lib.rs`.
+
+## P14 — `evrax-graph status` belum-index jangan tampil ✗ merah
+- Saat `.evrax/graph.db` belum ada, `status` mengembalikan `ok:false` → TUI render `✗` merah
+  → user/agent menyangka error.
+- **Target**: belum-index = **bukan error** → status netral (mis. `ok:true` + pesan
+  "graph not indexed yet · run evrax-graph action=index"), tanpa glyph `✗`/merah.
+  `✗` hanya untuk kegagalan nyata (DB korup/IO error).
+- File: `tools/graph.rs` + mapping status→glyph di `ui.rs` bila perlu.
+
+## P16 — chip paste besar (ala opencode) [PRIORITAS TINGGI]
+- **Gejala**: paste > 10 baris cuma memunculkan **flash** `pasted 2621 chars`; tak ada chip
+  visual `[pasted N chars]`, dan tak bisa dihapus sebagai satu unit.
+- **Akar**: `app.rs::paste_text_input` push ke `pasted_text` + `set_flash` saja; tak ada
+  render chip ( `ui.rs::render_attachment_chips` hanya menggambar `attachments` gambar), tak
+  ada handling backspace.
+- **Target**:
+  1. Render chip `[pasted N chars]` di atas composer (untuk tiap `app.pasted_text`).
+  2. Backspace saat composer kosong → hapus **chip terakhir** (bukan per-karakter).
+  3. `composer_height` menambah baris chip paste.
+  4. Isi tetap dikirim ke model saat submit (`merge_pasted_text` → `[pasted N chars]\n<body>`).
+- File: `ui.rs` (render), `main.rs` (backspace), `app.rs` (`composer_height`, urutan hapus).
+- Test: `large_paste_shows_a_chip`, `backspace_removes_paste_chip`, `paste_chip_content_is_sent`.
+
+## P15 (opsional) — auto-index evrax-graph
+- Kalau belum ada index & user minta status/search → jalankan index otomatis. Berat untuk
+  repo besar. Usul: **jangan auto**, cukup pesan jelas (bagian dari P14).
+
 ## Kontrak beku (untuk multi-worker)
 ```rust
 evrax_agent::worker::{run, load, list_for, spawn_worker, State, WorkerStatus, events_path}
 ```
 
 ## Lane (sekali jalan)
-- **K1** `crates/evrax-agent/src/worker.rs` + `crates/evrax-agent/src/lib.rs` — P1 core, P2, P3, **P7** (approval worker).
-- **K2** `crates/evrax-agent/src/tools.rs` + `crates/evrax-agent/src/catalog.rs` — P1 tool rename, **P8** (`read` cache), **P9** (bukti verifikasi).
-- **K3** `crates/evrax-tui/src/main.rs` + `app.rs` + `worker_link.rs` — P1 TUI, P4, P6 (standby non-blocking).
+- **K1** `crates/evrax-agent/src/worker.rs` + `crates/evrax-agent/src/lib.rs` — P1 core, P2, P3, P7 (approval worker), P10 (approval shell), P13 (delegasi wajib).
+- **K2** `crates/evrax-agent/src/tools.rs` + `catalog.rs` + `tools/todo.rs` + `tools/graph.rs` — P1 tool rename, P8 (`read` cache), P9 (bukti), P10 (requires_approval), P12 (todo render), P14 (graph status).
+- **K3** `crates/evrax-tui/src/main.rs` + `app.rs` + `worker_link.rs` + `ui.rs` — P1 TUI, P4, P6 (standby), P11 (chat format), P16 (chip paste).
 - **K4** docs — P5.
 
 ## Prioritas (paling murah → mahal)
 1. **P7** approval `shell` worker (impact terbesar).
-2. **P8** `read` cache collision.
-3. **P9** injeksi bukti verifikasi (sebagian sembuh setelah P7).
+2. **P16** chip paste besar + backspace (kerja sering gagal karena prompt panjang tak terlihat).
+3. **P8** `read` cache collision.
+4. **P10** shell workspace auto / luar approval.
+5. **P13** delegasi wajib ke worker.
+6. **P9** bukti verifikasi (sebagian sembuh setelah P7).
+7. **P11** format chat · **P12** todolist · **P14** graph status netral.
+8. P1 rename `subagent`→`worker`, P2/P3/P4/P6, P5 docs.
 
 ## Gate (serial, orkestrator)
 `cargo fmt --all` · `cargo clippy --workspace --all-targets -- -D warnings` ·
